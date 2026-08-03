@@ -1,0 +1,602 @@
+# MAC层上行用户管理演示项目 (UL MAC Manager)
+
+> 基于 srsRAN 开源项目（ocudu 5G NR + srsRAN_4G LTE）的定制化开发  
+> 参考协议：3GPP TS 36.321 (LTE MAC) / TS 38.321 (NR MAC)
+
+---
+
+## 目录
+
+1. [项目背景与技术架构](#1-项目背景与技术架构)
+2. [代码结构说明](#2-代码结构说明)
+3. [核心功能模块设计与实现](#3-核心功能模块设计与实现)
+4. [编译构建指南](#4-编译构建指南)
+5. [测试验证方法](#5-测试验证方法)
+6. [面试重点标注](#6-面试重点标注)
+7. [常见面试问题预测](#7-常见面试问题预测)
+8. [技术难点解析](#8-技术难点解析)
+9. [与标准协议的符合性分析](#9-与标准协议的符合性分析)
+
+---
+
+## 1. 项目背景与技术架构
+
+### 1.1 项目目标
+
+本项目面向通信工程领域 MAC 子层上行用户管理的实习与面试展示，基于 srsRAN 开源 4G/5G 协议栈项目，提取并增强 MAC 层上行管理核心机制，实现一个独立可运行的仿真演示系统。
+
+### 1.2 参考项目
+
+| 项目 | 目录 | 技术 | 说明 |
+|------|------|------|------|
+| srsRAN_4G | `srsRAN_4G/` | LTE | srsUE 侧 MAC 实现（sr_proc, bsr_proc, ul_harq_entity） |
+| ocudu | `ocudu/` | 5G NR | gNB 侧 MAC 实现（mac_impl, scheduler） |
+
+### 1.3 系统架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    演示系统架构                            │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│   ┌────────────┐   UL Grant    ┌──────────────────┐    │
+│   │  eNB调度器  │ ◄──────────► │   UE上下文管理器   │    │
+│   │(ul_scheduler)│              │  (ue_context)     │    │
+│   │             │   SR/BSR     │                   │    │
+│   │ • PF算法    │              │ ┌───────────────┐ │    │
+│   │ • RR算法    │              │ │ sr_manager    │ │    │
+│   │ • 优先级算法│              │ │ (SR调度请求)   │ │    │
+│   │             │              │ ├───────────────┤ │    │
+│   │ • UL Grant  │              │ │ bsr_manager   │ │    │
+│   │   生成      │              │ │ (BSR缓冲区)   │ │    │
+│   │ • HARQ反馈  │              │ ├───────────────┤ │    │
+│   │   管理      │              │ │ul_harq_manager│ │    │
+│   └────────────┘              │ │ (HARQ重传)    │ │    │
+│                               │ ├───────────────┤ │    │
+│                               │ │lcg_buffer_mgr │ │    │
+│                               │ │ (LCG缓冲区)   │ │    │
+│                               │ └───────────────┘ │    │
+│                               └───────────────────┘    │
+│                                                          │
+│   ┌──────────────────────────────────────────────┐     │
+│   │              横切关注点                         │     │
+│   │  mac_logger (日志系统) + metrics_collector    │     │
+│   └──────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 1.4 上行调度流程
+
+```
+UE侧数据到达 → LCG缓冲区更新 → 触发Regular BSR
+     │                              │
+     │  无PUCCH资源?                │
+     ▼                              ▼
+  发送SR ←────── BSR需要资源 ←── 生成BSR CE
+  (PUCCH)            │
+     │               │
+     ▼               ▼
+  eNB收到SR → 调度器分配UL Grant → 发送给UE
+                    │
+                    ▼
+           UE收到UL Grant
+           │           │
+           ▼           ▼
+     发送BSR+数据   HARQ管理新传/重传
+           │
+           ▼
+     eNB收到 → CRC校验 → ACK/NACK
+                    │
+                    ▼
+             NACK → 调度重传
+             ACK  → 释放HARQ进程
+```
+
+---
+
+## 2. 代码结构说明
+
+### 2.1 目录结构
+
+```
+ul_mac_manager/
+├── CMakeLists.txt                    # 构建配置
+├── include/ul_mac/
+│   ├── common_types.h               # 公共类型定义（BSR格式、SR状态、HARQ状态、UL Grant等）
+│   ├── mac_logger.h                 # 日志系统（线程安全、带时间戳）
+│   ├── metrics_collector.h          # 性能指标收集器（单例模式）
+│   ├── lcg_buffer.h                 # LCG缓冲区管理器
+│   ├── ue_sr_manager.h              # SR调度请求管理器
+│   ├── ue_bsr_manager.h             # BSR缓冲区状态报告管理器
+│   ├── ue_ul_harq_manager.h         # UL HARQ重传管理器
+│   ├── enb_ul_scheduler.h           # eNB侧上行调度器
+│   └── ue_context.h                 # UE上下文（整合所有组件）
+├── src/
+│   ├── main.cpp                     # 演示入口（4个仿真场景）
+│   ├── ue_sr_manager.cpp            # SR管理器实现
+│   ├── ue_bsr_manager.cpp           # BSR管理器实现
+│   ├── ue_ul_harq_manager.cpp       # HARQ管理器实现
+│   └── enb_ul_scheduler.cpp         # 调度器实现
+```
+
+### 2.2 关键类说明
+
+| 类名 | 文件 | 职责 | 对应 srsRAN 原型 |
+|------|------|------|-----------------|
+| `sr_manager` | ue_sr_manager.h/cpp | SR状态机、PUCCH资源管理、自适应SR周期 | `srsue::mac::sr_proc` |
+| `bsr_manager` | ue_bsr_manager.h/cpp | BSR触发、格式选择、定时器管理、预测性BSR | `srsue::mac::bsr_proc` |
+| `ul_harq_process` | ue_ul_harq_manager.h/cpp | 单HARQ进程状态机（NDI/RV管理） | `srsue::mac::ul_harq_process` |
+| `ul_harq_manager` | ue_ul_harq_manager.h/cpp | HARQ实体（16进程管理、统计） | `srsue::mac::ul_harq_entity` |
+| `ul_scheduler` | enb_ul_scheduler.h/cpp | eNB调度器（PF/RR/优先级） | `srsenb::mac::sched` |
+| `ue_context` | ue_context.h | UE上下文整合 | `srsue::mac::mac` |
+| `lcg_buffer_manager` | lcg_buffer.h | LCG缓冲区聚合 | `srsue::mac::bsr_proc::lcg_buffer_state` |
+| `metrics_collector` | metrics_collector.h | 系统级性能监控 | `srsenb::mac::mac_metrics` |
+
+---
+
+## 3. 核心功能模块设计与实现
+
+### 3.1 SR（调度请求）管理器
+
+**协议参考**：TS 36.321 §5.4.4 / TS 38.321 §5.4.4
+
+**状态机设计**：
+```
+    ┌─────────┐  数据到达     ┌───────────┐
+    │  IDLE   │ ──────────►  │  PENDING  │
+    └─────────┘              └─────┬─────┘
+         ▲                         │ SR周期到达
+         │ UL Grant                ▼
+         │ 收到              ┌─────────────┐
+         ├─────────────────  │ TRANSMITTING│
+         │                   └──────┬──────┘
+         │                          │
+         │                    ┌─────┴──────┐
+         │              成功   │            │ 失败(dsr_transmax)
+         │                    ▼            ▼
+         │               ┌────────┐  ┌─────────┐
+         └───────────────│  IDLE  │  │ FAILED  │→触发RA
+                         └────────┘  └─────────┘
+```
+
+**增强功能 — 自适应SR周期**：
+- 基于流量速率的EMA（指数移动平均）动态调整SR发送周期
+- 使用对数连续映射公式 `period = clamp(K / log2(1 + rate), 5, 80)`，平滑过渡无离散跳变
+- 迟滞机制：仅当新周期与当前周期差异超过20%时才调整，避免阈值附近频繁切换
+- 减少PUCCH资源浪费，同时保证高流量场景的低延迟
+
+**对应srsRAN源码**：
+- `srsRAN_4G/srsue/src/stack/mac/proc_sr.cc` 中的 `sr_proc::step()` 方法
+
+### 3.2 BSR（缓冲区状态报告）管理器
+
+**协议参考**：TS 36.321 §5.4.5 / TS 38.321 §5.4.5
+
+**三种触发类型**：
+1. **Regular BSR**：新数据到达且优先级高于当前缓冲区 / 新数据到达空LCG
+2. **Periodic BSR**：periodicBSR-Timer 超时
+3. **Padding BSR**：UL Grant 剩余空间足够填充 BSR CE
+
+**BSR格式选择算法**：
+```
+UL Grant可用空间 → 计算可报告LCG数
+  │
+  ├─ 只有1个LCG有数据 → Short BSR (1字节: LCG ID 2bit + BS Index 6bit)
+  ├─ 多个LCG且空间够  → Long BSR (3字节: 4个LCG各6-bit BS Index)
+  └─ 空间不够报全部   → Truncated BSR (按优先级截断)
+```
+
+**增强功能 — 预测性BSR**：
+- 使用最小二乘线性回归预测未来缓冲区需求，捕捉增长/下降趋势
+- 帮助调度器提前规划资源分配，减少调度延迟
+- 差分BSR：Padding BSR场景下，若所有LCG缓冲区大小未变化则跳过发送，减少信令开销
+
+**BSR缓冲区大小映射**：
+- 使用 64 级对数映射表（Index 0~63 → 0~150000 bytes）
+- 公式：`BS[i] = ceil(BS[i-1] × 1.12)`，量化精度随缓冲区增大而降低
+
+### 3.3 UL HARQ 重传管理器
+
+**协议参考**：TS 36.321 §5.4.2 / TS 38.321 §5.4.2
+
+**HARQ进程状态机**：
+```
+INACTIVE ──新传──► ACTIVE(IDLE)
+                      │
+                      ├── 发送 ──► ACTIVE(TX_PENDING)
+                      │               │
+                      │          ┌────┴─────┐
+                      │        ACK          NACK
+                      │          │            │
+                      │          ▼            ▼
+                      │      INACTIVE   ACTIVE(RETX_PENDING)
+                      │                     │
+                      │                     ├── 重传 ──► TX_PENDING
+                      │                     │
+                      │                     └── max_retx达到 ──► INACTIVE(丢弃)
+```
+
+**关键决策逻辑（new_grant_ul）**：
+1. 若有 PHICH 反馈 → 处理 ACK/NACK
+2. 检查是否达到最大重传次数（max_harq_tx）
+3. NDI 翻转 → 新传输；NDI 未翻转 → 自适应重传
+4. 无 NDI（非自适应重传）→ 按原参数重传
+
+**RV（冗余版本）序列**：
+- LTE: `{0, 2, 3, 1}` — 通过 IRV 计数器循环
+- RV=0 包含最多系统比特，优先用于首次传输
+
+**增强功能**：
+- RTT延迟建模：HARQ反馈需经过RTT（默认8 TTI）后才被处理，更真实地模拟PHICH反馈时序
+- 早期终止：连续NACK≥3次且已重传≥2次时提前丢弃TB，避免浪费无线资源
+- 令牌桶LCP：实现3GPP TS 36.321 §5.4.3.1两阶段逻辑信道优先级，PBR令牌桶控制各信道速率
+
+**对应srsRAN源码**：
+- `srsRAN_4G/srsue/src/stack/mac/ul_harq.cc` 中的 `new_grant_ul()` 方法
+
+### 3.4 上行调度器（eNB侧）
+
+**三种调度算法**：
+
+#### 比例公平调度（PF）
+```
+PF度量值 = 当前请求速率 / (历史平均速率 ^ fairness_coeff)
+```
+- 重传优先于新传（保证 HARQ RTT）
+- PF 度量值越高 → 越优先获得资源
+- 历史平均速率使用 EMA 平滑（α = 1/(n+1)）
+
+#### 轮询调度（RR）
+- 简单公平轮转，每个 UE 获得均等机会
+- 适合对公平性要求严格的场景
+
+#### 优先级调度
+- 按 UE 缓冲区大小排序，缓冲区大的优先
+- 适合最大化系统吞吐
+
+**UL Grant 生成**：
+- MCS 计算：基于 UE 上报的 SNR（0~30dB → MCS 0~28）
+- PRB 计算：`required_prb = ceil(req_bytes / bytes_per_prb)`
+- MCS 计算：基于SNR→MCS区间映射表（29个阈值点），替代线性公式
+- TBS 计算：基于3GPP TS 36.213 Table 7.1.7.2.1-1简化查找表（6个锚点+线性插值）
+
+---
+
+## 4. 编译构建指南
+
+### 4.1 依赖项
+
+```bash
+# 基础依赖（Ubuntu/Debian）
+sudo apt update
+sudo apt install -y build-essential cmake g++
+
+# 最低版本要求
+# CMake >= 3.10
+# GCC >= 7 (支持 C++17)
+```
+
+### 4.2 编译步骤
+
+```bash
+cd ul_mac_manager
+mkdir -p build && cd build
+cmake ..
+make -j$(nproc)
+```
+
+### 4.3 运行
+
+```bash
+./build/ul_mac_manager
+```
+
+### 4.4 srsRAN 原项目编译（供参考）
+
+```bash
+# srsRAN_4G (LTE)
+cd srsRAN_4G
+mkdir build && cd build
+cmake .. -DENABLE_UHD=OFF -DENABLE_BLADERF=OFF
+make -j$(nproc)
+
+# ocudu (5G NR)
+cd ../../ocudu
+mkdir build && cd build
+cmake .. -DENABLE_EXPORT=OFF
+make -j$(nproc)
+```
+
+---
+
+## 5. 测试验证方法
+
+### 5.1 仿真场景
+
+| 场景 | 参数 | 验证目标 |
+|------|------|---------|
+| 场景1 | 单UE, 200TTI, PF, BLER=10% | SR→BSR→Grant→HARQ完整流程 |
+| 场景2 | 5UE, 1000TTI, PF, BLER=5% | 多UE比例公平调度公平性 |
+| 场景3 | 单UE, 500TTI, RR, BLER=30% | HARQ重传机制、达到最大重传丢弃 |
+| 场景4 | 单UE, 500TTI, 变化流量 | 自适应SR周期、预测性BSR |
+
+### 5.2 验证指标
+
+- **SR成功率**：应接近100%（无信道差错时）
+- **HARQ BLER**：应接近配置的BLER值（如30%）
+- **平均重传次数**：BLER=30%时约1.43次（几何分布期望 1/(1-0.3)）
+- **PF公平性**：5个UE吞吐率差异应 < 30%（信道条件相同时）
+- **自适应SR**：高流量阶段SR周期应缩短，低流量应延长
+
+### 5.3 日志验证
+
+日志格式：`[HH:MM:SS.mmm] [LEVEL] [MODULE] UE[RNTI] TTI[XXXXX] Message`
+
+关键日志检查：
+- `SR sending on PUCCH` → SR发送
+- `Triggering Regular BSR` → BSR触发
+- `New TX, RV=0, TBS=xxx` → HARQ新传
+- `Adaptive ReTX=xxx` → HARQ自适应重传
+- `Max ReTX reached` → 达到最大重传
+
+### 5.4 自动化测试
+
+项目包含19个自动化单元测试，覆盖所有核心组件：
+
+```bash
+# 编译并运行测试
+cd build
+cmake ..
+make -j$(nproc)
+./ul_mac_manager_tests
+
+# 或使用 CTest
+ctest --output-on-failure
+```
+
+| 测试类别 | 测试数 | 覆盖内容 |
+|---------|--------|---------|
+| LCP令牌桶 | 3 | PBR限制、令牌补充、无PBR退化 |
+| MCS/TBS | 2 | SNR→MCS区间映射、TBS单调性 |
+| HARQ | 5 | 新传/重传/最大重传丢弃/RTT延迟/早期终止 |
+| SR | 2 | 状态机转换、自适应周期 |
+| BSR | 3 | Regular触发、线性回归预测、差分BSR |
+| 延迟统计 | 2 | P50/P90/P99计算、样本记录 |
+| 死锁修复 | 1 | TB丢弃后pending_retx清除 |
+| 线程安全 | 1 | get_all_process_info并发访问 |
+
+---
+
+## 6. 面试重点标注
+
+> **面试官重点关注领域** ⭐
+
+### ⭐⭐⭐ 核心知识点
+
+1. **SR过程（§5.4.4）**
+   - SR 的触发条件（有数据但无PUCCH资源）
+   - dsr-TransMax 限制与 RA 回退机制
+   - SR 禁止定时器（sr-ProhibitTimer）的作用
+
+2. **BSR过程（§5.4.5）**
+   - 三种触发类型的区别和应用场景
+   - BSR格式选择（Short/Long/Truncated）的判断条件
+   - periodicBSR-Timer 和 retxBSR-Timer 的作用
+
+3. **UL HARQ（§5.4.2）**
+   - NDI翻转机制判断新传/重传
+   - 自适应重传 vs 非自适应重传
+   - RV序列 `{0, 2, 3, 1}` 的设计原因（CC编码特性）
+   - 异步HARQ（LTE上行）vs 同步HARQ（LTE下行）
+
+4. **比例公平调度**
+   - PF度量值公式的物理含义
+   - 公平性与效率的权衡
+   - 历史平均速率的EMA更新
+
+### ⭐⭐ 重要知识点
+
+5. **LCG（逻辑通道组）**
+   - 4个LCG，最多8个LC per LCG
+   - BSR以LCG为单位上报（不是LC）
+
+6. **UL Grant 资源计算**
+   - MCS → TBS 的查表过程（TS 36.213 Table 7.1.7.2.1-1）
+   - PRB分配与频率资源管理
+
+### ⭐ 了解即可
+
+7. **NR 5G 与 LTE 的差异**
+   - NR 的 Configured Grant（Type1/Type2）vs LTE 的 SPS
+   - NR 支持更多HARQ进程（最多16个）
+   - NR 的BWP（带宽部分）对调度的影响
+
+---
+
+## 7. 常见面试问题预测
+
+### Q1: 请描述UE发送上行数据的完整MAC层流程
+
+**标准答案**：
+1. RLC层将SDU放入MAC层逻辑通道缓冲区
+2. MAC层检测到新数据（Regular BSR触发条件）
+3. 如果UE没有PUCCH SR资源 → 触发SR过程
+4. UE在PUCCH上发送SR（受dsr-TransMax限制）
+5. eNB收到SR后，通过PDCCH分配初始UL Grant（可能只够发BSR）
+6. UE使用UL Grant发送BSR（Short/Long/Truncated格式）
+7. eNB解析BSR后，按缓冲区状态分配足够大的UL Grant
+8. UE构造MAC PDU（包含BSR CE + 数据SDU），通过HARQ发送
+9. eNB收到后进行CRC校验，发送ACK/NACK
+10. NACK时触发重传（RV按{0,2,3,1}序列变化）
+
+### Q2: BSR的三种触发类型有什么区别？
+
+**标准答案**：
+- **Regular BSR**：(1) 新数据到达优先级高于当前缓冲区中所有LC的数据；(2) 新数据到达空的LCG。立即触发SR（如果没有资源）。
+- **Periodic BSR**：periodicBSR-Timer超时触发，周期性上报缓冲区状态，确保eNB有最新信息。
+- **Padding BSR**：UL Grant的剩余空间足以填充BSR CE时触发，利用填充空间携带BSR，无需额外资源。
+
+优先级：Regular > Periodic > Padding（同一TTI只发一个BSR）
+
+### Q3: UL HARQ中如何判断是新传还是重传？
+
+**标准答案**：
+通过DCI中的NDI（New Data Indicator）字段判断：
+- **NDI翻转**（与上次不同）→ 新传输：重置HARQ缓冲区，用新数据替换
+- **NDI未翻转**（与上次相同）→ 重传：使用原HARQ缓冲区数据重传
+- **特殊情况**：首次收到Grant（无历史NDI）视为新传；RAR中的Grant始终为新传（Msg3）
+
+自适应重传时，eNB可以改变MCS和PRB（但TBS不变）。非自适应重传（无NDI的PHICH NACK）使用与上次完全相同的参数。
+
+### Q4: 为什么HARQ的RV序列是{0, 2, 3, 1}而不是{0, 1, 2, 3}？
+
+**标准答案**：
+这与Turbo码/LDPC码的编码特性有关：
+- RV=0 包含最多的系统比特（信息位），解码性能最好
+- RV=2 包含最多的校验比特A
+- RV=3 包含最多的校验比特B  
+- RV=1 是混合类型
+
+序列 `{0, 2, 3, 1}` 的设计使得前两次传输（RV=0 和 RV=2）就包含足够的系统和校验信息，实现最佳的增量冗余（IR）效果。如果使用 `{0, 1, 2, 3}`，第二次传输（RV=1）的自解码能力较弱，浪费一次传输机会。
+
+### Q5: 比例公平(PF)调度算法的原理和优缺点？
+
+**标准答案**：
+PF度量值 = R_current(t) / R_avg(t)^α
+
+- R_current：当前UE的可支持速率（由信道质量决定）
+- R_avg：历史平均速率（EMA更新）
+- α：公平性因子（通常取1）
+
+**优点**：在系统吞吐率和用户公平性之间取得良好平衡。信道好的UE获得高速率，但不会饿死信道差的UE。
+**缺点**：计算复杂度高于RR；需要维护每个UE的历史状态；对时变信道的响应有一定延迟。
+
+实际系统中常用 PF 的变种：如加权PF（不同QoS等级不同权重）、最大C/I（纯吞吐率优化）、最大最小公平等。
+
+### Q6: SR失败后会怎样处理？
+
+**标准答案**：
+当SR发送次数达到 dsr-TransMax（最大SR传输次数）：
+1. MAC层通知RRC层SR失败
+2. RRC层释放该UE的PUCCH SR资源和SRS资源
+3. 触发随机接入（RA）过程，通过Msg1/Msg3重新请求资源
+4. RA过程中的Msg3携带BSR，eNB可以通过Msg4中的UL Grant响应
+
+这是一种回退机制，确保即使SR信道失步也能恢复上行通信。
+
+### Q7: 请解释配置授权（Configured Grant）与动态授权的区别
+
+**标准答案**：
+- **动态授权（Dynamic Grant）**：每次传输都需要eNB通过PDCCH发送DCI指示，灵活但信令开销大、延迟高。
+- **配置授权 Type1**：RRC信令直接配置周期、MCS、PRB等参数，UE无需PDCCH即可周期性发送。适合固定速率业务（如VoNR）。
+- **配置授权 Type2**：RRC配置基本参数，PDCCH激活/去激活。比Type1更灵活。
+
+配置授权是NR的新特性，对应LTE的SPS（半持续调度），但功能更强大。本项目中模拟的是动态授权方式。
+
+---
+
+## 8. 技术难点解析
+
+### 8.1 HARQ RTT与进程管理
+
+**难点**：上行HARQ RTT为8ms（FDD），意味着一个HARQ进程发送后需等待8ms才能收到反馈。在这8ms内如果有新数据到达，必须使用其他空闲HARQ进程。
+
+**解决方案**：
+- 维护16个HARQ进程（`MAX_HARQ_PROCESSES = 16`）
+- 调度器轮转分配进程ID（`next_pid_ % MAX_HARQ_PROCESSES`）
+- 重传优先：调度器先处理pending_retx的进程
+
+### 8.2 BSR量化精度与资源效率
+
+**难点**：BSR使用6bit的Buffer Size Index（0~63）表示缓冲区大小，但实际缓冲区范围是0~150000字节。量化必然引入误差。
+
+**解决方案**：
+- 对数量化表：小缓冲区精度高（如Index 10 → 315~347 bytes），大缓冲区精度低（Index 62 → 121278~150000 bytes）
+- 这是合理的，因为大缓冲区通常意味着大量背景流量，精确值对调度影响不大
+
+### 8.3 自适应SR与预测性BSR
+
+**难点**：标准SR周期固定，无法适应突发流量变化。高流量时需要更频繁的SR以降低延迟，低流量时需要更长的SR周期以节省PUCCH资源。
+
+**解决方案**：
+```cpp
+// 自适应SR周期调整（对数连续映射 + 迟滞）
+double ema_rate = alpha * current_rate + (1-alpha) * old_rate;
+double log_rate = log2(1.0 + ema_rate);
+uint32_t new_period = clamp(K / log_rate, MIN_PERIOD, MAX_PERIOD);
+// 迟滞：变化不超过20%则不调整
+if (abs(new_period - current_period) / current_period < 0.2) return;
+```
+
+预测性BSR使用线性趋势预测未来50ms的缓冲区增长，帮助调度器提前规划。
+
+### 8.4 线程安全设计
+
+**难点**：仿真系统中UE侧和eNB侧可能在不同线程运行（实际系统中确实如此），共享状态需要同步保护。
+
+**解决方案**：
+- `ul_scheduler` 内部所有公开方法使用 `std::lock_guard<std::mutex>` 保护
+- `ul_harq_process` 使用 `std::atomic` 原子变量存储关键状态
+- `metrics_collector` 使用单例模式 + mutex 保护全局指标
+
+---
+
+## 9. 与标准协议的符合性分析
+
+| 功能模块 | 协议章节 | 符合程度 | 说明 |
+|---------|---------|---------|------|
+| SR状态机 | TS 36.321 §5.4.4 | 高 | 完整实现SR触发、发送、dsr-TransMax限制、RA回退 |
+| BSR触发 | TS 36.321 §5.4.5 | 高 | Regular/Periodic/Padding三种触发全部实现 |
+| BSR格式 | TS 36.321 §6.1.3 | 高 | Short/Long/Truncated格式选择逻辑符合协议 |
+| HARQ NDI | TS 36.321 §5.4.2.1 | 高 | NDI翻转判断新传/重传，TC-RNTI特殊处理 |
+| RV序列 | TS 36.212 §5.2.2 | 高 | {0,2,3,1}序列正确实现 |
+| PF调度 | 业界通用 | 中 | 实现基本PF算法，未包含QoS加权等高级特性 |
+| PHICH处理 | TS 36.213 §8.0 | 中 | 简化为概率模型，未实现完整的PHICH资源映射 |
+| MCS/TBS | TS 36.213 §7.1.7 | 高 | 使用SNR→MCS区间映射表 + TBS锚点查找表（6点线性插值） |
+
+**项目简化说明**：
+- 未实现完整的MAC PDU构造（Header + CE + SDU）
+- 未实现下行HARQ和下行调度
+- 信道模型简化为概率BLER模型
+- LCP已实现令牌桶两阶段调度，但未实现MAC PDU复用（多LCID子头组装）
+
+---
+
+## 附录：性能指标示例输出
+
+```
+==============================================================
+  最终系统性能指标
+==============================================================
+
+仿真时长:           500 TTI (500 ms)
+--------------------------------------------------------------
+【调度请求 (SR)】
+  总发送次数:        1
+  成功次数:          1
+  成功率:            100.00%
+--------------------------------------------------------------
+【上行HARQ】
+  新传次数:          109
+  重传次数:          414
+  失败次数:          27
+  平均重传次数:      3.798
+--------------------------------------------------------------
+【上行吞吐】
+  总传输字节:        336798 bytes
+  系统吞吐率:        5388.77 kbps
+--------------------------------------------------------------
+【延迟统计】
+  样本数:            473
+  最小延迟:          0 TTI
+  P50 (中位数):      71 TTI
+  P90:               200 TTI
+  P99:               233 TTI
+  最大延迟:          235 TTI
+  平均延迟:          90.28 TTI
+```
+
+---
+
+*本项目基于 srsRAN (https://github.com/srsran/srsRAN) 开源项目定制化开发*  
+*遵循 3GPP TS 36.321 / TS 38.321 MAC协议规范*

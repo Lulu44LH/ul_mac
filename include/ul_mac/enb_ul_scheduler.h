@@ -1,0 +1,175 @@
+// =============================================================================
+// enb_ul_scheduler.h - 上行调度器 (eNB侧)
+//
+// 模拟eNB/gNB侧的上行调度器, 处理来自多个UE的SR、BSR并分配上行资源
+//
+// 【调度功能】:
+//   1. 接收和处理UE的SR (调度请求)
+//   2. 接收和处理UE的BSR (缓冲区状态报告)
+//   3. 基于调度算法选择UE并分配上行资源
+//   4. 生成上行授权 (UL Grant) 并发送给UE
+//   5. 管理HARQ反馈 (ACK/NACK)
+//
+// 【调度算法】:
+//   1. 轮询调度 (RR): 公平轮转, 每个UE获得相同机会
+//   2. 比例公平 (PF): 基于历史吞吐率加权, 平衡公平性和效率
+//      参考 srsRAN_4G/srsenb/hdr/stack/mac/schedulers/sched_time_pf.h
+//   3. 优先级调度: 按UE优先级排序, 高优先级UE优先
+//
+// 关键参考:
+//   - srsRAN_4G/srsenb/hdr/stack/mac/sched.h        调度器主类
+//   - srsRAN_4G/srsenb/hdr/stack/mac/sched_ue.h      UE级调度
+//   - srsRAN_4G/srsenb/hdr/stack/mac/schedulers/      调度算法
+//   - ocudu/include/ocudu/scheduler/mac_scheduler.h   NR调度器接口
+// =============================================================================
+
+#pragma once
+
+#include "ul_mac/common_types.h"
+#include "ul_mac/mac_logger.h"
+#include "ul_mac/metrics_collector.h"
+#include <map>
+#include <mutex>
+#include <queue>
+#include <vector>
+#include <cstring>
+
+namespace ul_mac {
+
+/// UE调度上下文 (eNB侧维护的每个UE的调度信息)
+/// 参考 srsRAN_4G/srsenb/hdr/stack/mac/sched_ue.h 中的 sched_ue 类
+struct ue_sched_context {
+    uint16_t rnti;              ///< UE的C-RNTI
+    bool     sr_pending;        ///< SR待处理标志
+    uint32_t ul_buffer[NOF_LCGS]; ///< 各LCG的上行缓冲区大小 (来自BSR)
+    uint32_t total_ul_buffer;   ///< 总上行缓冲区
+    int      phr;               ///< 功率余量 (dB)
+    uint32_t ul_snr;            ///< 上行SNR (x100)
+    double   dl_avg_rate;       ///< 下行平均速率 (PF调度用)
+    double   ul_avg_rate;       ///< 上行平均速率 (PF调度用)
+    uint32_t ul_nof_samples;    ///< 上行调度次数 (PF调度用)
+    uint32_t last_scheduled_tti; ///< 上次被调度的TTI
+    uint32_t pending_retx_pid;  ///< 待重传的HARQ进程ID (0xFFFF=无)
+    bool     ndi[MAX_HARQ_PROCESSES]; ///< 各HARQ进程当前NDI (新传时翻转, 重传时保持)
+    uint8_t  cqi;              ///< UE上报的CQI (0-15, 0=未上报, 回退SNR)
+    bool     harq_pid_busy[MAX_HARQ_PROCESSES]; ///< 该UE各HARQ进程忙闲 (eNB跟踪, 避免多UE重复分配)
+
+    ue_sched_context()
+        : rnti(0), sr_pending(false), total_ul_buffer(0)
+        , phr(0), ul_snr(200), dl_avg_rate(0.0), ul_avg_rate(0.0)
+        , ul_nof_samples(0), last_scheduled_tti(0)
+        , pending_retx_pid(0xFFFF), cqi(0)
+    {
+        memset(ul_buffer, 0, sizeof(ul_buffer));
+        memset(ndi, 0, sizeof(ndi));
+        memset(harq_pid_busy, 0, sizeof(harq_pid_busy));
+    }
+};
+
+/// 上行调度器
+///
+/// 模拟eNB侧调度器, 处理多UE上行资源分配
+class ul_scheduler {
+public:
+    /// 构造函数
+    /// @param algorithm 调度算法
+    /// @param total_prb 可用PRB总数
+    explicit ul_scheduler(sched_algorithm algorithm = sched_algorithm::PROPORTIONAL_FAIR,
+                          uint32_t total_prb = 100);
+
+    /// 添加UE到调度器
+    void add_ue(uint16_t rnti);
+
+    /// 移除UE
+    void remove_ue(uint16_t rnti);
+
+    /// 处理UE的SR指示
+    /// 对应 srsRAN sched.h 中的 ul_sr_info()
+    void handle_sr(uint16_t rnti);
+
+    /// 处理UE的BSR
+    /// 对应 srsRAN sched.h 中的 ul_bsr()
+    void handle_bsr(uint16_t rnti, uint8_t lcg_id, uint32_t bsr_value);
+
+    /// 处理UE的PHR
+    /// 对应 srsRAN sched.h 中的 ul_phr()
+    void handle_phr(uint16_t rnti, int phr, uint32_t ul_nof_prb);
+
+    /// 处理UE上报的CQI (0-15)
+    /// CQI>0时调度器优先用CQI选MCS; CQI=0表示未上报, 回退SNR
+    void handle_cqi(uint16_t rnti, uint8_t cqi);
+
+    /// 处理上行CRC结果 (HARQ反馈)
+    /// 对应 srsRAN sched.h 中的 ul_crc_info()
+    void handle_ul_crc(uint16_t rnti, uint32_t pid, bool crc_ok);
+
+    /// 执行每TTI的上行调度
+    /// 对应 srsRAN sched.h 中的 ul_sched()
+    struct ul_sched_result {
+        uint16_t rnti;
+        ul_grant grant;
+        bool     is_retx;
+    };
+    std::vector<ul_sched_result> schedule_ul(uint32_t tti);
+
+    /// 设置调度算法
+    void set_algorithm(sched_algorithm algo) { algorithm_ = algo; }
+
+    /// 获取当前调度UE数量
+    size_t get_nof_ues() const;
+
+    /// 获取UE调度上下文
+    const ue_sched_context* get_ue_context(uint16_t rnti) const;
+
+private:
+    /// 比例公平(PF)调度算法
+    /// 参考 srsRAN_4G/srsenb/hdr/stack/mac/schedulers/sched_time_pf.h
+    /// 优先调度: retx > 高优先级 > PF度量值最大
+    std::vector<ul_sched_result> schedule_pf(uint32_t tti);
+
+    /// 轮询(RR)调度算法
+    std::vector<ul_sched_result> schedule_rr(uint32_t tti);
+
+    /// 优先级调度算法
+    std::vector<ul_sched_result> schedule_priority(uint32_t tti);
+
+    /// 为UE生成上行授权 (无锁版本, 供内部调度方法使用)
+    ul_grant generate_ul_grant_unlocked(uint16_t rnti, uint32_t tti,
+                                         uint32_t pid, bool is_retx);
+
+    /// 发出新传授权后扣减UE的缓冲区估计 (无锁版本)
+    /// 对应 srsRAN sched_ue: 避免BSR更新前对同一份数据重复授权
+    void deduct_ul_buffer_unlocked(ue_sched_context& ctx, uint32_t bytes);
+
+    /// 根据SNR计算MCS
+    uint8_t calculate_mcs(uint32_t snr_x100);
+
+    /// 根据MCS和PRB计算TBS
+    uint32_t calculate_tbs(uint8_t mcs, uint32_t n_prb);
+
+    /// 根据CQI(0-15)计算MCS (CQI=0返回0, 由调用方回退SNR)
+    uint8_t calculate_mcs_from_cqi(uint8_t cqi);
+
+    /// 为UE分配一个空闲HARQ进程ID (无锁版本)
+    /// @return 进程ID (0..MAX_HARQ_PROCESSES-1), -1表示全部忙
+    int32_t alloc_free_pid_unlocked(ue_sched_context& ctx);
+
+    /// 从PRB池首次适配分配n个连续PRB (无锁版本, 每TTI重置)
+    /// @return 起始PRB索引, -1表示无足够连续PRB
+    int32_t prb_alloc_unlocked(uint32_t n);
+
+    /// 重置PRB池 (每TTI调度开始时调用)
+    void prb_reset_unlocked();
+
+    sched_algorithm algorithm_;
+    uint32_t total_prb_;
+
+    mutable std::mutex mutex_;
+    std::map<uint16_t, ue_sched_context> ue_db_;
+
+    std::vector<uint8_t> prb_busy_; ///< PRB占用表 (1=已分配), 每TTI重置
+
+    double fairness_coeff_; ///< PF公平性系数
+};
+
+} // namespace ul_mac
