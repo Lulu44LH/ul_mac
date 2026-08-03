@@ -1,0 +1,14 @@
+# 构建产物
+build/
+*.o
+*.obj
+*.exe
+*.test
+
+# IDE
+.vscode/
+.idea/
+
+# 操作系统
+Thumbs.db
+Desktop.ini

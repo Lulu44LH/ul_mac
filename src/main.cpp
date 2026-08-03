@@ -445,6 +445,14 @@ void scenario4_enhanced_features() {
     std::cout << "    Short: " << bsr_stats.short_count << "\n";
     std::cout << "    Long: " << bsr_stats.long_count << "\n";
     std::cout << "    Truncated: " << bsr_stats.truncated_count << "\n";
+
+    // P1: 调度实时性度量 - 展示每次 TTI 调度决策耗时的 P50/P99
+    auto lat = scheduler.get_sched_latency_stats();
+    std::cout << "\n  调度实时性 (schedule_ul 单次耗时, 微秒):\n";
+    std::cout << "    采样数: " << lat.count << "\n";
+    std::cout << "    min=" << lat.min_us << "  max=" << lat.max_us
+              << "  avg=" << lat.avg_us << "\n";
+    std::cout << "    P50=" << lat.p50_us << "  P99=" << lat.p99_us << "\n";
 }
 
 // ============================================================================

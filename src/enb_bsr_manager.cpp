@@ -54,6 +54,8 @@ bool enb_bsr_manager::receive_bsr(uint16_t rnti, const bsr_ce& bsr) {
                 ", skip");
             continue;
         }
+        // TS 36.321 §6.1.3.1: 索引 i 对应区间下界, eNB 按"缓冲区 >= table[i]"解读.
+        // 此处取 table[i] 作为下界估计(保守, 不会高估导致过度授权).
         view[r.lcg_id] = bsr_index_to_bytes(r.buffer_size);
     }
 

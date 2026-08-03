@@ -780,7 +780,8 @@ average_retx_.store(static_cast<float>(stats_.avg_retx_per_pkt));
 | 1 | `include/ul_mac/enb_ul_scheduler.h` | 149 | eNB 侧调度器接口 |
 | 2 | `src/enb_ul_scheduler.cpp` | 309 | 三种调度算法实现 |
 | 3 | `include/ul_mac/ue_context.h` | 205 | UE 侧组件整合 |
-| 4 | `src/main.cpp` | 429 | 4 个仿真场景 + TTI 主循环 |
+| 4 | `include/ul_mac/mac_pdu.h` / `src/mac_pdu.cpp` | — | UL-SCH MAC PDU 组包/解包（P1 新增） |
+| 5 | `src/main.cpp` | 429 | 4 个仿真场景 + TTI 主循环 |
 
 ### 📖 知识讲解 1：eNB 侧调度器（ul_scheduler）
 
@@ -831,8 +832,14 @@ tbs = calculate_tbs(mcs, n_prb);  // 锚点插值 × n_prb / 8
 ```
 阶段1: 重传优先 —— 遍历所有UE, pending_retx_pid有效的先分配 (保证HARQ RTT)
 阶段2: 计算PF度量 —— 对有数据/有SR的UE:
-        pf = current_rate / pow(avg_rate, fairness_coeff)
+        // P1 改进: 分子改用"信道可支持速率封顶后的需求"
+        mcs = cqi>0 ? calculate_mcs_from_cqi(cqi) : calculate_mcs(ul_snr)
+        achievable    = calculate_tbs(mcs, total_prb_)            // 信道可支持瞬时速率
+        demand_capped = min(achievable, total_ul_buffer)          // 需求封顶
+        pf = demand_capped / pow(avg_rate, fairness_coeff)
         按度量值降序排序
+```
+> **P1 改进点**：原 `current_rate` 直接取「待传字节数」，无法体现信道能力。改为先用 MCS 算出「信道可支持的瞬时速率」再与缓冲区需求取 min，使高 CQI 用户在该 TTI 更能体现信道优势（详见 PROTOCOL_NOTES.md §7.2.1）。
 阶段3: 按序分配 —— PRB用完为止; 每次分配后:
         ① 清除sr_pending (真正拿到授权才清, 避免SR丢失)
         ② 扣减该UE的缓冲区估计 (deduct_ul_buffer_unlocked, 避免重复授权)
@@ -936,6 +943,8 @@ for (uint32_t tti = 0; tti < 200; tti++) {
 ### 🔍 代码精读指南
 
 - [ ] `enb_ul_scheduler.cpp`：`handle_sr/bsr/ul_crc` → `calculate_mcs/tbs` → `generate_ul_grant_unlocked`（含NDI/RV管理）→ `deduct_ul_buffer_unlocked` → `schedule_pf`（重点）→ 快速过 rr 和 priority
+- [ ] `schedule_ul()` 里用 `std::chrono::steady_clock` 包裹调度耗时，样本存入 `sched_latency_samples_`（配 `latency_mutex_`），`get_sched_latency_stats()` 返回 P50/P99——这是 P1 新增的实时性评估点（先读 PROTOCOL_NOTES.md §7.2.2）
+- [ ] `mac_pdu.cpp`：先读 `mac_pdu.h` 的 subheader 布局（R/R/E/LCID）与 `mac_lcid` 枚举（Short=21/Long=26/Truncated=22/Padding=31）；`pack` 三步（BSR CE 优先→SDU 复用→Padding 填满），`unpack` 子头链解析与越界容错（先读 PROTOCOL_NOTES.md §7.2.3）
 - [ ] 注意 `generate_ul_grant_unlocked` 的命名：它不加锁，因为调用它的 `schedule_pf` 已持有锁（又是阶段 3 学过的 `_unlocked` 模式！）
 - [ ] `ue_context.h`：构造函数的依赖注入 → `run_tti()` → `handle_ul_grant()` 六步曲 → 三个 `on_xxx` 回调
 - [ ] `main.cpp`：精读场景 1 的循环（上面已注解），场景 2/3/4 看差异点即可（多 UE / 高 BLER / 变流量）
@@ -948,7 +957,7 @@ for (uint32_t tti = 0; tti < 200; tti++) {
 
 ### 🏁 里程碑
 
-✅ 能画出一个 TTI 内 ①~⑨ 的完整调用链；能解释 PF 公式如何平衡公平与效率；能说出成员初始化顺序陷阱。
+✅ 能画出一个 TTI 内 ①~⑨ 的完整调用链；能解释 PF 公式如何平衡公平与效率；能说出成员初始化顺序陷阱；能讲清 MAC PDU 的 subheader(R/R/E/LCID) 布局与 BSR CE 编解码、以及调度耗时 P50/P99 的采集方式。
 
 ---
 
@@ -1201,6 +1210,24 @@ NR 补充：还有 2-step RA（MsgA=preamble+数据，MsgB=响应），降低时
 | ⑰ | 早期终止/差分BSR 头文件声明但未实现 | 注释提到功能但代码为空 | HARQ：连续NACK≥3+重传≥2→提前丢弃；BSR：Padding BSR全部LCG无变化→跳过 | 单测验证早期终止触发；Padding BSR数量减少 |
 | ⑱ | 无延迟统计（P50/P90/P99） | 缺少端到端延迟分布，无法评估QoS | `metrics_collector` 新增 `latency_stats`；`ue_context` 追踪数据到达→发送的TTI差 | 场景4输出 P50=71/P90=200/P99=233 TTI |
 | ⑲ | `get_all_process_info()` 16次重复加锁+`cur_tbs_`数据竞争 | manager mutex 重复加锁16次效率低；`get_current_tbs()` 无锁访问非原子字段 | 新增 `fill_process_info()` 在process锁内一次性读取；`get_all_process_info()` 改为1次加锁 | 并发读写测试无崩溃 |
+
+> **后续 P0/P1 修复（2026-08 在 Windows + g++ 下实施，详见 PROTOCOL_NOTES.md §10）**——这是一轮"关键缺陷清零 + 能力增强"的专项，同样是可讲的面试故事（"我拿到一个能跑但不健壮的代码库，做了系统性加固"）。
+
+| # | 问题 | 为什么错 | 修复 | 验证 |
+|---|---|---|---|---|
+| ⑳ | BSR 索引向上取整（`ceil` 找第一个 ≥ 的索引） | 高估缓冲区，使 eNB 分配超出实际需求的资源 | `bytes_to_bsr_index()` 改为向下取整（找最后一个 ≤ 的索引） | 单测 `test29` 严格校验索引语义 |
+| ㉑ | PRB/TBS 计算分散、不统一 | 多处重复计算口径不一致，易埋 bug | 统一 `calculate_tbs` / `required_prb` 入口 | 单测验证 TBS 随 MCS 单调递增 |
+| ㉒ | 重传 TBS 被重新计算 | 重传用新算的 TBS/MCS，与首传不一致，破坏 NDI/RV 语义 | 重传锁定 `harq_tb[pid]`（首传记录的 tbs/mcs/prb），新传记录、重传复用 | 单测验证重传 TBS 与首传一致 |
+| ㉓ | HARQ 待重传用单值 `pending_retx_pid`（16 进程覆盖） | 多进程并行重传时互相覆盖，丢失重传请求 | 改为 `std::array<bool, MAX_HARQ_PROCESSES> pending_retx` 位图，遍历所有待重传进程 | 单测 `test18` 适配位图 |
+| ㉔ | `get_ue_context()` 返回悬垂引用/指针 | 返回栈上或 map 内部引用，调用方持有期失效 → 未定义行为 | 改为返回 `std::optional<ue_sched_context>`（值拷贝） | 编译通过 + 单测验证 |
+| ㉕ | 有符号/无符号混用（`ul_snr` 等） | SNR 可为负，无符号导致比较/运算异常与越界 | `ul_snr` 等改 `int32_t`，统一有符号处理 | -Wall -Wextra 零警告 |
+| ㉖ | 未初始化成员变量 | 部分字段默认构造值不确定，行为不可复现 | 结构体成员显式初始化 | 编译零警告 |
+| ㉗ | CMake 误列不存在的源文件（header-only 被当 cpp 编） | `lcg_buffer_manager.cpp`/`ue_context.cpp` 实际为 header-only，编译报找不到文件 | 修正 CMakeLists，仅含真实源文件；README 列出 6 个 cpp 直接 g++ 编译路径 | g++ 编译 `RUN_EXIT=0` |
+| ㉘ | （P1）PF 分子用"待传字节数"，未体现信道能力 | 低需求高信道质量 UE 反而获低权重，违背 PF 初衷 | 分子改为「`calculate_tbs(mcs, total_prb)` 信道可支持速率封顶后的需求」 | 单测 + 仿真吞吐对比 |
+| ㉙ | （P1）无调度实时性指标 | 无法评估调度器延迟分布 | `schedule_ul` 用 `steady_clock` 计时，存 `sched_latency_samples_`，新增 `get_sched_latency_stats()` 返回 P50/P99 | 主程序实测 P50≈1μs / P99≈34μs |
+| ㉚ | （P1）无 MAC PDU 组包/解包 | 调度结果无法落地为真实字节流，eNB 侧无法解包校验 | 新增 `mac_pdu.h/.cpp`：`pack`/`unpack`，subheader(R/R/E/LCID)、Short/Long/Truncated BSR CE、SDU 复用 + Padding、越界容错 | 新增 test30-34（34/34 全通过） |
+
+**P0/P1 叙事建议**：优先讲 ㉓+㉔（内存安全：从"单值覆盖"到"位图"、从"悬垂引用"到"`optional` 值语义"——最能体现 C++ 内存模型与生命周期理解）、㉒（协议一致性：重传 TBS 锁定的工程必要性）、㉓→㉗ 整体体现"在 Windows + g++ 严格编译(`-Wall -Wextra -Wpedantic`)下做健壮化"的工程能力。P1 的 ㉚ 可作为"不止修 bug，还补模块"的收尾亮点。
 
 **面试叙事建议**：优先讲 ①（NDI 契约，最能体现协议理解深度）、②（用几何分布理论值验证仿真，体现工程严谨）、⑧（建模完整性：闭环仿真必须让状态能循环）、⑪（跨平台死锁排查：从"Windows 才卡死"的表象定位到随机序列差异 + 同锁重入的真因，并用最小复现验证——完整的并发 debug 故事，可与附录 E.6 死锁专题串讲）。
 

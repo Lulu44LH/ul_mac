@@ -22,6 +22,7 @@
 #include "ul_mac/enb_ul_harq_manager.h"
 #include "ul_mac/enb_bsr_manager.h"
 #include "ul_mac/enb_ul_scheduler.h"
+#include "ul_mac/mac_pdu.h"
 #include "ul_mac/ue_context.h"
 #include "ul_mac/mac_logger.h"
 #include "ul_mac/metrics_collector.h"
@@ -262,9 +263,9 @@ TEST(test_tbs_monotonic) {
     uint32_t tbs3 = 0;
     for (const auto& r : r3) if (r.rnti == 0x0001) tbs3 = r.grant.tbs;
 
-    EXPECT_TRUE(tbs1 > 0);      // 小缓冲区也有授权
-    EXPECT_TRUE(tbs2 > tbs1);   // TBS 单调递增
-    EXPECT_TRUE(tbs3 > tbs2);
+    EXPECT_TRUE(tbs1 > 0);          // 小缓冲区也有授权
+    EXPECT_TRUE(tbs2 >= tbs1);      // TBS 随缓冲区非递减
+    EXPECT_TRUE(tbs3 >= tbs2);      // PRB 饱和时 TBS 封顶, 允许相等
 }
 
 // ============================================================================
@@ -617,25 +618,30 @@ TEST(test_latency_recording) {
 // 死锁修复验证
 // ============================================================================
 
-// 测试18: TB 丢弃后调度器 pending_retx_pid 被清除
-// 对应 LEARNING_PATH.md 附录 E.6 中的状态机死锁修复:
-//   当 HARQ 达到最大重传丢弃 TB 时, 需主动通知调度器清除 pending_retx_pid,
-//   否则调度器会无限重传一个已被丢弃的 TB (活锁)
+// 测试18: TB 丢弃后调度器 pending_retx 位图被清除 (HARQ进程泄漏修复)
+// 验证: 多进程并发 NACK 不会被单值覆盖丢失; ACK 后对应进程位图与 busy 标志清除
 TEST(test_deadlock_fix_discard_clears_retx) {
     ul_scheduler scheduler(sched_algorithm::PROPORTIONAL_FAIR, 100);
     scheduler.add_ue(0x0001);
 
-    // 模拟 CRC 失败: 调度器标记 pending_retx_pid
+    // 模拟 CRC 失败: PID=3 与 PID=7 同时 NACK, 位图两位置位 (验证不互相覆盖)
     scheduler.handle_ul_crc(0x0001, 3, false);  // crc_ok=false
+    scheduler.handle_ul_crc(0x0001, 7, false);  // crc_ok=false
     auto ctx1 = scheduler.get_ue_context(0x0001);
-    EXPECT_TRUE(ctx1 != nullptr);
-    EXPECT_EQ(ctx1->pending_retx_pid, 3u);  // 标记 PID=3 待重传
+    EXPECT_TRUE(ctx1.has_value());
+    if (!ctx1.has_value()) return;
+    EXPECT_TRUE(ctx1->pending_retx[3]);
+    EXPECT_TRUE(ctx1->pending_retx[7]);
 
-    // 模拟 TB 丢弃后的修复: 主动通知调度器清除重传标志
-    // (对应 main.cpp: action.is_discarded 时调用 handle_ul_crc(rnti, pid, true))
-    scheduler.handle_ul_crc(0x0001, 3, true);  // crc_ok=true -> 清除
+    // 模拟 TB 丢弃后的修复: 主动通知调度器清除重传标志 (对应 main.cpp 中 is_discarded)
+    scheduler.handle_ul_crc(0x0001, 3, true);  // crc_ok=true -> 释放PID=3
     auto ctx2 = scheduler.get_ue_context(0x0001);
-    EXPECT_EQ(ctx2->pending_retx_pid, 0xFFFFu);  // 已清除, 不再重传
+    EXPECT_TRUE(ctx2.has_value());
+    if (!ctx2.has_value()) return;
+    EXPECT_FALSE(ctx2->pending_retx[3]);   // 已清除
+    EXPECT_TRUE(ctx2->pending_retx[7]);     // PID=7 仍待重传, 未被覆盖
+    EXPECT_FALSE(ctx2->harq_pid_busy[3]);   // 进程释放
+    EXPECT_TRUE(ctx2->harq_pid_busy[7]);    // 进程仍占用
 }
 
 // ============================================================================
@@ -968,15 +974,18 @@ TEST(test_enb_bsr_quantization_mapping) {
     EXPECT_EQ(bsr.get_ul_buffer(0x0001, 0), bsr_index_to_bytes(63)); // 25000
 
     // 端到端: UE 端 bytes_to_bsr_index(1500) → 编码 idx, eNB 解码 idx → bytes
-    // 验证编解码对称性 (量化误差内)
+    // 协议语义 (TS 36.321 §6.1.3.1): BSR 上报缓冲区为区间下界, 解码值 <= 原值
     uint32_t orig_bytes = 1500;
     uint8_t enc_idx = bytes_to_bsr_index(orig_bytes);
     bsr.receive_bsr(0x0001, make_short_bsr(bsr_format::SHORT_BSR, 0, enc_idx));
     uint32_t decoded_bytes = bsr.get_ul_buffer(0x0001, 0);
-    // 解码值 >= 原值 (向上量化), 且差值不超过一级
-    EXPECT_TRUE(decoded_bytes >= orig_bytes);
-    EXPECT_TRUE(decoded_bytes <= bsr_index_to_bytes(enc_idx));
+    // 解码值 <= 原值 (向下取整, 符合协议下界语义), 且等于对应索引的字节数
+    EXPECT_TRUE(decoded_bytes <= orig_bytes);
     EXPECT_EQ(decoded_bytes, bsr_index_to_bytes(enc_idx));
+    // 区间下界性质: 不存在更小的索引其字节数 > 原值
+    if (enc_idx > 0) {
+        EXPECT_TRUE(bsr_index_to_bytes(enc_idx - 1) <= orig_bytes);
+    }
 }
 
 // 测试29: 未注册UE与空BSR的容错
@@ -1010,6 +1019,114 @@ TEST(test_enb_bsr_error_handling) {
     EXPECT_EQ(bsr.get_total_buffer(0x0001), 0u);
     auto stats_after = bsr.get_ue_stats(0x0001);
     EXPECT_EQ(stats_after.total_bsr_rx, stats_before.total_bsr_rx);
+}
+
+// ============================================================================
+// MAC PDU 组包/解包 测试 (P1: 新增模块, 岗位核心技能)
+// 参考 3GPP TS 36.321 Section 6.1.2 / 6.2.1
+// ============================================================================
+
+// 测试30: Short BSR CE 组包 → 解包 往返一致
+TEST(test_mac_pdu_short_bsr_roundtrip) {
+    uint8_t buf[64];
+    auto bsr = make_short_bsr(bsr_format::SHORT_BSR, 1, 20); // LCG1, idx=20
+    auto pr = mac_pdu_packer::pack_bsr_only(buf, 8, bsr);
+    EXPECT_TRUE(pr.ok);
+    EXPECT_EQ(pr.bsr_bytes, 2u);       // 1B 子头 + 1B BSR
+    EXPECT_TRUE(pr.padding_bytes >= 6u); // 剩余为 padding
+
+    auto ur = mac_pdu_unpacker::unpack(buf, pr.written);
+    EXPECT_TRUE(ur.ok);
+    EXPECT_TRUE(ur.bsr.format == bsr_format::SHORT_BSR);
+    EXPECT_EQ(ur.bsr.reports.size(), 1u);
+    EXPECT_EQ(ur.bsr.reports[0].lcg_id, 1);
+    EXPECT_EQ(ur.bsr.reports[0].buffer_size, 20);
+    EXPECT_EQ(ur.sdus.size(), 0u);    // 无 SDU
+}
+
+// 测试31: Long BSR CE 组包 → 解包 多LCG一致
+TEST(test_mac_pdu_long_bsr_roundtrip) {
+    uint8_t buf[64];
+    auto long_bsr = make_long_bsr({{0, 10}, {1, 20}, {2, 30}, {3, 40}});
+    auto pr = mac_pdu_packer::pack_bsr_only(buf, 16, long_bsr);
+    EXPECT_TRUE(pr.ok);
+    EXPECT_EQ(pr.bsr_bytes, 4u);      // 1B 子头 + 3B BSR
+
+    auto ur = mac_pdu_unpacker::unpack(buf, pr.written);
+    EXPECT_TRUE(ur.ok);
+    EXPECT_TRUE(ur.bsr.format == bsr_format::LONG_BSR);
+    EXPECT_EQ(ur.bsr.reports.size(), 4u);
+    // 校验每个 LCG 的索引还原正确
+    for (uint8_t i = 0; i < 4; ++i) {
+        bool found = false;
+        for (const auto& r : ur.bsr.reports) {
+            if (r.lcg_id == i) { EXPECT_EQ(r.buffer_size, static_cast<uint8_t>((i + 1) * 10)); found = true; break; }
+        }
+        EXPECT_TRUE(found);
+    }
+}
+
+// 测试32: SDU 复用 + Padding 填充
+TEST(test_mac_pdu_sdu_mux_and_padding) {
+    uint8_t buf[64];
+    auto bsr = make_short_bsr(bsr_format::SHORT_BSR, 0, 5);
+    std::vector<lcid_sdu> sdus = {
+        {lcid_sdu{3, 10}},
+        {lcid_sdu{1, 20}},
+    };
+    auto pr = mac_pdu_packer::pack(buf, 40, bsr, sdus);
+    EXPECT_TRUE(pr.ok);
+    EXPECT_EQ(pr.bsr_bytes, 2u);
+    EXPECT_EQ(pr.sdu_bytes, 30u);      // 10 + 20
+    EXPECT_EQ(pr.padding_bytes, 4u);    // 40 - 2(BSR) - 12(SDU1:1+1+10) - 22(SDU2:1+1+20) = 4
+
+    auto ur = mac_pdu_unpacker::unpack(buf, pr.written);
+    EXPECT_TRUE(ur.ok);
+    EXPECT_EQ(ur.sdus.size(), 2u);
+    EXPECT_EQ(ur.sdus[0].lcid, 3);
+    EXPECT_EQ(ur.sdus[0].size, 10u);
+    EXPECT_EQ(ur.sdus[1].lcid, 1);
+    EXPECT_EQ(ur.sdus[1].size, 20u);
+    EXPECT_EQ(ur.bsr.reports[0].lcg_id, 0);
+}
+
+// 测试33: 子头 E 标志链 (多个 SDU 连续)
+TEST(test_mac_pdu_multi_sdu_e_chain) {
+    uint8_t buf[128];
+    std::vector<lcid_sdu> sdus = {
+        {lcid_sdu{0, 5}},
+        {lcid_sdu{2, 7}},
+        {lcid_sdu{4, 3}},
+    };
+    auto pr = mac_pdu_packer::pack(buf, 64, bsr_ce(), sdus); // 仅 SDU, 无 BSR
+    EXPECT_TRUE(pr.ok);
+    EXPECT_EQ(pr.sdu_bytes, 15u);  // 5+7+3
+
+    auto ur = mac_pdu_unpacker::unpack(buf, pr.written);
+    EXPECT_TRUE(ur.ok);
+    EXPECT_EQ(ur.sdus.size(), 3u);
+    EXPECT_EQ(ur.sdus[0].lcid, 0); EXPECT_EQ(ur.sdus[0].size, 5u);
+    EXPECT_EQ(ur.sdus[1].lcid, 2); EXPECT_EQ(ur.sdus[1].size, 7u);
+    EXPECT_EQ(ur.sdus[2].lcid, 4); EXPECT_EQ(ur.sdus[2].size, 3u);
+}
+
+// 测试34: 空 PDU / 越界保护 不崩溃
+TEST(test_mac_pdu_empty_and_oob) {
+    // 空输入
+    auto ur1 = mac_pdu_unpacker::unpack(nullptr, 0);
+    EXPECT_FALSE(ur1.ok);
+
+    // 极小 grant: 仅够 BSR 子头+CE, 无 padding 空间
+    uint8_t buf[8];
+    auto bsr = make_short_bsr(bsr_format::SHORT_BSR, 0, 1);
+    auto pr = mac_pdu_packer::pack(buf, 2, bsr, {});
+    EXPECT_TRUE(pr.ok);
+    EXPECT_EQ(pr.bsr_bytes, 2u);
+
+    // 截断的 PDU (声明长度大于实际): 解包不越界
+    uint8_t bad[4] = {0};
+    auto ur2 = mac_pdu_unpacker::unpack(bad, 4);
+    EXPECT_TRUE(ur2.ok); // 容错, 不崩溃
 }
 
 // ============================================================================

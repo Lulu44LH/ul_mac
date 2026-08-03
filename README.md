@@ -110,13 +110,17 @@ ul_mac_manager/
 │   ├── ue_bsr_manager.h             # BSR缓冲区状态报告管理器
 │   ├── ue_ul_harq_manager.h         # UL HARQ重传管理器
 │   ├── enb_ul_scheduler.h           # eNB侧上行调度器
+│   ├── mac_pdu.h                    # MAC PDU 组包/解包 (TS 36.321 §6.1.2, P1新增)
 │   └── ue_context.h                 # UE上下文（整合所有组件）
 ├── src/
 │   ├── main.cpp                     # 演示入口（4个仿真场景）
 │   ├── ue_sr_manager.cpp            # SR管理器实现
 │   ├── ue_bsr_manager.cpp           # BSR管理器实现
 │   ├── ue_ul_harq_manager.cpp       # HARQ管理器实现
-│   └── enb_ul_scheduler.cpp         # 调度器实现
+│   ├── enb_ul_scheduler.cpp         # 调度器实现 (含PF/RR/优先级 + 实时性统计)
+│   ├── enb_bsr_manager.cpp          # eNB侧BSR解码器
+│   ├── enb_ul_harq_manager.cpp      # eNB侧HARQ接收 (IR软合并 + PHICH)
+│   └── mac_pdu.cpp                  # MAC PDU 组包/解包实现 (P1新增)
 ```
 
 ### 2.2 关键类说明
@@ -285,6 +289,23 @@ cmake ..
 make -j$(nproc)
 ```
 
+> **Windows + MinGW (g++) 直接使用**：本项目提供纯 `g++` 命令行编译路径（无需 CMake）：
+>
+> ```bat
+> rem 演示主程序
+> g++ -std=c++17 -Wall -Wextra -Wpedantic -Iinclude src/main.cpp ^
+>     src/ue_sr_manager.cpp src/ue_bsr_manager.cpp src/ue_ul_harq_manager.cpp ^
+>     src/enb_ul_scheduler.cpp src/enb_bsr_manager.cpp src/enb_ul_harq_manager.cpp ^
+>     -o build/ul_mac_manager.exe -pthread
+> rem 单元测试
+> g++ -std=c++17 -Wall -Wextra -Wpedantic -Iinclude tests/test_main.cpp ^
+>     src/ue_sr_manager.cpp src/ue_bsr_manager.cpp src/ue_ul_harq_manager.cpp ^
+>     src/enb_ul_scheduler.cpp src/enb_bsr_manager.cpp src/enb_ul_harq_manager.cpp ^
+>     -o build/ul_mac_manager_tests.exe -pthread
+> ```
+>
+> 若在 MinGW 环境下使用 CMake，请指定生成器：`cmake -S . -B build -G "MinGW Makefiles"`。
+
 ### 4.3 运行
 
 ```bash
@@ -341,7 +362,7 @@ make -j$(nproc)
 
 ### 5.4 自动化测试
 
-项目包含19个自动化单元测试，覆盖所有核心组件：
+项目包含34个自动化单元测试，覆盖所有核心组件：
 
 ```bash
 # 编译并运行测试
@@ -364,6 +385,7 @@ ctest --output-on-failure
 | 延迟统计 | 2 | P50/P90/P99计算、样本记录 |
 | 死锁修复 | 1 | TB丢弃后pending_retx清除 |
 | 线程安全 | 1 | get_all_process_info并发访问 |
+| MAC PDU | 5 | Short/Long BSR编解码往返、SDU复用+Padding、多SDU子头链、空/越界容错 |
 
 ---
 
@@ -552,7 +574,8 @@ if (abs(new_period - current_period) / current_period < 0.2) return;
 | RV序列 | TS 36.212 §5.2.2 | 高 | {0,2,3,1}序列正确实现 |
 | PF调度 | 业界通用 | 中 | 实现基本PF算法，未包含QoS加权等高级特性 |
 | PHICH处理 | TS 36.213 §8.0 | 中 | 简化为概率模型，未实现完整的PHICH资源映射 |
-| MCS/TBS | TS 36.213 §7.1.7 | 高 | 使用SNR→MCS区间映射表 + TBS锚点查找表（6点线性插值） |
+| MCS/TBS | TS 36.213 §7.1.7 | 低 | 教学近似: SNR→MCS区间映射表 + TBS 6点线性插值 (非完整查表, 偏差可达40%+); UL Grant资源计算已与TBS自洽 |
+| MAC PDU | TS 36.321 §6.1.2 | 中 | 已实现UL MAC PDU组包/解包: subheader(R/R/E/LCID)、Short/Long/Truncated BSR CE、SDU复用、Padding |
 
 **项目简化说明**：
 - 未实现完整的MAC PDU构造（Header + CE + SDU）

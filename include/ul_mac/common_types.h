@@ -350,13 +350,20 @@ inline uint32_t bsr_index_to_bytes(uint8_t index) {
 
 /// 字节数转6-bit BSR缓冲区大小索引
 /// 参考: ocudu/lib/mac/mac_ul/ul_bsr.h (反向映射)
+///
+/// TS 36.321 §6.1.3.1: BSR 的 6-bit 缓冲区大小字段是一个索引 i, 对应区间
+/// [table[i], table[i+1]). UE 应上报满足 "table[i] <= 真实缓冲区" 的最大索引 i,
+/// 即"向下取整". eNB 收到索引 i 后按 **下界** 解读: 认为缓冲区 >= table[i].
+/// 注意: 索引表达的是下界而非精确值, 标准语义下缓冲区必须 **>=** 表格值(而非 <=).
 inline uint8_t bytes_to_bsr_index(uint32_t bytes) {
-    for (uint8_t i = 0; i < BSR_BUFFER_SIZE_LEVELS; i++) {
-        if (bytes <= bsr_index_to_bytes(i)) {
-            return i;
+    if (bytes == 0) return 0;
+    // 向下取整: 返回满足 table[i] <= bytes 的最大 i (缓冲区 >= 表格值).
+    for (uint32_t i = BSR_BUFFER_SIZE_LEVELS - 1; i > 0; --i) {
+        if (bsr_index_to_bytes(static_cast<uint8_t>(i)) <= bytes) {
+            return static_cast<uint8_t>(i);
         }
     }
-    return BSR_BUFFER_SIZE_LEVELS - 1;
+    return 0;
 }
 
 /// RV序列计算 - 对应3GPP TS 36.321 Section 5.4.2.1

@@ -11,7 +11,9 @@
 
 #include "ul_mac/enb_ul_scheduler.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <numeric>
 
 namespace ul_mac {
 
@@ -81,16 +83,17 @@ void ul_scheduler::handle_ul_crc(uint16_t rnti, uint32_t pid, bool crc_ok) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = ue_db_.find(rnti);
     if (it == ue_db_.end() || pid >= MAX_HARQ_PROCESSES) return;
+    auto& ctx = it->second;
     if (!crc_ok) {
-        // NACK: 标记待重传, 进程保持占用 (等待重传)
-        it->second.pending_retx_pid = pid;
-        it->second.harq_pid_busy[pid] = true;
+        // NACK: 标记该进程待重传(位图, 支持多进程并发NACK), 进程保持占用
+        ctx.pending_retx[pid] = true;
+        ctx.harq_pid_busy[pid] = true;
         LOG_DEBUG("SCHED", rnti, 0, "UL CRC FAIL PID=" + std::to_string(pid));
     } else {
         // ACK: 清除待重传标记, 释放HARQ进程
-        if (it->second.pending_retx_pid == pid)
-            it->second.pending_retx_pid = 0xFFFF;
-        it->second.harq_pid_busy[pid] = false;
+        ctx.pending_retx[pid] = false;
+        ctx.harq_pid_busy[pid] = false;
+        ctx.harq_tb[pid].valid = false;  // 原始TB已成功, 重传信息失效
         LOG_DEBUG("SCHED", rnti, 0, "UL CRC OK PID=" + std::to_string(pid));
     }
 }
@@ -152,10 +155,9 @@ static const struct { uint8_t mcs; uint16_t bits_per_prb; } TBS_EFFICIENCY_ANCHO
 static const size_t TBS_ANCHOR_COUNT =
     sizeof(TBS_EFFICIENCY_ANCHOR) / sizeof(TBS_EFFICIENCY_ANCHOR[0]);
 
-uint8_t ul_scheduler::calculate_mcs(uint32_t snr_x100) {
-    // snr_x100为uint32_t, 转为int32_t以便与负阈值正确比较
-    // (避免有符号/无符号比较时负阈值被转换为巨大无符号值导致判断错误)
-    int32_t snr = static_cast<int32_t>(snr_x100);
+uint8_t ul_scheduler::calculate_mcs(int32_t snr_x100) {
+    // 参数直接为 int32_t (SNR x100, 可为负). 负值合法(低SNR区间).
+    int32_t snr = snr_x100;
     // 从高到低查找首个满足阈值的MCS索引, 实现区间映射
     for (int i = 28; i >= 0; --i) {
         if (snr >= SNR_MCS_THRESHOLD[i]) {
@@ -243,37 +245,60 @@ ul_grant ul_scheduler::generate_ul_grant_unlocked(
     if (it == ue_db_.end()) return ul_grant();
     auto& ctx = it->second;
 
-    uint32_t req_bytes = ctx.total_ul_buffer;
-    if (req_bytes == 0) req_bytes = 100;
-    // MCS: 优先用UE上报的CQI, 未上报(cqi=0)则回退SNR
-    uint8_t mcs = (ctx.cqi > 0) ? calculate_mcs_from_cqi(ctx.cqi)
-                                : calculate_mcs(ctx.ul_snr);
-    uint32_t bytes_per_prb = (static_cast<uint32_t>(mcs) + 1) * 72 / 8;
-    uint32_t n_prb = (bytes_per_prb > 0)
-        ? (req_bytes + bytes_per_prb - 1) / bytes_per_prb : total_prb_;
-    n_prb = std::min(n_prb, total_prb_);
-    // 从PRB池首次适配分配连续区间
-    int32_t start = prb_alloc_unlocked(n_prb);
-    if (start < 0) return ul_grant(); // 本TTI无连续PRB可用
-    uint32_t tbs = calculate_tbs(mcs, n_prb);
-
     ul_grant grant;
     grant.rnti = rnti;
     grant.pid = pid;
+
+    uint8_t mcs = (ctx.cqi > 0) ? calculate_mcs_from_cqi(ctx.cqi)
+                                : calculate_mcs(ctx.ul_snr);
+    uint32_t n_prb = 0;
+    uint32_t tbs = 0;
+
+    if (is_retx) {
+        // 重传: TBS/MCS/PRB必须锁定为原始新传值 (TS 36.321 §5.4.2.1)
+        // 保证同一TB的IR软合并前提; NDI不翻转, RV由UE侧递进.
+        const auto& tb = ctx.harq_tb[pid];
+        if (!tb.valid) {
+            // 没有记录原始TB信息(异常), 退回空grant, 避免产生不一致的重传
+            return ul_grant();
+        }
+        n_prb = tb.n_prb;
+        mcs = tb.mcs;
+        // 从PRB池首次适配分配连续区间
+        int32_t start = prb_alloc_unlocked(n_prb);
+        if (start < 0) return ul_grant(); // 本TTI无连续PRB可用
+        grant.prb_start = static_cast<uint32_t>(start);
+        tbs = tb.tbs;
+        grant.ndi = ctx.ndi[pid];
+        grant.rv = -1;
+    } else {
+        uint32_t req_bytes = ctx.total_ul_buffer;
+        if (req_bytes == 0) req_bytes = 100; // 仅够承载 BSR CE + subheader
+        // 用与 calculate_tbs 一致的每PRB效率反推所需PRB数, 保证 PRB/TBS 自洽
+        uint32_t bytes_per_prb = calculate_tbs(mcs, 1);
+        if (bytes_per_prb == 0) bytes_per_prb = 1;
+        n_prb = (req_bytes + bytes_per_prb - 1) / bytes_per_prb;
+        n_prb = std::min(n_prb, total_prb_);
+        // 从PRB池首次适配分配连续区间
+        int32_t start = prb_alloc_unlocked(n_prb);
+        if (start < 0) return ul_grant(); // 本TTI无连续PRB可用
+        grant.prb_start = static_cast<uint32_t>(start);
+        tbs = calculate_tbs(mcs, n_prb);
+        // 记录本次新传的TB信息, 供后续重传回放 (锁定TBS)
+        ctx.harq_tb[pid].tbs = tbs;
+        ctx.harq_tb[pid].mcs = mcs;
+        ctx.harq_tb[pid].n_prb = n_prb;
+        ctx.harq_tb[pid].valid = true;
+        // NDI管理 (3GPP TS 36.321 §5.4.2.1): 新传翻转NDI
+        ctx.ndi[pid] = !ctx.ndi[pid];
+        grant.ndi = ctx.ndi[pid];
+        grant.rv = 0;
+    }
+
     grant.tbs = tbs;
     grant.n_prb = n_prb;
-    grant.prb_start = static_cast<uint32_t>(start);
     grant.mcs = mcs;
-    // NDI管理 (3GPP TS 36.321 §5.4.2.1):
-    //   新传: 翻转该HARQ进程的NDI, UE侧检测到NDI变化即判定为新传
-    //   重传: NDI保持不变, UE侧判定为自适应重传
-    if (!is_retx) {
-        ctx.ndi[pid] = !ctx.ndi[pid];
-    }
-    grant.ndi = ctx.ndi[pid];
     grant.ndi_present = true;
-    // 新传固定RV=0; 重传时rv=-1, 由UE侧HARQ进程按IRV序列{0,2,3,1}自行递进
-    grant.rv = is_retx ? -1 : 0;
     grant.tti_tx = tti;
     return grant;
 }
@@ -292,12 +317,23 @@ void ul_scheduler::deduct_ul_buffer_unlocked(ue_sched_context& ctx, uint32_t byt
 }
 
 std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_ul(uint32_t tti) {
+    // 实时性度量: 测量本次调度决策的执行耗时 (微秒)
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<ul_sched_result> results;
     switch (algorithm_) {
-        case sched_algorithm::PROPORTIONAL_FAIR: return schedule_pf(tti);
-        case sched_algorithm::ROUND_ROBIN:       return schedule_rr(tti);
-        case sched_algorithm::PRIORITY_BASED:    return schedule_priority(tti);
-        default: return schedule_pf(tti);
+        case sched_algorithm::PROPORTIONAL_FAIR: results = schedule_pf(tti); break;
+        case sched_algorithm::ROUND_ROBIN:       results = schedule_rr(tti); break;
+        case sched_algorithm::PRIORITY_BASED:    results = schedule_priority(tti); break;
+        default:                                 results = schedule_pf(tti); break;
     }
+    auto t1 = std::chrono::steady_clock::now();
+    uint64_t us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+    {
+        std::lock_guard<std::mutex> lock(latency_mutex_);
+        sched_latency_samples_.push_back(us);
+    }
+    return results;
 }
 
 std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_pf(uint32_t tti) {
@@ -306,16 +342,17 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_pf(uint32_t tt
     std::lock_guard<std::mutex> lock(mutex_);
     prb_reset_unlocked();
 
-    // 阶段1: 重传优先 (用 pending_retx_pid, 进程仍在忙)
+    // 阶段1: 重传优先 (遍历 pending_retx 位图, 处理所有待重传进程)
     for (auto& [rnti, ctx] : ue_db_) {
-        if (ctx.pending_retx_pid != 0xFFFF) {
+        for (uint32_t pid = 0; pid < MAX_HARQ_PROCESSES; ++pid) {
+            if (!ctx.pending_retx[pid]) continue;
             ul_sched_result res;
             res.rnti = rnti;
-            res.grant = generate_ul_grant_unlocked(rnti, tti, ctx.pending_retx_pid, true);
+            res.grant = generate_ul_grant_unlocked(rnti, tti, pid, true);
             res.is_retx = true;
             if (res.grant.tbs > 0) {
                 // 已调度重传: 清除待重传标记, 进程保持忙直到收到ACK/NACK
-                ctx.pending_retx_pid = 0xFFFF;
+                ctx.pending_retx[pid] = false;
                 results.push_back(res);
                 metrics_collector::instance().record_ul_grant();
                 LOG_INFO("SCHED", rnti, tti,
@@ -330,9 +367,15 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_pf(uint32_t tt
     std::vector<ue_pf> queue;
     for (auto& [rnti, ctx] : ue_db_) {
         if (ctx.total_ul_buffer == 0 && !ctx.sr_pending) continue;
-        double current_rate = static_cast<double>(ctx.total_ul_buffer);
+        // 标准PF: 分子 R_current 为信道可支持瞬时速率 (由CQI/SNR决定的MCS推导)
+        uint8_t mcs = (ctx.cqi > 0) ? calculate_mcs_from_cqi(ctx.cqi)
+                                    : calculate_mcs(ctx.ul_snr);
+        double achievable = static_cast<double>(calculate_tbs(mcs, total_prb_));
+        // 与缓冲区需求取小, 避免无数据UE被空转调度; 同时反映"有多少需要发"
+        double demand_capped = std::min(achievable,
+                                        static_cast<double>(ctx.total_ul_buffer));
         double avg = (ctx.ul_avg_rate > 0) ? ctx.ul_avg_rate : 1.0;
-        double pf = current_rate / std::pow(avg, fairness_coeff_);
+        double pf = demand_capped / std::pow(avg, fairness_coeff_);
         queue.push_back({rnti, pf});
     }
     std::sort(queue.begin(), queue.end(),
@@ -375,13 +418,14 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_rr(uint32_t tt
 
     // 重传优先
     for (auto& [rnti, ctx] : ue_db_) {
-        if (ctx.pending_retx_pid != 0xFFFF) {
+        for (uint32_t pid = 0; pid < MAX_HARQ_PROCESSES; ++pid) {
+            if (!ctx.pending_retx[pid]) continue;
             ul_sched_result res;
             res.rnti = rnti;
-            res.grant = generate_ul_grant_unlocked(rnti, tti, ctx.pending_retx_pid, true);
+            res.grant = generate_ul_grant_unlocked(rnti, tti, pid, true);
             res.is_retx = true;
             if (res.grant.tbs > 0) {
-                ctx.pending_retx_pid = 0xFFFF;
+                ctx.pending_retx[pid] = false;
                 results.push_back(res);
                 metrics_collector::instance().record_ul_grant();
             }
@@ -414,13 +458,14 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_priority(uint3
 
     // 重传优先
     for (auto& [rnti, ctx] : ue_db_) {
-        if (ctx.pending_retx_pid != 0xFFFF) {
+        for (uint32_t pid = 0; pid < MAX_HARQ_PROCESSES; ++pid) {
+            if (!ctx.pending_retx[pid]) continue;
             ul_sched_result res;
             res.rnti = rnti;
-            res.grant = generate_ul_grant_unlocked(rnti, tti, ctx.pending_retx_pid, true);
+            res.grant = generate_ul_grant_unlocked(rnti, tti, pid, true);
             res.is_retx = true;
             if (res.grant.tbs > 0) {
-                ctx.pending_retx_pid = 0xFFFF;
+                ctx.pending_retx[pid] = false;
                 results.push_back(res);
                 metrics_collector::instance().record_ul_grant();
             }
@@ -460,11 +505,34 @@ size_t ul_scheduler::get_nof_ues() const {
     return ue_db_.size();
 }
 
-const ue_sched_context* ul_scheduler::get_ue_context(uint16_t rnti) const {
+ul_scheduler::sched_latency_stats ul_scheduler::get_sched_latency_stats() const {
+    std::lock_guard<std::mutex> lock(latency_mutex_);
+    sched_latency_stats s;
+    if (sched_latency_samples_.empty()) return s;
+    // 复制后排序计算分位数 (避免修改采样序列)
+    std::vector<uint64_t> sorted = sched_latency_samples_;
+    std::sort(sorted.begin(), sorted.end());
+    s.count  = sorted.size();
+    s.min_us = static_cast<double>(sorted.front());
+    s.max_us = static_cast<double>(sorted.back());
+    s.avg_us = static_cast<double>(std::accumulate(sorted.begin(), sorted.end(), 0ULL))
+               / static_cast<double>(sorted.size());
+    // P50 / P99: 线性插值分位数 (nearest-rank 风格)
+    auto q = [&](double p) -> double {
+        size_t idx = static_cast<size_t>(std::ceil(p * sorted.size())) - 1;
+        if (idx >= sorted.size()) idx = sorted.size() - 1;
+        return static_cast<double>(sorted[idx]);
+    };
+    s.p50_us = q(0.50);
+    s.p99_us = q(0.99);
+    return s;
+}
+
+std::optional<ue_sched_context> ul_scheduler::get_ue_context(uint16_t rnti) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = ue_db_.find(rnti);
-    if (it == ue_db_.end()) return nullptr;
-    return &it->second;
+    if (it == ue_db_.end()) return std::nullopt;
+    return it->second;  // 值拷贝, 锁内完成, 调用方无需持锁, 无悬垂指针风险
 }
 
 } // namespace ul_mac

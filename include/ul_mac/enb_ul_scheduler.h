@@ -28,41 +28,56 @@
 #include "ul_mac/common_types.h"
 #include "ul_mac/mac_logger.h"
 #include "ul_mac/metrics_collector.h"
+#include <array>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <vector>
-#include <cstring>
 
 namespace ul_mac {
 
 /// UE调度上下文 (eNB侧维护的每个UE的调度信息)
 /// 参考 srsRAN_4G/srsenb/hdr/stack/mac/sched_ue.h 中的 sched_ue 类
 struct ue_sched_context {
+    // 重传时锁定的TB信息 (保证HARQ重传TBS不变, 符合TS 36.321 §5.4.2.1)
+    struct harq_tb_info {
+        uint32_t tbs   = 0;   ///< 该进程最近一次新传的TBS
+        uint8_t  mcs   = 0;   ///< 对应的MCS
+        uint32_t n_prb = 0;   ///< 对应的PRB数
+        bool     valid = false;  ///< 是否已记录有效TB
+    };
+
     uint16_t rnti;              ///< UE的C-RNTI
     bool     sr_pending;        ///< SR待处理标志
     uint32_t ul_buffer[NOF_LCGS]; ///< 各LCG的上行缓冲区大小 (来自BSR)
     uint32_t total_ul_buffer;   ///< 总上行缓冲区
     int      phr;               ///< 功率余量 (dB)
-    uint32_t ul_snr;            ///< 上行SNR (x100)
+    int32_t  ul_snr;            ///< 上行SNR (x100, 可为负; 低SNR区间需负值)
     double   dl_avg_rate;       ///< 下行平均速率 (PF调度用)
     double   ul_avg_rate;       ///< 上行平均速率 (PF调度用)
     uint32_t ul_nof_samples;    ///< 上行调度次数 (PF调度用)
     uint32_t last_scheduled_tti; ///< 上次被调度的TTI
-    uint32_t pending_retx_pid;  ///< 待重传的HARQ进程ID (0xFFFF=无)
+    std::array<bool, MAX_HARQ_PROCESSES> pending_retx{};  ///< 各进程是否有待重传 (位图, 避免单值覆盖导致进程泄漏)
     bool     ndi[MAX_HARQ_PROCESSES]; ///< 各HARQ进程当前NDI (新传时翻转, 重传时保持)
     uint8_t  cqi;              ///< UE上报的CQI (0-15, 0=未上报, 回退SNR)
     bool     harq_pid_busy[MAX_HARQ_PROCESSES]; ///< 该UE各HARQ进程忙闲 (eNB跟踪, 避免多UE重复分配)
+    harq_tb_info harq_tb[MAX_HARQ_PROCESSES];    ///< 各进程最近新传的TB信息 (重传时回放)
 
     ue_sched_context()
         : rnti(0), sr_pending(false), total_ul_buffer(0)
         , phr(0), ul_snr(200), dl_avg_rate(0.0), ul_avg_rate(0.0)
         , ul_nof_samples(0), last_scheduled_tti(0)
-        , pending_retx_pid(0xFFFF), cqi(0)
+        , cqi(0)
     {
         memset(ul_buffer, 0, sizeof(ul_buffer));
         memset(ndi, 0, sizeof(ndi));
         memset(harq_pid_busy, 0, sizeof(harq_pid_busy));
+        pending_retx.fill(false);
     }
 };
 
@@ -112,14 +127,27 @@ public:
     };
     std::vector<ul_sched_result> schedule_ul(uint32_t tti);
 
+    /// 调度耗时统计 (展示实时性意识: 每 TTI schedule_ul 的执行时间)
+    struct sched_latency_stats {
+        uint64_t count = 0;       ///< 采样次数
+        double   min_us = 0.0;    ///< 最小耗时 (微秒)
+        double   max_us = 0.0;    ///< 最大耗时 (微秒)
+        double   avg_us = 0.0;    ///< 平均耗时 (微秒)
+        double   p50_us = 0.0;    ///< P50 耗时 (微秒)
+        double   p99_us = 0.0;    ///< P99 耗时 (微秒)
+    };
+
+    /// 获取调度耗时统计 (基于历史采样的 P50/P99)
+    sched_latency_stats get_sched_latency_stats() const;
+
     /// 设置调度算法
     void set_algorithm(sched_algorithm algo) { algorithm_ = algo; }
 
     /// 获取当前调度UE数量
     size_t get_nof_ues() const;
 
-    /// 获取UE调度上下文
-    const ue_sched_context* get_ue_context(uint16_t rnti) const;
+    /// 获取UE调度上下文 (返回值拷贝, 调用方无需持有锁, 避免悬垂指针)
+    std::optional<ue_sched_context> get_ue_context(uint16_t rnti) const;
 
 private:
     /// 比例公平(PF)调度算法
@@ -141,8 +169,8 @@ private:
     /// 对应 srsRAN sched_ue: 避免BSR更新前对同一份数据重复授权
     void deduct_ul_buffer_unlocked(ue_sched_context& ctx, uint32_t bytes);
 
-    /// 根据SNR计算MCS
-    uint8_t calculate_mcs(uint32_t snr_x100);
+    /// 根据SNR(x100, 可为负)计算MCS
+    uint8_t calculate_mcs(int32_t snr_x100);
 
     /// 根据MCS和PRB计算TBS
     uint32_t calculate_tbs(uint8_t mcs, uint32_t n_prb);
@@ -170,6 +198,10 @@ private:
     std::vector<uint8_t> prb_busy_; ///< PRB占用表 (1=已分配), 每TTI重置
 
     double fairness_coeff_; ///< PF公平性系数
+
+    // 调度耗时采样 (微秒), 用于 P50/P99 统计
+    mutable std::mutex latency_mutex_;
+    std::vector<uint64_t> sched_latency_samples_;
 };
 
 } // namespace ul_mac

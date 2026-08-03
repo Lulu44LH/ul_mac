@@ -46,9 +46,10 @@
 ### 1.2 本项目范围
 
 本项目聚焦 **UE 侧上行 MAC 用户管理**，参考 srsRAN_4G (LTE) 与 ocudu (NR) 实现。**未实现**的部分（数据面）：
-- 完整 MAC PDU 组装（Header + CE + SDU 复用）
 - 下行 HARQ / 下行调度
 - PHY 实际交互（PHICH 资源映射、PUSCH 发射）
+
+> 注：上行 **MAC PDU 组包/解包** 已在 P1 阶段实现（[mac_pdu.h](include/ul_mac/mac_pdu.h) / [mac_pdu.cpp](src/mac_pdu.cpp)，对应 TS 36.321 §6.1.2）——包含 subheader(R/R/E/LCID)、Short/Long/Truncated BSR CE、SDU 复用与 Padding。详见 §7.4 与 §9。
 
 发送动作用回调抽象解耦（如 [ue_bsr_manager.h:57](include/ul_mac/ue_bsr_manager.h#L57) 的 `bsr_tx_callback`），实现简化为日志。
 
@@ -369,6 +370,41 @@ flowchart TD
 - **重传优先于新传**（保证 HARQ RTT，见 [README.md:506-508](README.md#L506-L508)）
 - 优点：吞吐率与公平性平衡；缺点：计算复杂度高，需维护每 UE 历史状态
 
+### 7.2.1 PF 度量改进（P1，信道速率度量）
+
+原 `R_current` 采用「待传字节数」作为分子，未反映信道可支持能力。P1 改为：
+
+```cpp
+uint8_t mcs = (ctx.cqi > 0) ? calculate_mcs_from_cqi(ctx.cqi)
+                             : calculate_mcs(ctx.ul_snr);
+double achievable    = (double)calculate_tbs(mcs, total_prb_);   // 信道可支持瞬时速率
+double demand_capped = std::min(achievable, (double)ctx.total_ul_buffer); // 需求封顶
+double pf = demand_capped / std::pow(avg, fairness_coeff_);      // α = fairness_coeff_
+```
+
+分子改用「信道可支持的瞬时速率封顶后的需求」，令高 CQI 用户在该 TTI 更能体现信道优势，避免低需求 UE 误获高权重。
+
+### 7.2.2 调度耗时统计（P1 新增）
+
+`schedule_ul()` 用 `std::chrono::steady_clock` 包裹，每次调度延迟存入 `sched_latency_samples_`（配 `latency_mutex_`），并提供：
+
+```cpp
+struct sched_latency_stats { size_t count,min,max,avg,p50,p99; };
+sched_latency_stats get_sched_latency_stats() const;
+```
+
+分位采用 nearest-rank 风格。实测（scenario4，约 500 采样）：P50≈1μs、P99≈34μs，用于评估调度实时性（参考 [README.md 目录 §9](README.md)）。
+
+### 7.2.3 MAC PDU 组包/解包（P1 新增）
+
+实现 UL-SCH MAC PDU 编解码（[mac_pdu.h](include/ul_mac/mac_pdu.h) / [mac_pdu.cpp](src/mac_pdu.cpp)，对应 TS 36.321 §6.1.2）：
+
+- **subheader**：`R|R|E|LCID`（1B）；数据 LCID(0-10) 后跟 `F|L`（1B，7bit L，演示级支持 <128B SDU）。
+- **BSR CE**：`encode_bsr_ce`/`decode_bsr_ce` 支持 Short(1B)/Long(3B，LCG0-3 各 6bit)/Truncated。LCID 取值 Short=21、Truncated=22、Long=26、Padding=31。
+- **pack**：BSR CE 优先 → 按 LCID 复用 SDU → 剩余空间 ≥2B 用 Padding CE，=1B 用单字节 Padding subheader，恰好填满 grant。
+- **unpack**：解析子头链，越界/未知 CE 容错，返回 `mac_pdu_unpack_result`（BSR + SDU 列表 + padding 计数）。
+- 与 `bsr_ce` / `bsr_format`（common_types.h）衔接，供 eNB 侧解包校验。
+
 ### 7.3 UL Grant 生成
 
 1. **MCS 计算**：UE 上报 SNR (0~30dB) → MCS (0~28)，使用 29 个阈值点的区间映射表
@@ -423,13 +459,17 @@ sequenceDiagram
 | PF 调度 | 业界通用 | [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h) | `srsenb::mac::sched` | 中 |
 | MCS/TBS | TS 36.213 §7.1.7 | `enb_ul_scheduler.cpp` | — | 高 |
 | PHICH | TS 36.213 §8.0 | 概率 BLER 模型 | — | 中 |
+| MAC PDU 组包/解包 | TS 36.321 §6.1.2 | [mac_pdu](include/ul_mac/mac_pdu.h) | `srsenb::mac::mac_pdu` | 中 |
+| PF 信道速率度量 | 业界通用 | [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h) | `srsenb::mac::sched` | 中 |
+| 调度耗时统计 | 非协议（工程指标） | [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h) | — | 低 |
 
 ### 9.1 项目简化说明
 
-- 未实现完整 MAC PDU 构造（Header + CE + SDU 复用）
+- 已实现上行 MAC PDU 组包/解包（Header + BSR CE + SDU 复用 + Padding），见 §7.2.3
 - 未实现下行 HARQ 和下行调度
 - 信道模型简化为概率 BLER
 - 发送动作（`bsr_tx_callback` 等）简化为日志，保留回调抽象骨架
+- MAC PDU 演示级仅支持 <128B SDU（7bit L 字段）、LCP 不严格按优先级两阶段（调用方排好序）
 
 ### 9.2 项目增强功能（非协议要求）
 
@@ -440,6 +480,50 @@ sequenceDiagram
 | 差分 BSR | [ue_bsr_manager.h:139](include/ul_mac/ue_bsr_manager.h#L139) | Padding BSR 跳过未变化项，省信令 |
 | HARQ 早期终止 | [ue_ul_harq_manager.h:121](include/ul_mac/ue_ul_harq_manager.h#L121) | 恶劣信道下提前丢弃，省资源 |
 | HARQ RTT 建模 | [ue_ul_harq_manager.h:109](include/ul_mac/ue_ul_harq_manager.h#L109) | 真实模拟 PHICH 反馈时序 |
+| MAC PDU 编解码 | [mac_pdu.h:64](include/ul_mac/mac_pdu.h#L64) | 实现 UL-SCH 组包/解包，便于 eNB 侧校验 |
+| PF 信道速率度量 | [enb_ul_scheduler.cpp](src/enb_ul_scheduler.cpp) | 分子改用信道可支持速率，调度更合理 |
+| 调度耗时统计 | [enb_ul_scheduler.h](include/ul_mac/enb_ul_scheduler.h) | P50/P99 实时性评估 |
+
+---
+
+## 10. P0/P1 修复与 P2 待办
+
+### 10.1 P0 关键缺陷修复（已完成）
+
+| 编号 | 问题 | 修复 |
+|------|------|------|
+| P0-1 | BSR 索引向上取整导致高估缓冲区 | `bytes_to_bsr_index` 改为向下取整 |
+| P0-2 | PRB/TBS 计算不统一 | 统一入口 `calculate_tbs`/`required_prb` |
+| P0-3 | 重传 TBS 被重算，NDI 语义错误 | 重传锁定 `harq_tb[pid]`(tbs/mcs/prb) |
+| P0-4 | HARQ 进程单值 → 多进程悬垂/覆盖 | `pending_retx` 改为 `std::array<bool,MAX_HARQ_PROCESSES>` 位图 |
+| P0-5 | `get_ue_context` 返回悬垂引用 | 改为返回 `std::optional<ue_sched_context>` 值拷贝 |
+| P0-6 | 有符号/无符号混用导致越界 | `ul_snr` 等改 `int32_t`，统一有符号处理 |
+| P0-7 | 未初始化变量 | 结构体成员显式初始化 |
+| P0-8 | 编译/CMake 错误（列不存在 cpp） | 修正 CMakeLists，仅含真实源文件 |
+
+验证：29/29 单元测试通过，主程序 `RUN_EXIT=0`，g++ `-Wall -Wextra -Wpedantic` 零警告。
+
+### 10.2 P1 增强（已完成）
+
+- **PF 信道速率度量**（§7.2.1）
+- **调度耗时统计 P50/P99**（§7.2.2）
+- **MAC PDU 组包/解包模块**（§7.2.3，新增 mac_pdu.h/.cpp）
+- 新增 test30-34（BSR 往返、SDU 复用+Padding、多 SDU 子头链、空/越界容错）
+
+验证：34/34 单元测试通过，主程序调度 P50≈1μs / P99≈34μs。
+
+### 10.3 P2 待办（建议，未实施）
+
+> P2 为「质量/健壮性增强」级别，不阻断现有功能，建议在后续迭代推进。
+
+| 编号 | 内容 | 说明 |
+|------|------|------|
+| P2-1 | 多线程压测 + TSan | 调度器共享状态（`sched_latency_samples_`/`ue_ctx_map_`）目前仅部分加锁；建议引入 `-fsanitize=thread` 压测并发调度路径 |
+| P2-2 | `enb_ue_manager` 生命周期 | UE 上下文增删（接入/释放）需明确 RAII 与互斥保护，避免迭代中悬垂 |
+| P2-3 | 真实 TBS 子表 | 当前 `calculate_tbs` 为锚点+线性插值的教学近似；建议替换为 TS 36.213 Table 7.1.7.2.1-1 完整查表，提升 MCS/TBS 符合度至「高」 |
+| P2-4 | 错误码体系 | 散落的 `bool`/`optional` 返回值统一为 `expected<T,err_code>` 或枚举错误码，便于调用方分类处理 |
+| P2-5 | MAC PDU 大 SDU 与严格 LCP | 支持 ≥128B SDU（15bit L 字段，F=1）、实现两阶段 LCP 令牌桶复用（目前仅按调用方排序复用） |
+| P2-6 | 下行调度/下行 HARQ | 补齐本项目未实现的下行侧，形成完整 eNB MAC |
 
 ---
 
