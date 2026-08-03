@@ -165,7 +165,7 @@ private:
 #define LOG_ERROR(comp, rnti, tti, msg)  \
     ul_mac::mac_logger::instance().error(comp, rnti, tti, msg)
 
-#define LOG_TRACE(comp, rnti, tti, mse) \
-    ul_mac::mac_logger::instance().trace(comp, rnti, tti, mes)
+#define LOG_TRACE(comp, rnti, tti, msg) \
+    ul_mac::mac_logger::instance().trace(comp, rnti, tti, msg)
 
 } // namespace ul_mac

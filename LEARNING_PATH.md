@@ -1,8 +1,10 @@
-# UL MAC Manager 学习路径与知识手册（C++ 初学者版）
+# UL MAC Manager 学习路径与知识手册（eNB 基站侧上行调度视角）
 
-> 本文档 = 学习路径 + 知识讲解教材。面向 C++ 初学者，通过本项目同时掌握：
+> 本文档 = 学习路径 + 知识讲解教材。面向基站平台组实习同学，通过本项目掌握：
 > **① 现代 C++ 工程实践**（C++17、STL、多线程、设计模式）
-> **② LTE/NR MAC 层上行管理协议知识**（SR / BSR / HARQ / 调度，对应 3GPP TS 36.321）
+> **② eNB 基站侧上行 MAC 调度**（SR 接收 / BSR 解码 / HARQ 重传决策 / 资源调度，对应 3GPP TS 36.321）——**这是学习重心**
+>
+> **⚠️ 重心说明**：本项目以 **eNB 基站侧上行调度** 为核心学习对象。UE 侧（`ue_context` / `ue_sr_manager` / `ue_bsr_manager` / `ue_ul_harq_manager`）只是**仿真桩**，用来产生数据、编码 BSR、模拟 HARQ 软缓冲，通过 `main.cpp` 直接"空口"投递给 eNB 调度器。**你（基站组）真正要掌握的是 eNB 侧的接收、决策与反馈闭环**，UE 侧只需理解其"上报语义"即可，不必深究实现。
 >
 > 总周期约 4~5 周（每天 2~3 小时），共 6 个阶段。
 > **使用方法**：按阶段顺序执行，完成一项勾选一项 `- [x]`，达成"里程碑"后进入下一阶段。
@@ -15,16 +17,18 @@
 - [预备知识：术语速查表](#预备知识术语速查表)
 - [阶段 0：环境准备与项目跑通](#阶段-0环境准备与项目跑通05~1-天)
 - [阶段 1：通用类型与工具层](#阶段-1通用类型与工具层2~3-天)
-- [阶段 2：SR 管理器——状态机编程](#阶段-2sr-管理器状态机编程3~4-天)
-- [阶段 3：BSR 管理器 + LCG 缓冲区——数据结构实战](#阶段-3bsr-管理器--lcg-缓冲区数据结构实战4~5-天)
-- [阶段 4：UL HARQ 管理器——并发与组合设计](#阶段-4ul-harq-管理器并发与组合设计4~5-天)
-- [阶段 5：调度器 + 全局整合——算法与架构](#阶段-5调度器--全局整合算法与架构4~5-天)
+- [阶段 2：UE 仿真桩——SR 管理器（理解对端上报）](#阶段-2sr-管理器状态机编程3~4-天)
+- [阶段 3：UE 仿真桩——BSR 管理器 + LCG 缓冲区（理解对端上报）](#阶段-3bsr-管理器--lcg-缓冲区数据结构实战4~5-天)
+- [阶段 4：UE 仿真桩——UL HARQ 管理器（理解对端软缓冲）](#阶段-4ul-harq-管理器并发与组合设计4~5-天)
+- [阶段 5：🔥 eNB 上行调度器（核心，重点学习）](#阶段-5调度器--全局整合算法与架构4~5-天)
 - [阶段 6：融会贯通与输出](#阶段-6融会贯通与输出3~5-天)
 - [附录 A：C++ 知识点 ↔ 项目代码对照总表](#附录-ac-知识点--项目代码对照总表)
 - [附录 B：总览时间表与学习建议](#附录-b总览时间表与学习建议)
 - [附录 C：通信协议知识补充（面试防问）](#附录-c通信协议知识补充面试防问)
 - [附录 D：项目修正记录（面试加分素材）](#附录-d项目修正记录面试加分素材)
 - [附录 E：C++ 并发与多线程面试专题](#附录-ec-并发与多线程面试专题)
+
+> **阅读重心提示**：阶段 2/3/4 的 UE 模块是**仿真桩**，目标是"看懂 UE 给 eNB 喂了什么数据"，不必逐行扣实现；**阶段 5 的 `enb_ul_scheduler` 才是你（基站组）的重心**，建议把最多时间花在这里。
 
 ---
 
@@ -319,7 +323,9 @@ auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
 
 ---
 
-## 阶段 2：SR 管理器——状态机编程（3~4 天）
+## 阶段 2：UE 仿真桩——SR 管理器（理解对端上报，3~4 天）
+
+> **桩阶段**：`ue_sr_manager` 模拟 UE 侧 SR 触发与发送。你只需理解"UE 什么时候举手、eNB 收到 SR 后怎么处理"——**eNB 侧的处理在阶段 5 的 `handle_sr()`**，本阶段重点看 UE 桩行为即可。
 
 **目标**：通过最小的业务模块掌握状态机编程、回调函数、锁的正确使用。
 
@@ -460,9 +466,11 @@ EMA 用一行递推公式实现"带遗忘的平均值"，不需要存历史数�
 
 ---
 
-## 阶段 3：BSR 管理器 + LCG 缓冲区——数据结构实战（4~5 天）
+## 阶段 3：UE 仿真桩——BSR 管理器 + LCG 缓冲区（理解对端上报，4~5 天）
 
-**目标**：掌握 STL 容器实战选型、结构化绑定、mutable 关键字，吃透 BSR 触发与格式选择逻辑。
+> **桩阶段**：`ue_bsr_manager` 模拟 UE 侧 BSR 触发与编码。**eNB 侧怎么解码 BSR、怎么维护 per-UE LCG 缓冲区视图、怎么用于调度，才是你要掌握的**——这部分在阶段 5 的 `enb_bsr_manager::receive_bsr()` + 调度器 `handle_bsr()`。本阶段先看 UE 桩的编码语义。
+
+**目标**：掌握 STL 容器实战选型、结构化绑定、mutable 关键字，吃透 BSR 触发与格式选择逻辑（UE 桩侧）。
 
 ### 阅读顺序
 
@@ -624,7 +632,9 @@ history_idx_++;   // 下标一直递增, 取模后循环覆盖最旧数据
 
 ---
 
-## 阶段 4：UL HARQ 管理器——并发与组合设计（4~5 天）
+## 阶段 4：UE 仿真桩——UL HARQ 管理器（理解对端软缓冲，4~5 天）
+
+> **桩阶段**：`ue_ul_harq_manager` 模拟 UE 侧 HARQ 软缓冲与 NDI 判断。**真正在基站侧做重传决策的是 `enb_ul_scheduler::handle_ul_crc()`**（ACK 释放进程 / NACK 触发重传），配合 `enb_ul_harq_manager::receive_tb()` 做软合并——这部分在阶段 5。本阶段先看 UE 桩的 NDI/RV 语义即可，NDI 翻转契约（面试高频）在阶段 5 会更完整地呈现。
 
 **目标**：掌握对象组合、unique_ptr、std::atomic；吃透 NDI 新传/重传判断（面试最高频考点）。
 
@@ -748,7 +758,7 @@ stats_.avg_retx_per_pkt = static_cast<double>(stats_.total_retx) / stats_.total_
 average_retx_.store(static_cast<float>(stats_.avg_retx_per_pkt));
 ```
 
-统计口径与 metrics_collector 的 `avg_harq_retx()` 保持一致。**验算方法**：BLER=p 时每个 TB 的期望重传次数 ≈ p/(1-p)（几何分布），p=0.3 时理论值 ≈ 0.43，与场景 3 实测的 0.49 同量级——能用理论值验证仿真输出是面试亮点（早期版本这里用错了样本导致均值恒为 1.0，见附录 D）。
+统计口径与 metrics_collector 的 `avg_harq_retx()` 保持一致。**验算方法**：BLER=p 时每个 TB 的期望重传次数 ≈ p/(1-p)（几何分布），p=0.3 时理论值 ≈ 0.43，与早期概率 BLER 版本实测的 0.49 同量级——能用理论值验证仿真输出是面试亮点（早期版本这里用错了样本导致均值恒为 1.0，见附录 D）。注意当前场景 3 已改为确定性 SNR 模型（新传 NACK、IR 合并后 ACK），重传率由 SNR 余量决定而非概率。
 
 ### 🔍 代码精读指南
 
@@ -759,7 +769,7 @@ average_retx_.store(static_cast<float>(stats_.avg_retx_per_pkt));
 
 ### ✏️ 动手练习
 
-- [ ] 场景 3 的 BLER 从 0.30 改成 0.50（main.cpp 第 261 行 `simulate_harq_feedback(0.30, rng)`），先用几何分布期望 1/(1-p) 预测平均传输次数（=2.0），运行对比 `avg_retx` 输出
+- [ ] 把场景 3 的 `enb_harq.set_ul_snr(0x0001, 200)` 改成更低的值（如 100，即 1dB），观察新传失败后需要几次 IR 软合并（每次 +2dB）才能通过解码阈值，对比 `avg_retx` 与 soft_combine 计数的变化（当前为确定性模型：`eff_snr = ul_snr + (合并次数-1)×2dB ≥ MCS阈值+1dB` 才 ACK）
 - [ ] 把场景 3 的 `harq_cfg.max_harq_tx` 从 4 改成 1，观察 "Max ReTX reached" 和 fail 计数的暴涨
 - [ ] 思考题：`generate_new_tx()` 里 `current_irv_ = 0` 而 `generate_tx()` 里 `current_irv_ = (current_irv_+1)%4`，那么第一次新传实际用的 RV 是多少？（答案：RV=rv_of_irv(0)=0，先取值后步进）
 
@@ -769,19 +779,23 @@ average_retx_.store(static_cast<float>(stats_.avg_retx_per_pkt));
 
 ---
 
-## 阶段 5：调度器 + 全局整合——算法与架构（4~5 天）
+## 阶段 5：🔥 eNB 上行调度器（核心，重点学习，4~5 天）
 
-**目标**：理解 PF 调度算法、UE 上下文的组合设计、TTI 主循环，把前四个阶段的模块串成完整系统。
+> **这是整个项目的重心，也是你（基站组）最该花时间的地方**。`enb_ul_scheduler` 把 SR/BSR/CQI/PHR/HARQ 全部收敛为一个每 TTI 的决策：给哪些 UE 授权、授权多少 PRB/MCS/TBS、重传还是新传。阶段 2/3/4 的 UE 桩只是为它"喂数据"。
 
-### 阅读顺序
+**目标**：吃透 eNB 侧上行调度闭环（接收 → 决策 → 授权 → 反馈），理解 PF 调度算法、HARQ 重传决策、TTI 主循环，把前几个阶段的协议要素串成完整基站逻辑。
+
+### 阅读顺序（eNB 核心模块优先）
 
 | 顺序 | 文件 | 行数 | 主题 |
 |---|---|---|---|
-| 1 | `include/ul_mac/enb_ul_scheduler.h` | 149 | eNB 侧调度器接口 |
-| 2 | `src/enb_ul_scheduler.cpp` | 309 | 三种调度算法实现 |
-| 3 | `include/ul_mac/ue_context.h` | 205 | UE 侧组件整合 |
-| 4 | `include/ul_mac/mac_pdu.h` / `src/mac_pdu.cpp` | — | UL-SCH MAC PDU 组包/解包（P1 新增） |
-| 5 | `src/main.cpp` | 429 | 4 个仿真场景 + TTI 主循环 |
+| 1 | `include/ul_mac/enb_ul_scheduler.h` | 149 | **eNB 侧调度器接口**（重心） |
+| 2 | `src/enb_ul_scheduler.cpp` | 309 | **三种调度算法 + grant 生成 + HARQ 管理**（重心） |
+| 3 | `include/ul_mac/enb_bsr_manager.h` / `src/enb_bsr_manager.cpp` | — | **eNB 侧 BSR 解码器**（接收 UE 上报→LCG 视图） |
+| 4 | `include/ul_mac/enb_ul_harq_manager.h` / `src/enb_ul_harq_manager.cpp` | — | **eNB 侧 HARQ 软合并/重传判定**（接收 TB + CRC） |
+| 5 | `include/ul_mac/mac_pdu.h` / `src/mac_pdu.cpp` | — | UL-SCH MAC PDU 组包/解包（P1 新增，eNB 侧校验用） |
+| 6 | `include/ul_mac/ue_context.h` | 205 | UE 侧组件整合（桩，仅了解数据怎么来） |
+| 7 | `src/main.cpp` | 429 | 4 个仿真场景 + TTI 主循环 |
 
 ### 📖 知识讲解 1：eNB 侧调度器（ul_scheduler）
 
@@ -793,10 +807,11 @@ average_retx_.store(static_cast<float>(stats_.avg_retx_per_pkt));
 |---|---|---|
 | `sr_pending` | `handle_sr()` | UE 举过手，即使 BSR 还没到也要给资源 |
 | `ul_buffer[4]` / `total_ul_buffer` | `handle_bsr()`（BSR 索引→字节数） | 决定分配多少资源 |
-| `ul_snr` | 信道测量（本项目固定 200 = 2dB… 实为 x100 编码） | 决定 MCS |
+| `ul_snr` / `cqi` | 信道测量（SNR 固定 200=x100=2dB；CQI 0-15） | 决定 MCS（CQI 优先，SNR 回退） |
 | `ul_avg_rate` / `ul_nof_samples` | 每次调度后 EMA 更新 | PF 算法的"历史平均速率" |
-| `pending_retx_pid` | `handle_ul_crc()` CRC 失败时记录 | 重传优先调度；0xFFFF 表示无待重传 |
+| `pending_retx[16]` | `handle_ul_crc()` CRC 失败时置位（位图） | 重传优先调度；多进程并行不互相覆盖（P0 修复） |
 | `ndi[16]` | 每次发新传授权时翻转 | 每个 HARQ 进程的 NDI 状态（新传翻转/重传保持，与 UE 侧对齐） |
+| `harq_tb[16]` | 新传时记录 tbs/mcs/prb | 重传锁定，保证 TBS 不变（P0 修复关键点） |
 
 #### 5.1b 授权生成中的 NDI/RV 管理（generate_ul_grant_unlocked）
 
@@ -830,7 +845,7 @@ tbs = calculate_tbs(mcs, n_prb);  // 锚点插值 × n_prb / 8
 #### 5.3 PF 调度算法三阶段（schedule_pf，第 137 行）
 
 ```
-阶段1: 重传优先 —— 遍历所有UE, pending_retx_pid有效的先分配 (保证HARQ RTT)
+阶段1: 重传优先 —— 遍历所有UE, 对任一HARQ进程pending_retx[pid]置位的先分配 (位图, 支持多进程并行重传)
 阶段2: 计算PF度量 —— 对有数据/有SR的UE:
         // P1 改进: 分子改用"信道可支持速率封顶后的需求"
         mcs = cqi>0 ? calculate_mcs_from_cqi(cqi) : calculate_mcs(ul_snr)
@@ -863,7 +878,27 @@ std::sort(queue.begin(), queue.end(),
 
 `std::sort` + lambda 是 STL 最常用的组合。注意比较器的语义是"a 是否应排在 b 前面"。
 
-### 📖 知识讲解 2：UE 上下文整合（ue_context.h）
+#### 5.4b eNB 侧 HARQ 重传决策闭环（重心补充）
+
+调度器发出的授权到达 UE，UE 解码 PUSCH 后做 CRC，结果通过 `handle_ul_crc()` 回到 eNB——**这是基站侧真正的重传决策点**：
+
+```cpp
+// src/enb_ul_scheduler.cpp :: handle_ul_crc(rnti, pid, crc_ok)
+if (crc_ok) {
+    ctx.pending_retx[pid] = false;       // 重传请求清除
+    ctx.harq_pid_busy[pid] = false;      // 释放 HARQ 进程, 可被新传复用
+    ctx.harq_tb[pid].valid = false;      // 清除锁定的 TB 信息
+} else {
+    ctx.pending_retx[pid] = true;        // 置位 → 下一 TTI 重传优先
+    // NDI 不翻转(保持), 重传 grant 复用 harq_tb[pid] 锁定的 tbs/mcs/prb
+}
+```
+
+配合 `enb_ul_harq_manager::receive_tb()` 的软合并模型（同数据重复发送 → `effective_snr` 随合并次数累积 +IR 增益），构成 **eNB 侧 HARQ 收尾闭环**。注意这与 UE 侧 `ue_ul_harq_manager` 的 NDI 判断是同一契约的两面：基站发新传时翻转 NDI、发重传时保持，UE 据此区分新数据/重传——**两端 NDI 状态必须一致**，否则新传/重传判反（早期 bug 见附录 D）。
+
+> 学习建议：把 `handle_ul_crc` + `schedule_pf` 的重传分支 + `enb_ul_harq_manager::receive_tb` 连起来读，这是基站组日常最典型的"反馈→决策"循环。
+
+### 📖 知识讲解 2：UE 上下文整合（ue_context.h，桩，仅了解）
 
 #### 5.5 组合设计的教科书案例
 
@@ -910,48 +945,53 @@ ue_context(uint16_t rnti)
 
 ### 📖 知识讲解 3：main.cpp 的 TTI 主循环
 
-以场景 1（第 96~137 行）为例，每个 TTI 内的完整"心跳"：
+以场景 1（main.cpp `scenario1_basic_ul_scheduling`）为例，每个 TTI 内的完整"心跳"：
 
 ```cpp
 for (uint32_t tti = 0; tti < 200; tti++) {
-    // ── UE 侧 ──
+    // ── UE 桩侧 ──
     if (tti % 10 == 0) ue.data_arrived(2, 500);   // ① 模拟RLC数据到达(周期性)
     ue.run_tti(tti);                              // ② BSR.step() + SR.step()
 
     // ── UE→eNB 上行信令(仿真中直接函数调用代替空口传输) ──
     if (ue.get_sr_manager().get_state() == sr_state::PENDING)
         scheduler.handle_sr(ue.get_rnti());       // ③ SR 到达基站
-    /* 每个有数据的LCG */ scheduler.handle_bsr(rnti, lcg, bsr_idx);  // ④ BSR 到达基站
+    auto lcg_sizes = ue.get_buffer_manager().get_all_lcg_buffer_sizes();
+    enb_handle_bsr_ul(enb_bsr, scheduler, ...);   // ④ BSR CE 编码→enb_bsr解码→喂调度器
 
     // ── eNB 侧 ──
     auto results = scheduler.schedule_ul(tti);    // ⑤ 调度决策, 生成Grant
 
-    // ── eNB→UE 下行 + 反馈闭环 ──
-    for (auto& res : results) {
-        grant.hi_value = simulate_harq_feedback(0.1, rng); // ⑥ 掷骰子模拟信道(10% BLER)
-        ue.handle_ul_grant(grant);                         // ⑦ UE处理授权(六步曲)
-        ue.handle_harq_feedback(grant.pid, grant.hi_value);// ⑧ UE收ACK/NACK
-        scheduler.handle_ul_crc(rnti, grant.pid, ok);      // ⑨ eNB记录CRC(失败→排重传)
+    // ── eNB 接收 + 反馈闭环 ──
+    for (const auto& res : results) {
+        ul_grant grant = res.grant;
+        auto rx = enb_harq.receive_tb(rnti, grant); // ⑥ IR软合并+CRC判定(确定性SNR模型)
+        grant.phich_available = true;
+        grant.hi_value = rx.crc_ok;                 //    PHICH 反馈值由 eNB 接收端决定
+        ue.handle_ul_grant(grant);                  // ⑦ UE桩处理授权(六步曲)
+        ue.handle_harq_feedback(grant.pid, grant.hi_value); // ⑧ UE收ACK/NACK
+        scheduler.handle_ul_crc(rnti, grant.pid,
+                                rx.discarded ? true : rx.crc_ok); // ⑨ eNB记录CRC(失败→排重传)
     }
 }
 ```
 
-补充两个 C++ 点：
-- **`std::mt19937 rng(42)`**：梅森旋转随机数引擎，**固定种子 42 保证每次运行结果完全相同**（可复现性，调试仿真程序的关键技巧）；`std::uniform_real_distribution` 生成 0~1 均匀分布用于 BLER 判定
+补充两个要点：
+- **确定性信道模型**：`receive_tb()` 按 `eff_snr = ul_snr + (合并次数-1)×2dB` 与 `MCS阈值+1dB` 比较判定 CRC，同一输入每次运行结果完全相同（可复现性，调试仿真程序的关键；早期版本用 `std::mt19937 rng(42)` 掷骰子模拟概率 BLER，已替换为更贴近物理层语义的 SNR 模型）
 - **`std::vector<std::unique_ptr<ue_context>>`**（场景 2）：ue_context 含 mutex 不可拷贝，vector 里只能放它的智能指针；`push_back(std::make_unique<ue_context>(rnti))` 是标准写法
 
 ### 🔍 代码精读指南
 
 - [ ] `enb_ul_scheduler.cpp`：`handle_sr/bsr/ul_crc` → `calculate_mcs/tbs` → `generate_ul_grant_unlocked`（含NDI/RV管理）→ `deduct_ul_buffer_unlocked` → `schedule_pf`（重点）→ 快速过 rr 和 priority
 - [ ] `schedule_ul()` 里用 `std::chrono::steady_clock` 包裹调度耗时，样本存入 `sched_latency_samples_`（配 `latency_mutex_`），`get_sched_latency_stats()` 返回 P50/P99——这是 P1 新增的实时性评估点（先读 PROTOCOL_NOTES.md §7.2.2）
-- [ ] `mac_pdu.cpp`：先读 `mac_pdu.h` 的 subheader 布局（R/R/E/LCID）与 `mac_lcid` 枚举（Short=21/Long=26/Truncated=22/Padding=31）；`pack` 三步（BSR CE 优先→SDU 复用→Padding 填满），`unpack` 子头链解析与越界容错（先读 PROTOCOL_NOTES.md §7.2.3）
+- [ ] `mac_pdu.cpp`：先读 `mac_pdu.h` 的 subheader 布局（R/R/E/LCID）与 `mac_lcid` 枚举（Truncated=28/Short=29/Long=30/Padding=31，TS 36.321 Table 6.2.1-1，与 srsRAN_4G `ul_sch_lcid` 一致）；`pack` 三步（BSR CE 优先→SDU 复用→Padding 填满），`unpack` 子头链解析与越界容错（先读 PROTOCOL_NOTES.md §7.2.3）
 - [ ] 注意 `generate_ul_grant_unlocked` 的命名：它不加锁，因为调用它的 `schedule_pf` 已持有锁（又是阶段 3 学过的 `_unlocked` 模式！）
 - [ ] `ue_context.h`：构造函数的依赖注入 → `run_tti()` → `handle_ul_grant()` 六步曲 → 三个 `on_xxx` 回调
-- [ ] `main.cpp`：精读场景 1 的循环（上面已注解），场景 2/3/4 看差异点即可（多 UE / 高 BLER / 变流量）
+- [ ] `main.cpp`：精读场景 1 的循环（上面已注解），场景 2/3/4 看差异点即可（多 UE / 弱信道重传 / 变流量）
 
 ### ✏️ 动手练习
 
-- [ ] 场景 2 中通过修改调度器给 5 个 UE 设置不同 SNR（提示：`ue_sched_context::ul_snr` 目前固定 200，可给 `ul_scheduler` 加一个 `set_ue_snr(rnti, snr)` 方法），观察 PF 下五个 UE 的吞吐差异，再切换成 `ROUND_ROBIN` 对比
+- [ ] 场景 2 中通过修改调度器给 5 个 UE 设置不同 SNR（提示：eNB 接收端 `enb_ul_harq_manager` 已有 `set_ul_snr(rnti, snr)`，main.cpp 各场景已在用；但调度器侧 `ue_sched_context::ul_snr` 目前固定 200，可仿照给 `ul_scheduler` 加一个 `set_ue_snr(rnti, snr)` 方法并让 `calculate_mcs` 用它），观察 PF 下五个 UE 的吞吐差异，再切换成 `ROUND_ROBIN` 对比
 - [ ] **综合大作业**：新增 Max C/I 调度算法（只按 `current_rate` 排序、不除历史平均）——完整走一遍：`common_types.h` 加枚举值 → `enb_ul_scheduler.h` 声明 `schedule_max_ci()` → `.cpp` 实现（可复制 schedule_pf 改排序键）→ `schedule_ul()` 加 case → main.cpp 换算法运行对比
 - [ ] 思考题：场景 1 第 109 行，为什么 eNB 能直接读 `ue.get_sr_manager().get_state()`？真实系统里可以吗？（答案：仿真捷径。真实系统中 SR 通过 PUCCH 物理信号传输，eNB 只能检测到能量，本项目用函数调用模拟了这条空口链路）
 
@@ -976,7 +1016,7 @@ for (uint32_t tti = 0; tti < 200; tti++) {
   (gdb) break ul_mac::sr_manager::step
   (gdb) run        # c继续 / n下一行 / s进入函数 / p 变量名 打印
   ```
-- [ ] **协议对照**（进阶可选）：下载 3GPP TS 36.321，精读 §5.4.2（HARQ）/ §5.4.4（SR）/ §5.4.5（BSR）三节，对照 README §9 的符合性表，能说出本项目的 4 项简化（无 MAC PDU 构造、无 LCP、无下行、概率信道模型）
+- [ ] **协议对照**（进阶可选）：下载 3GPP TS 36.321，精读 §5.4.2（HARQ）/ §5.4.4（SR）/ §5.4.5（BSR）三节，对照 README §9 的符合性表，能说出本项目相对真实系统的主要简化（无下行 HARQ/下行调度；信道为确定性 SNR 阈值 + IR 软合并模型而非随机衰落；MAC PDU 仅支持 <128B SDU 的 7-bit L 字段；BSR 量化表为简化版 0~25000 字节；PHR 仅预留接口未实际参与调度）
 - [ ] **溯源 srsRAN**（进阶可选）：按代码注释标注的原型去读真实工程实现：
   - `srsRAN_4G/srsue/src/stack/mac/proc_sr.cc` ↔ 本项目 sr_manager
   - `srsRAN_4G/srsue/src/stack/mac/proc_bsr.cc` ↔ bsr_manager + lcg_buffer
@@ -1111,7 +1151,7 @@ CE 装入 PDU 的优先级：**C-RNTI/数据 > BSR > PHR > 普通数据 > Paddin
 ### C.5 BSR 深入（TS 36.321 §5.4.5）
 
 - **LCG 映射**：RRC 通过 `logicalChannelGroup`（0~3）把每个逻辑信道映射到 LCG——项目 `add_lcg()/add_bearer()` 模拟此配置。典型映射：LCG0=SRB（信令），LCG1~3=DRB 按 QCI 分组
-- **6-bit 缓冲区索引表**（TS 36.321 Table 6.1.3.1-1）：64 级，**指数分布**（0, ≤10, ≤12, ≤14 … ≤150000, >150000 字节）。为什么指数而不是线性？——小缓冲量需要精确（调度小包），大缓冲量只需量级（反正要多次调度），用 6 bit 覆盖 5 个数量级。项目 `bsr_index_to_bytes()` 即此表的逆映射
+- **6-bit 缓冲区索引表**（TS 36.321 Table 6.1.3.1-1）：64 级，**指数分布**（0, ≤10, ≤12, ≤14 … ≤150000, >150000 字节）。为什么指数而不是线性？——小缓冲量需要精确（调度小包），大缓冲量只需量级（反正要多次调度），用 6 bit 覆盖 5 个数量级。项目 `bsr_index_to_bytes()` 即此表的逆映射（**注意**：项目采用简化量化表，上限 25000 字节，标准表上限 150000 字节且 index 63 表示 ">150000"，两者差异详见 PROTOCOL_NOTES.md §4.3）
 - **三种触发的记忆锚点**：Regular=事件驱动（新数据且优先级更高/从空变有），Periodic=定时器驱动，Padding=机会驱动（PDU 有剩余空间）
 - **取消规则**（已在 §3.8 详述）：授权容纳全部数据→取消；发出非 Truncated BSR→取消；Truncated 不取消
 - **NR 差异**：NR 支持 **8 个 LCG**，Long BSR 变长格式（1 字节 bitmap 指示哪些 LCG 有报告 + 变长 BS 字段），缓冲区索引扩展为 **8-bit（256 级）**
@@ -1232,6 +1272,18 @@ NR 补充：还有 2-step RA（MsgA=preamble+数据，MsgB=响应），降低时
 **面试叙事建议**：优先讲 ①（NDI 契约，最能体现协议理解深度）、②（用几何分布理论值验证仿真，体现工程严谨）、⑧（建模完整性：闭环仿真必须让状态能循环）、⑪（跨平台死锁排查：从"Windows 才卡死"的表象定位到随机序列差异 + 同锁重入的真因，并用最小复现验证——完整的并发 debug 故事，可与附录 E.6 死锁专题串讲）。
 
 **新增修正（⑫~⑲）的面试叙事建议**：优先讲⑬（MCS/TBS从线性到查表的协议符合性提升）、⑭（HARQ RTT建模体现对物理层时序的理解）、⑮（从0到19个测试的工程规范提升）。⑫（LCP令牌桶）可与⑧串讲，体现"从简化到完整"的迭代过程。⑯（SR/BSR增强深度）适合展示"不只是实现协议，还能优化协议"的工程能力。
+
+> **后续 P2 协议符合性审查修复（2026-08 实施，详见 PROTOCOL_NOTES.md §10.3）**——这一轮主题是"拿协议原文与权威参照逐值核对 + 深挖构建环境陷阱"。
+
+| # | 问题 | 为什么错 | 修复 | 验证 |
+|---|---|---|---|---|
+| ㉛ | `mac_lcid` 枚举值错误（TRUNCATED_BSR=22 / SHORT_BSR=21 / LONG_BSR=26） | TS 36.321 Table 6.2.1-1 规定 UL-SCH 上 Truncated=28 / Short=29 / Long=30 / Padding=31；错误取值生成的字节流无法与任何标准实现对通 | 枚举值对齐标准表，并与 srsRAN_4G `lib/include/srsran/mac/pdu.h` 的 `ul_sch_lcid` 逐一核对一致 | 34/34 单测通过（测试用枚举名引用，不受影响）；本文档附录 C.3 本就写有正确二进制值（11100/11101/11110），修复后代码与文档恢复自洽——"文档与代码互相矛盾"正是发现此 bug 的线索 |
+| ㉜ | `mac_pdu::pack()` 在**检查授权空间之前**就写入 BSR CE | 授权小于 CE 时（如 Long BSR 需 4 字节而 grant 仅剩 2 字节）越界写缓冲区 | 先按格式计算 CE 长度（Short/Truncated=1、Long=3），检查放得下再编码，并复核实际编码长度一致 | test30-34 覆盖小授权/空授权容错 |
+| ㉝ | `LOG_TRACE` 宏形参名拼写错误（声明 `mse`、宏体引用 `mes`） | 任何 TRACE 级日志调用都无法编译（潜伏问题，只因从未启用 TRACE 未暴露） | 统一形参名 | `-Wall -Wextra -Wpedantic` 零警告 |
+| ㉞ | MinGW 编译的 exe 在 -O2 下启动即段错误（零输出、-O0 侥幸通过） | 与业务代码无关：本机 g++（D:\WorkStudio\mingw64）与 Git for Windows 自带的旧版 `libstdc++-6.dll` ABI 不匹配，Windows 加载器按 PATH 优先找到后者，静态初始化阶段即崩溃 | 编译加 `-static` 静态链接 C++ 运行时，杜绝 DLL 劫持/版本冲突 | 静态链接后 34/34 单测通过、主程序 4 场景全部 `RUN_EXIT=0`；用 `git stash` 验证该问题在改动前就存在，排除了"改出来的"嫌疑 |
+| ㉟ | `test_main.cpp` 两处 BSR 注释与量化表不符（index 10 注成 46 bytes、index 60 注成 21956 bytes） | 注释值错一个索引位（46 是 index 9、21956 是 index 62），误导读者核对量化表 | 更正为 index 10 → 52 bytes、index 60 → 17212 bytes | 与 `common_types.h` `size_table` 逐项核对一致 |
+
+**P2 叙事建议**：㉛ 适合讲"用权威参照（3GPP 表格 + srsRAN 源码）交叉核对自己的实现"，且发现过程本身就是故事——附录 C.3 文档里的二进制值是对的、代码却是错的，文档与代码的矛盾暴露了问题；㉜ 是"检查顺序错误导致越界写"的典型内存安全案例，可与 ㉓㉔ 串讲；㉞ 是环境陷阱排查故事：面对零输出段错误，用 gdb 定位到崩溃发生在第三方 DLL 的静态构造、再用 git stash 确认问题早于自己的改动——"不冤枉业务代码，也不放过环境问题"。
 
 ---
 

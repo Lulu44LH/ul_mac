@@ -31,10 +31,11 @@ enum class mac_lcid : uint8_t {
     // 0-10: 逻辑信道 (数据)
     MIN_DATA_LCID = 0,
     MAX_DATA_LCID = 10,
-    // 控制元素 CE
-    TRUNCATED_BSR = 22,   ///< Truncated BSR (无 L 字段)
-    SHORT_BSR     = 21,   ///< Short BSR (无 L 字段)
-    LONG_BSR      = 26,   ///< Long BSR (无 L 字段)
+    // 控制元素 CE —— 取值依据 3GPP TS 36.321 Table 6.2.1-1 (UL-SCH),
+    // 与 srsRAN_4G lib/include/srsran/mac/pdu.h 的 ul_sch_lcid 一致
+    TRUNCATED_BSR = 28,   ///< Truncated BSR (无 L 字段)
+    SHORT_BSR     = 29,   ///< Short BSR (无 L 字段)
+    LONG_BSR      = 30,   ///< Long BSR (无 L 字段)
     PADDING       = 31,   ///< Padding (无 L 字段)
 };
 

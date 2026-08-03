@@ -1,28 +1,30 @@
-# UL MAC 层通信协议知识整理
+# UL MAC 层通信协议知识整理（eNB 基站侧上行调度视角）
 
 > 基于 3GPP TS 36.321 (LTE MAC) / TS 38.321 (NR MAC) 协议规范
 > 结合本项目 `ul_mac_manager` 的具体实现进行梳理
+> **文档重心**：本项目以 **eNB/gNB 基站侧上行调度** 为学习和实现重点；UE 侧（ue_context / ue_*_manager）仅为**仿真桩**，用于驱动 eNB 调度器、模拟对端行为
 > 所有状态机/决策流程图均对应项目源码中的实际逻辑
 
 ---
 
 ## 目录
 
-1. [MAC 层定位与协议栈](#1-mac-层定位与协议栈)
+1. [MAC 层定位与协议栈（eNB 视角）](#1-mac-层定位与协议栈)
 2. [关键常量与参数](#2-关键常量与参数)
 3. [SR 调度请求 (§5.4.4)](#3-sr-调度请求-544)
 4. [BSR 缓冲区状态报告 (§5.4.5)](#4-bsr-缓冲区状态报告-545)
 5. [UL HARQ 重传 (§5.4.2)](#5-ul-harq-重传-542)
 6. [LCP 逻辑信道优先级 (§5.4.3.1)](#6-lcp-逻辑信道优先级-5431)
-7. [UL Scheduler 上行调度器](#7-ul-scheduler-上行调度器)
-8. [端到端上行流程](#8-端到端上行流程)
+7. [UL Scheduler 上行调度器（本项目核心模块）](#7-ul-scheduler-上行调度器本项目核心模块)
+8. [端到端上行流程（eNB 主视角）](#8-端到端上行流程)
 9. [项目与协议对应关系](#9-项目与协议对应关系)
+10. [P0/P1 修复与 P2 待办](#10-p0p1-修复与-p2-待办)
 
 ---
 
 ## 1. MAC 层定位与协议栈
 
-### 1.1 协议栈位置
+### 1.1 协议栈位置（本项目关注 eNB MAC）
 
 ```
 ┌─────────────────────────────────┐
@@ -32,26 +34,45 @@
 ├─────────────────────────────────┤
 │  RLC (分段/重传/ARQ)             │
 ├─────────────────────────────────┤
-│  MAC ← 本项目关注层              │
-│    • 逻辑信道 ↔ 传输信道映射      │
-│    • 调度请求 SR                  │
-│    • 缓冲区状态报告 BSR           │
-│    • HARQ 重传                    │
-│    • 逻辑信道优先级 LCP           │
+│  MAC                            │
+│   ┌───────────────────────────┐ │
+│   │ eNB 侧 (本项目重心)       │ │  ← 调度器在此: 收 SR/BSR/CQI/PHR/CRC
+│   │  • 上行资源调度 (UL Grant) │ │     决策 MCS/PRB/TBS、生成授权、管 HARQ
+│   │  • 调度请求 SR 接收        │ │
+│   │  • 缓冲区状态 BSR 解码     │ │
+│   │  • HARQ 重传调度           │ │
+│   │  • 逻辑信道优先级 LCP      │ │
+│   └───────────────────────────┘ │
+│   ┌───────────────────────────┐ │
+│   │ UE 侧 (本项目为仿真桩)    │ │  ← 仅模拟对端: 产生数据/发 SR/编 BSR
+│   │  • 触发 SR / 编码 BSR      │ │     供 eNB 调度器消费, 不参与决策
+│   │  • HARQ 软缓冲 / NDI 判断  │ │
+│   └───────────────────────────┘ │
 ├─────────────────────────────────┤
 │  PHY (物理层, 调制/编码/发射)     │
 └─────────────────────────────────┘
 ```
 
+> **学习重心提示**：基站平台组的真实工作中，你面对的就是 eNB MAC 调度器这一侧——接收 UE 上报、做调度决策、下发授权、处理 HARQ 反馈。UE 侧代码在本项目里只用来"喂数据"，理解其**上报语义**即可，不必深究其实现细节。
+
 ### 1.2 本项目范围
 
-本项目聚焦 **UE 侧上行 MAC 用户管理**，参考 srsRAN_4G (LTE) 与 ocudu (NR) 实现。**未实现**的部分（数据面）：
+本项目聚焦 **eNB 基站侧上行 MAC 调度**，参考 srsRAN_4G `srsenb` (LTE) 与 ocudu scheduler (NR) 实现。
+
+**eNB 侧核心模块（重点学习）**：
+- [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h)：上行调度器——接收 SR/BSR/CQI/PHR/CRC，运行 PF/RR/Priority 算法，生成 UL Grant，管理 HARQ 进程
+- [enb_bsr_manager](include/ul_mac/enb_bsr_manager.h)：eNB 侧 BSR 解码器——把 UE 上报的 BSR CE 解码为 per-UE LCG 缓冲区视图
+- [enb_ul_harq_manager](include/ul_mac/enb_ul_harq_manager.h)：eNB 侧 HARQ 软合并/重传决策——维护 per-UE 软缓冲与 NDI，输出 CRC 解码成败
+
+**UE 侧仿真桩（理解对端即可）**：
+- [ue_context](include/ul_mac/ue_context.h) / [ue_sr_manager](include/ul_mac/ue_sr_manager.h) / [ue_bsr_manager](include/ul_mac/ue_bsr_manager.h) / [ue_ul_harq_manager](include/ul_mac/ue_ul_harq_manager.h)：模拟 UE 行为，产生数据、编码 BSR、执行 HARQ 软缓冲，通过 `main.cpp` 的函数调用直接把报告"空口"投递给 eNB 调度器。**这些模块不掌握调度决策权**，仅用于让 eNB 调度器在闭环中跑起来。
+
+**未实现**的部分：
 - 下行 HARQ / 下行调度
 - PHY 实际交互（PHICH 资源映射、PUSCH 发射）
+- UE 侧真实协议栈（RLC/PDCP 集成）
 
-> 注：上行 **MAC PDU 组包/解包** 已在 P1 阶段实现（[mac_pdu.h](include/ul_mac/mac_pdu.h) / [mac_pdu.cpp](src/mac_pdu.cpp)，对应 TS 36.321 §6.1.2）——包含 subheader(R/R/E/LCID)、Short/Long/Truncated BSR CE、SDU 复用与 Padding。详见 §7.4 与 §9。
-
-发送动作用回调抽象解耦（如 [ue_bsr_manager.h:57](include/ul_mac/ue_bsr_manager.h#L57) 的 `bsr_tx_callback`），实现简化为日志。
+> 注：上行 **MAC PDU 组包/解包** 已在 P1 阶段实现（[mac_pdu.h](include/ul_mac/mac_pdu.h) / [mac_pdu.cpp](src/mac_pdu.cpp)，对应 TS 36.321 §6.1.2）——用于 eNB 侧把调度结果落地为字节流、并解包 UE 上报的 PDU 校验。详见 §7.2.3 与 §9。
 
 ---
 
@@ -92,11 +113,32 @@ ul_harq_config:
 ## 3. SR 调度请求 (§5.4.4)
 
 **协议参考**：TS 36.321 §5.4.4 / TS 38.321 §5.4.4
-**项目实现**：[ue_sr_manager.h](include/ul_mac/ue_sr_manager.h) / [ue_sr_manager.cpp](src/ue_sr_manager.cpp)
 
-### 3.1 触发条件
+> **本协议主线在 eNB 侧**：SR 最终由 eNB 调度器在 `ul_scheduler::handle_sr()` 接收、在 `schedule_ul()` 中决策授权。UE 侧 `ue_sr_manager` 只是产生 SR 信号的**仿真桩**，理解其"上报"语义即可。
+> - **eNB 侧（重点）**：[enb_ul_scheduler.h](include/ul_mac/enb_ul_scheduler.h) `handle_sr()` / `schedule_ul()`
+> - **UE 侧（桩）**：[ue_sr_manager.h](include/ul_mac/ue_sr_manager.h) / [ue_sr_manager.cpp](src/ue_sr_manager.cpp)
+
+### 3.1 触发条件（UE 桩视角）
 
 当 **Regular BSR 被触发** 且 UE **无上行授权** 时，触发 SR 过程（[ue_sr_manager.cpp](src/ue_sr_manager.cpp) `start()`）。若 PUCCH 未配置，则直接回退到随机接入 (RA)。
+
+### 3.1b eNB 侧处理（重点）：handle_sr → 调度决策
+
+```cpp
+// 文件: src/enb_ul_scheduler.cpp  (eNB 调度器)
+void ul_scheduler::handle_sr(uint16_t rnti) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = ue_db_.find(rnti);
+    if (it == ue_db_.end()) return;
+    ue_sched_context& ctx = it->second;
+    // SR 冷却: 4ms 内已调度过则不重复触发(避免 SR 风暴)
+    if (ctx.last_scheduled_tti != UINT32_MAX &&
+        (tti - ctx.last_scheduled_tti) < 4) return;
+    ctx.sr_pending = true;   // 置位, 供 schedule_ul() 在排序时优先
+}
+```
+- eNB 收到 SR 仅置 `sr_pending` 标志，**不立即分配资源**；真正授权在 `schedule_ul()` 按算法统一分配
+- `sr_pending` 在调度排序中享有最高优先级（见 §7 schedule_pf 阶段1）
 
 ### 3.2 SR 状态机
 
@@ -144,9 +186,12 @@ new_period = clamp(K / log2(1 + ema_rate), 5, 80)      // 对数连续映射
 ## 4. BSR 缓冲区状态报告 (§5.4.5)
 
 **协议参考**：TS 36.321 §5.4.5 / TS 38.321 §5.4.5
-**项目实现**：[ue_bsr_manager.h](include/ul_mac/ue_bsr_manager.h) / [ue_bsr_manager.cpp](src/ue_bsr_manager.cpp)
 
-### 4.1 三种触发类型
+> **本协议主线在 eNB 侧**：eNB 通过 `enb_bsr_manager::receive_bsr()` 把 UE 上报的 BSR CE 解码成 **per-UE LCG 缓冲区视图**，这是调度器做资源分配的输入。UE 侧 `ue_bsr_manager` 是**编码桩**。
+> - **eNB 侧（重点）**：[enb_bsr_manager.h](include/ul_mac/enb_bsr_manager.h) `receive_bsr()` → 维护 `ue_db_[rnti].lcg_buffer[]`
+> - **UE 侧（桩）**：[ue_bsr_manager.h](include/ul_mac/ue_bsr_manager.h) / [ue_bsr_manager.cpp](src/ue_bsr_manager.cpp) 编码 BSR CE
+
+### 4.1 三种触发类型（UE 桩视角）
 
 定义见 [common_types.h:78-83](include/ul_mac/common_types.h#L78-L83)。
 
@@ -175,10 +220,10 @@ flowchart TD
 
 [common_types.h:333-348](include/ul_mac/common_types.h#L333-L348) `bsr_index_to_bytes()`：
 
-- 6-bit 索引 0~63 对应字节数 0~25000
+- 6-bit 索引 0~63 对应字节数 0~25000（**本项目为演示用的简化表**，上限 25000 字节）
 - **对数尺度**：小缓冲区精度高（Index 10 → 52 bytes），大缓冲区精度低（Index 62 → 21956 bytes）
-- 量化公式（3GPP 标准）：`BS[i] = ceil(BS[i-1] × 1.12)`
-- 反向映射 `bytes_to_bsr_index()` 采用线性查找（项目简化）
+- 3GPP 标准表（TS 36.321 Table 6.1.3.1-1）的量化公式为 `BS[i] = ceil(BS[i-1] × 1.12)`，索引 62 对应 150000 字节、索引 63 表示 ">150000"。项目简化表保持了相同的"对数递增"形状，但量纲上限更小——面试/阅读时需能区分"标准表"与"项目表"
+- 反向映射 `bytes_to_bsr_index()` 采用向下取整语义（返回满足 `table[i] <= bytes` 的最大索引 i，对应 §5.4.5 的区间下界解读），线性查找实现
 
 ### 4.4 BSR 定时器
 
@@ -189,7 +234,30 @@ flowchart TD
 | `periodicBSR-Timer` | 80 ms | 超时触发 Periodic BSR，确保 eNB 有最新缓冲区信息 |
 | `retxBSR-Timer` | 320 ms | Regular BSR 发送后启动，超时且仍有数据则重发 Regular BSR |
 
-### 4.5 项目增强
+### 4.4b eNB 侧解码（重点）：receive_bsr → LCG 缓冲区视图
+
+```cpp
+// 文件: src/enb_bsr_manager.cpp  (eNB 侧)
+bool enb_bsr_manager::receive_bsr(uint16_t rnti, const bsr_ce& bsr) {
+    // ... 查 ue_db_, 校验 reports 非空 ...
+    auto& view = ue_db_[rnti].lcg_buffer;
+    // Short/Truncated: 只更新报告的 1 个 LCG, 不影响其它
+    // Long: 先清零所有 LCG, 再填报告项 (UE 端只编码 buffer>0 的 LCG)
+    if (bsr.format == bsr_format::LONG_BSR) view.fill(0);
+    for (const auto& r : bsr.reports) {
+        if (r.lcg_id >= NOF_LCGS) continue;
+        // TS 36.321 §6.1.3.1: 索引对应区间下界, eNB 按 "缓冲区 >= table[i]" 解读
+        view[r.lcg_id] = bsr_index_to_bytes(r.buffer_size);
+    }
+    // 更新统计: total_bsr_rx / short_count / truncated_count / long_count
+}
+```
+- 解码结果 `ue_db_[rnti].lcg_buffer[]` 被 `ul_scheduler::handle_bsr()` → `ue_db_[rnti].ul_buffer[]` 取用，是调度器分配资源的依据
+- 关键语义：**Short/Truncated BSR 只更新部分 LCG**（标准 §5.4.5 允许），eNB 视图中未报告的 LCG 保留旧值——这是标准行为，不是 bug
+
+### 4.5 UE 桩增强（非 eNB 逻辑，仅了解）
+
+> 以下增强位于 UE 侧 `ue_bsr_manager`，属于"对端更聪明地编码 BSR"的演示，**未接入 eNB 调度器决策**，仅作协议扩展认知，不必深究。
 
 #### 4.5.1 预测性 BSR
 
@@ -197,7 +265,7 @@ flowchart TD
 
 - 保留最近 10 个 TTI 的缓冲区历史（[ue_bsr_manager.h:204](include/ul_mac/ue_bsr_manager.h#L204) `buffer_history_`）
 - 使用最小二乘线性回归预测未来缓冲区需求
-- 帮助调度器提前规划资源，减少调度延迟
+- *注：场景4 中每 50 TTI 调用一次并打印预测值作演示，但预测结果**未接入 eNB 调度器决策**，仅作协议扩展认知*
 
 #### 4.5.2 差分 BSR
 
@@ -212,9 +280,12 @@ flowchart TD
 ## 5. UL HARQ 重传 (§5.4.2)
 
 **协议参考**：TS 36.321 §5.4.2 / TS 38.321 §5.4.2
-**项目实现**：[ue_ul_harq_manager.h](include/ul_mac/ue_ul_harq_manager.h) / [ue_ul_harq_manager.cpp](src/ue_ul_harq_manager.cpp)
 
-### 5.1 LTE 上行 HARQ 特性
+> **本协议主线在 eNB 侧**：HARQ 重传决策由 eNB 调度器在 `ul_scheduler::handle_ul_crc()` 中完成（根据 CRC 结果翻转 NDI / 触发重传 / 释放进程）。eNB 侧 `enb_ul_harq_manager` 维护 per-UE 软合并缓冲与 NDI 跟踪；UE 侧 `ue_ul_harq_manager` 是**软缓冲桩**。
+> - **eNB 侧（重点）**：[enb_ul_scheduler.h](include/ul_mac/enb_ul_scheduler.h) `handle_ul_crc()` / [enb_ul_harq_manager.h](include/ul_mac/enb_ul_harq_manager.h) `receive_tb()`
+> - **UE 侧（桩）**：[ue_ul_harq_manager.h](include/ul_mac/ue_ul_harq_manager.h) / [ue_ul_harq_manager.cpp](src/ue_ul_harq_manager.cpp)
+
+### 5.1 LTE 上行 HARQ 特性（协议背景）
 
 - **同步 HARQ**：进程 ID 由子帧号隐式确定（固定时序）
 - **RTT = 8 TTI**（FDD），一个进程发送后需等 8ms 才能收到 PHICH 反馈
@@ -345,9 +416,32 @@ flowchart LR
 
 ---
 
-## 7. UL Scheduler 上行调度器
+## 7. UL Scheduler 上行调度器（本项目核心模块）
 
-**项目实现**：[enb_ul_scheduler.h](include/ul_mac/enb_ul_scheduler.h) / [enb_ul_scheduler.cpp](src/enb_ul_scheduler.cpp)
+**项目实现（eNB 侧，重点学习）**：[enb_ul_scheduler.h](include/ul_mac/enb_ul_scheduler.h) / [enb_ul_scheduler.cpp](src/enb_ul_scheduler.cpp)
+
+> **这是整个项目的重心**：eNB 上行调度器把前面所有协议要素（SR/BSR/CQI/PHR/HARQ）收敛为**一个每 TTI 的决策**——给哪些 UE 授权、授权多少 PRB/MCS/TBS。基站平台组的日常工作核心即在此。
+
+### 7.0 调度器闭环（eNB 主视角）
+
+```
+ UE ──SR/BSR/CQI/PHR──▶ handle_sr/bsr/cqi/phr()  ──▶ ue_db_[rnti] 上下文更新
+                              │
+                   每 TTI: schedule_ul(tti)
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                                ▼
+       schedule_pf/rr/priority           generate_ul_grant_unlocked()
+       ①重传优先 ②SR优先 ③PF度量           → MCS/PRB/TBS/NDI/RV
+              │                                │
+              └───────────────┬────────────────┘
+                              ▼
+                   返回 UL Grant 列表 ──▶ (空口发送给 UE)
+                              │
+   UE 解码 PUSCH, CRC ──UL CRC──▶ handle_ul_crc(rnti,pid,crc_ok)
+              │                                │
+              └── ACK: 释放进程 / NACK: 置 pending_retx ─┘
+```
 
 ### 7.1 三种调度算法
 
@@ -400,8 +494,8 @@ sched_latency_stats get_sched_latency_stats() const;
 实现 UL-SCH MAC PDU 编解码（[mac_pdu.h](include/ul_mac/mac_pdu.h) / [mac_pdu.cpp](src/mac_pdu.cpp)，对应 TS 36.321 §6.1.2）：
 
 - **subheader**：`R|R|E|LCID`（1B）；数据 LCID(0-10) 后跟 `F|L`（1B，7bit L，演示级支持 <128B SDU）。
-- **BSR CE**：`encode_bsr_ce`/`decode_bsr_ce` 支持 Short(1B)/Long(3B，LCG0-3 各 6bit)/Truncated。LCID 取值 Short=21、Truncated=22、Long=26、Padding=31。
-- **pack**：BSR CE 优先 → 按 LCID 复用 SDU → 剩余空间 ≥2B 用 Padding CE，=1B 用单字节 Padding subheader，恰好填满 grant。
+- **BSR CE**：`encode_bsr_ce`/`decode_bsr_ce` 支持 Short(1B)/Long(3B，LCG0-3 各 6bit)/Truncated。LCID 取值按 TS 36.321 Table 6.2.1-1（UL-SCH）：Truncated=28、Short=29、Long=30、Padding=31，与 srsRAN_4G `mac/pdu.h` 的 `ul_sch_lcid` 一致。
+- **pack**：BSR CE 优先（先按格式校验空间再编码，避免小 grant 越界写）→ 按 LCID 复用 SDU → 剩余空间 ≥2B 用 Padding CE，=1B 用单字节 Padding subheader，恰好填满 grant。
 - **unpack**：解析子头链，越界/未知 CE 容错，返回 `mac_pdu_unpack_result`（BSR + SDU 列表 + padding 计数）。
 - 与 `bsr_ce` / `bsr_format`（common_types.h）衔接，供 eNB 侧解包校验。
 
@@ -448,28 +542,29 @@ sequenceDiagram
 
 ## 9. 项目与协议对应关系
 
-| 功能模块 | 协议章节 | 项目实现 | srsRAN 原型 | 符合度 |
+| 功能模块 | 协议章节 | 项目实现（**eNB 侧为重点** / UE 侧为桩） | srsRAN 原型 | 符合度 |
 |---------|---------|---------|------------|--------|
-| SR 状态机 | TS 36.321 §5.4.4 | [ue_sr_manager](include/ul_mac/ue_sr_manager.h) | `srsue::mac::sr_proc` | 高 |
-| BSR 触发 | TS 36.321 §5.4.5 | [ue_bsr_manager](include/ul_mac/ue_bsr_manager.h) | `srsue::mac::bsr_proc` | 高 |
-| BSR 格式 | TS 36.321 §6.1.3 | `select_bsr_format()` | `proc_bsr.cc` | 高 |
-| HARQ NDI | TS 36.321 §5.4.2.1 | `new_grant_ul()` | `ul_harq.cc` | 高 |
+| SR 接收与调度 | TS 36.321 §5.4.4 | **eNB**: [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h) `handle_sr()` / `schedule_ul()` ｜ UE 桩: [ue_sr_manager](include/ul_mac/ue_sr_manager.h) | `srsenb::mac::sched` / `srsue::mac::sr_proc` | 高 |
+| BSR 解码与缓冲视图 | TS 36.321 §5.4.5 | **eNB**: [enb_bsr_manager](include/ul_mac/enb_bsr_manager.h) `receive_bsr()` ｜ UE 桩: [ue_bsr_manager](include/ul_mac/ue_bsr_manager.h) | `srsenb::mac` / `srsue::mac::bsr_proc` | 高 |
+| BSR 格式 | TS 36.321 §6.1.3 | `select_bsr_format()` (UE 桩编码) / `enb_bsr_manager` 解码 | `proc_bsr.cc` | 高 |
+| HARQ 重传决策 | TS 36.321 §5.4.2.1 | **eNB**: [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h) `handle_ul_crc()` + [enb_ul_harq_manager](include/ul_mac/enb_ul_harq_manager.h) `receive_tb()` ｜ UE 桩: [ue_ul_harq_manager](include/ul_mac/ue_ul_harq_manager.h) | `srsenb::mac::ul_harq` / `srsue::mac::ul_harq` | 高 |
 | RV 序列 | TS 36.212 §5.2.2 | [rv_of_irv()](include/ul_mac/common_types.h#L366) | `rv_of_irv` | 高 |
-| LCP 令牌桶 | TS 36.321 §5.4.3.1 | [lcg_buffer](include/ul_mac/lcg_buffer.h) | `bsr_proc::lcg_buffer_state` | 高 |
-| PF 调度 | 业界通用 | [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h) | `srsenb::mac::sched` | 中 |
+| LCP 令牌桶 | TS 36.321 §5.4.3.1 | [lcg_buffer](include/ul_mac/lcg_buffer.h)（LCP 是 UE 侧行为：组装 PDU 时两阶段令牌桶消耗缓冲区；eNB 侧只决定授权大小） | `bsr_proc::lcg_buffer_state` | 高 |
+| **上行调度器（核心）** | 业界通用 + TS 36.321 | **[enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h)**（PF/RR/Priority + grant 生成 + HARQ 管理） | `srsenb::mac::sched` | 中 |
 | MCS/TBS | TS 36.213 §7.1.7 | `enb_ul_scheduler.cpp` | — | 高 |
-| PHICH | TS 36.213 §8.0 | 概率 BLER 模型 | — | 中 |
-| MAC PDU 组包/解包 | TS 36.321 §6.1.2 | [mac_pdu](include/ul_mac/mac_pdu.h) | `srsenb::mac::mac_pdu` | 中 |
+| PHICH | TS 36.213 §8.0 | 确定性 SNR 阈值 + IR 软合并模型（eNB 侧 CRC 判定，[enb_ul_harq_manager](include/ul_mac/enb_ul_harq_manager.h)） | — | 中 |
+| MAC PDU 组包/解包 | TS 36.321 §6.1.2 | [mac_pdu](include/ul_mac/mac_pdu.h)（eNB 侧组包/解包校验） | `srsenb::mac::mac_pdu` | 中 |
 | PF 信道速率度量 | 业界通用 | [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h) | `srsenb::mac::sched` | 中 |
 | 调度耗时统计 | 非协议（工程指标） | [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h) | — | 低 |
 
 ### 9.1 项目简化说明
 
-- 已实现上行 MAC PDU 组包/解包（Header + BSR CE + SDU 复用 + Padding），见 §7.2.3
+- **重心说明**：本项目以 **eNB 基站侧上行调度**为学习与实现重点（`enb_ul_scheduler` / `enb_bsr_manager` / `enb_ul_harq_manager`）。UE 侧（`ue_context` / `ue_sr_manager` / `ue_bsr_manager` / `ue_ul_harq_manager`）为**仿真桩**，仅用于产生上行数据、编码 BSR、模拟 HARQ 软缓冲，通过 `main.cpp` 直接"空口"投递给 eNB 调度器，不参与调度决策。
+- 已实现上行 MAC PDU 组包/解包（Header + BSR CE + SDU 复用 + Padding），eNB 侧可用于校验，见 §7.2.3
 - 未实现下行 HARQ 和下行调度
-- 信道模型简化为概率 BLER
+- 信道模型为**确定性 SNR 阈值模型**：`eff_snr = ul_snr + (合并次数-1)×IR增益(2dB)`，达到 `MCS选择阈值+1dB` 即解码成功——无随机衰落/误码建模（早期版本为概率 BLER，已替换）
 - 发送动作（`bsr_tx_callback` 等）简化为日志，保留回调抽象骨架
-- MAC PDU 演示级仅支持 <128B SDU（7bit L 字段）、LCP 不严格按优先级两阶段（调用方排好序）
+- MAC PDU 演示级仅支持 <128B SDU（7bit L 字段）；LCP 已实现两阶段令牌桶（PBR 限制 + 纯优先级），由 `consume_data()` 内部完成
 
 ### 9.2 项目增强功能（非协议要求）
 
@@ -512,20 +607,17 @@ sequenceDiagram
 
 验证：34/34 单元测试通过，主程序调度 P50≈1μs / P99≈34μs。
 
-### 10.3 P2 待办（建议，未实施）
+### 10.3 P2 协议符合性修复（2026-08 评审）
 
-> P2 为「质量/健壮性增强」级别，不阻断现有功能，建议在后续迭代推进。
-
-| 编号 | 内容 | 说明 |
+| 编号 | 问题 | 修复 |
 |------|------|------|
-| P2-1 | 多线程压测 + TSan | 调度器共享状态（`sched_latency_samples_`/`ue_ctx_map_`）目前仅部分加锁；建议引入 `-fsanitize=thread` 压测并发调度路径 |
-| P2-2 | `enb_ue_manager` 生命周期 | UE 上下文增删（接入/释放）需明确 RAII 与互斥保护，避免迭代中悬垂 |
-| P2-3 | 真实 TBS 子表 | 当前 `calculate_tbs` 为锚点+线性插值的教学近似；建议替换为 TS 36.213 Table 7.1.7.2.1-1 完整查表，提升 MCS/TBS 符合度至「高」 |
-| P2-4 | 错误码体系 | 散落的 `bool`/`optional` 返回值统一为 `expected<T,err_code>` 或枚举错误码，便于调用方分类处理 |
-| P2-5 | MAC PDU 大 SDU 与严格 LCP | 支持 ≥128B SDU（15bit L 字段，F=1）、实现两阶段 LCP 令牌桶复用（目前仅按调用方排序复用） |
-| P2-6 | 下行调度/下行 HARQ | 补齐本项目未实现的下行侧，形成完整 eNB MAC |
+| P2-1 | `mac_pdu.h` 的 LCID 取值错误（Short=21/Truncated=22/Long=26），不符合 TS 36.321 Table 6.2.1-1 | 改为标准值 Truncated=28、Short=29、Long=30、Padding=31（与 srsRAN_4G `ul_sch_lcid` 一致），并补注释出处 |
+| P2-2 | `mac_pdu_packer::pack()` 先写 BSR CE 再检查空间，小 grant（如 Long BSR 需 4B 而 grant 仅 2B）时缓冲区越界写 | 先按格式计算 CE 长度并校验空间，再编码写入 |
+| P2-3 | `LOG_TRACE` 宏参数名 `mse` 与宏体引用的 `mes` 不一致，任何调用都会编译失败 | 统一为 `msg` |
+| P2-4 | Windows 下测试程序静态初始化阶段段错误：exe 由 D 盘 MinGW g++ 编译，运行时却加载 PATH 中 Git-for-Windows 自带的旧版 `libstdc++-6.dll`，C++ ABI 不匹配 | 编译加 `-static` 静态链接 libstdc++/libgcc，消除运行时 DLL 依赖（README 编译命令已同步） |
+| P2-5 | `tests/test_main.cpp` 两处 BSR 注释值错误（`bsr_index=10 -> 46 bytes`、`bsr_index=60 -> 21956 bytes`），与 `common_types.h` 量化表不符 | 更正为 index 10 → 52 bytes、index 60 → 17212 bytes（21956 实为 index 62） |
 
----
+验证：`-static` 构建后 34/34 单元测试通过，主程序 4 场景 `RUN_EXIT=0`，`-Wall -Wextra -Wpedantic` 零警告。
 
 ## 参考资料
 

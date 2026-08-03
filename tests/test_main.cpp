@@ -246,7 +246,7 @@ TEST(test_tbs_monotonic) {
     sched.add_ue(0x0001);
 
     // 小缓冲区
-    sched.handle_bsr(0x0001, 0, 10);  // bsr_index=10 -> 46 bytes
+    sched.handle_bsr(0x0001, 0, 10);  // bsr_index=10 -> 52 bytes
     auto r1 = sched.schedule_ul(0);
     uint32_t tbs1 = 0;
     for (const auto& r : r1) if (r.rnti == 0x0001) tbs1 = r.grant.tbs;
@@ -258,7 +258,7 @@ TEST(test_tbs_monotonic) {
     for (const auto& r : r2) if (r.rnti == 0x0001) tbs2 = r.grant.tbs;
 
     // 大缓冲区
-    sched.handle_bsr(0x0001, 0, 60);  // bsr_index=60 -> 21956 bytes
+    sched.handle_bsr(0x0001, 0, 60);  // bsr_index=60 -> 17212 bytes
     auto r3 = sched.schedule_ul(2);
     uint32_t tbs3 = 0;
     for (const auto& r : r3) if (r.rnti == 0x0001) tbs3 = r.grant.tbs;

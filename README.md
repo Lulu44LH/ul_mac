@@ -110,6 +110,8 @@ ul_mac_manager/
 │   ├── ue_bsr_manager.h             # BSR缓冲区状态报告管理器
 │   ├── ue_ul_harq_manager.h         # UL HARQ重传管理器
 │   ├── enb_ul_scheduler.h           # eNB侧上行调度器
+│   ├── enb_bsr_manager.h            # eNB侧BSR解码器（per-UE LCG视图）
+│   ├── enb_ul_harq_manager.h        # eNB侧HARQ接收（IR软合并 + CRC/PHICH判定）
 │   ├── mac_pdu.h                    # MAC PDU 组包/解包 (TS 36.321 §6.1.2, P1新增)
 │   └── ue_context.h                 # UE上下文（整合所有组件）
 ├── src/
@@ -132,6 +134,9 @@ ul_mac_manager/
 | `ul_harq_process` | ue_ul_harq_manager.h/cpp | 单HARQ进程状态机（NDI/RV管理） | `srsue::mac::ul_harq_process` |
 | `ul_harq_manager` | ue_ul_harq_manager.h/cpp | HARQ实体（16进程管理、统计） | `srsue::mac::ul_harq_entity` |
 | `ul_scheduler` | enb_ul_scheduler.h/cpp | eNB调度器（PF/RR/优先级） | `srsenb::mac::sched` |
+| `enb_bsr_manager` | enb_bsr_manager.h/cpp | eNB侧BSR解码、per-UE LCG缓冲视图 | `srsenb::mac`（BSR处理） |
+| `enb_ul_harq_manager` | enb_ul_harq_manager.h/cpp | eNB侧HARQ接收（IR软合并 + 确定性SNR CRC判定 + PHICH反馈） | `srsenb::mac::ul_harq` |
+| `mac_pdu_packer` / `mac_pdu_unpacker` | mac_pdu.h/cpp | UL MAC PDU 组包/解包（subheader + BSR CE + SDU复用 + Padding） | `srsenb::mac::mac_pdu` |
 | `ue_context` | ue_context.h | UE上下文整合 | `srsue::mac::mac` |
 | `lcg_buffer_manager` | lcg_buffer.h | LCG缓冲区聚合 | `srsue::mac::bsr_proc::lcg_buffer_state` |
 | `metrics_collector` | metrics_collector.h | 系统级性能监控 | `srsenb::mac::mac_metrics` |
@@ -196,8 +201,8 @@ UL Grant可用空间 → 计算可报告LCG数
 - 差分BSR：Padding BSR场景下，若所有LCG缓冲区大小未变化则跳过发送，减少信令开销
 
 **BSR缓冲区大小映射**：
-- 使用 64 级对数映射表（Index 0~63 → 0~150000 bytes）
-- 公式：`BS[i] = ceil(BS[i-1] × 1.12)`，量化精度随缓冲区增大而降低
+- 3GPP 标准表（TS 36.321 Table 6.1.3.1-1）为 64 级指数映射（Index 0~63 → 0~150000 bytes，比值约 1.12，Index 63 表示 ">150000"）
+- 本项目采用同构的**简化量化表**（Index 0~63 → 0~25000 bytes，见 `common_types.h` 的 `bsr_index_to_bytes()`），上限小于标准表；`bytes_to_bsr_index()` 为向下取整的逆映射（避免高估缓冲区）
 
 ### 3.3 UL HARQ 重传管理器
 
@@ -259,9 +264,8 @@ PF度量值 = 当前请求速率 / (历史平均速率 ^ fairness_coeff)
 - 适合最大化系统吞吐
 
 **UL Grant 生成**：
-- MCS 计算：基于 UE 上报的 SNR（0~30dB → MCS 0~28）
+- MCS 计算：基于 SNR→MCS 区间映射表（29 个阈值点，`calculate_mcs()`），替代早期线性公式
 - PRB 计算：`required_prb = ceil(req_bytes / bytes_per_prb)`
-- MCS 计算：基于SNR→MCS区间映射表（29个阈值点），替代线性公式
 - TBS 计算：基于3GPP TS 36.213 Table 7.1.7.2.1-1简化查找表（6个锚点+线性插值）
 
 ---
@@ -293,18 +297,20 @@ make -j$(nproc)
 >
 > ```bat
 > rem 演示主程序
-> g++ -std=c++17 -Wall -Wextra -Wpedantic -Iinclude src/main.cpp ^
+> g++ -std=c++17 -Wall -Wextra -Wpedantic -O2 -static -Iinclude src/main.cpp ^
 >     src/ue_sr_manager.cpp src/ue_bsr_manager.cpp src/ue_ul_harq_manager.cpp ^
 >     src/enb_ul_scheduler.cpp src/enb_bsr_manager.cpp src/enb_ul_harq_manager.cpp ^
->     -o build/ul_mac_manager.exe -pthread
+>     src/mac_pdu.cpp -o build/ul_mac_manager.exe -pthread
 > rem 单元测试
-> g++ -std=c++17 -Wall -Wextra -Wpedantic -Iinclude tests/test_main.cpp ^
+> g++ -std=c++17 -Wall -Wextra -Wpedantic -O2 -static -Iinclude tests/test_main.cpp ^
 >     src/ue_sr_manager.cpp src/ue_bsr_manager.cpp src/ue_ul_harq_manager.cpp ^
 >     src/enb_ul_scheduler.cpp src/enb_bsr_manager.cpp src/enb_ul_harq_manager.cpp ^
->     -o build/ul_mac_manager_tests.exe -pthread
+>     src/mac_pdu.cpp -o build/ul_mac_manager_tests.exe -pthread
 > ```
 >
 > 若在 MinGW 环境下使用 CMake，请指定生成器：`cmake -S . -B build -G "MinGW Makefiles"`。
+>
+> **注意**：`-static` 用于静态链接 C++ 运行时。若系统 PATH 中存在其他 MinGW 发行版（如 Git for Windows 自带的旧版 `libstdc++-6.dll`），动态链接的 exe 可能加载到版本不匹配的 DLL，导致启动时段错误（详见 PROTOCOL_NOTES.md §10.3 P2-4）。
 
 ### 4.3 运行
 
@@ -336,16 +342,18 @@ make -j$(nproc)
 
 | 场景 | 参数 | 验证目标 |
 |------|------|---------|
-| 场景1 | 单UE, 200TTI, PF, BLER=10% | SR→BSR→Grant→HARQ完整流程 |
-| 场景2 | 5UE, 1000TTI, PF, BLER=5% | 多UE比例公平调度公平性 |
-| 场景3 | 单UE, 500TTI, RR, BLER=30% | HARQ重传机制、达到最大重传丢弃 |
-| 场景4 | 单UE, 500TTI, 变化流量 | 自适应SR周期、预测性BSR |
+| 场景1 | 单UE, 200TTI, PF, ul_snr=20dB（好信道） | SR→BSR→Grant→HARQ完整流程（一次成功为主） |
+| 场景2 | 5UE, 1000TTI, PF, ul_snr=20dB（好信道） | 多UE比例公平调度公平性 |
+| 场景3 | 单UE, 500TTI, RR, ul_snr=2dB（弱信道） | HARQ重传机制：新传 NACK、IR 软合并（+2dB/次）后 ACK |
+| 场景4 | 单UE, 500TTI, 变化流量, ul_snr=20dB | 自适应SR周期、预测性BSR |
+
+> 信道为**确定性 SNR 模型**：`enb_ul_harq_manager::receive_tb()` 按 `eff_snr = ul_snr + (合并次数-1)×2dB` 与 `MCS 解码阈值+1dB` 比较判定 CRC，无随机性、结果可复现（取代了早期的概率 BLER 模型）。
 
 ### 5.2 验证指标
 
-- **SR成功率**：应接近100%（无信道差错时）
-- **HARQ BLER**：应接近配置的BLER值（如30%）
-- **平均重传次数**：BLER=30%时约1.43次（几何分布期望 1/(1-0.3)）
+- **SR成功率**：应接近100%（SR 信道无差错建模）
+- **场景3重传行为**：ul_snr=2dB 时新传必然 NACK（eff=200 < 阈值300），第一次重传后 eff=200+200(IR增益)=400 ≥ 300 → ACK，即每个 TB 恰好重传 1 次，`avg_retx ≈ 1.0`
+- **平均重传次数（概率模型下的验算基准）**：若改用概率 BLER=p 建模，每个 TB 的期望传输次数为 1/(1-p)、期望重传次数为 p/(1-p)（几何分布）；p=0.3 时重传次数理论值 ≈ 0.43，早期概率版本实测 0.49，同量级——用理论值验证仿真输出是重要的工程习惯
 - **PF公平性**：5个UE吞吐率差异应 < 30%（信道条件相同时）
 - **自适应SR**：高流量阶段SR周期应缩短，低流量应延长
 
@@ -354,7 +362,7 @@ make -j$(nproc)
 日志格式：`[HH:MM:SS.mmm] [LEVEL] [MODULE] UE[RNTI] TTI[XXXXX] Message`
 
 关键日志检查：
-- `SR sending on PUCCH` → SR发送
+- `Sending SR on PUCCH` → SR发送
 - `Triggering Regular BSR` → BSR触发
 - `New TX, RV=0, TBS=xxx` → HARQ新传
 - `Adaptive ReTX=xxx` → HARQ自适应重传
@@ -530,10 +538,10 @@ PF度量值 = R_current(t) / R_avg(t)^α
 
 ### 8.2 BSR量化精度与资源效率
 
-**难点**：BSR使用6bit的Buffer Size Index（0~63）表示缓冲区大小，但实际缓冲区范围是0~150000字节。量化必然引入误差。
+**难点**：BSR使用6bit的Buffer Size Index（0~63）表示缓冲区大小，但实际缓冲区可能远大于此。量化必然引入误差。
 
 **解决方案**：
-- 对数量化表：小缓冲区精度高（如Index 10 → 315~347 bytes），大缓冲区精度低（Index 62 → 121278~150000 bytes）
+- 指数（对数）量化表：小缓冲区精度高（本项目简化表中 Index 10 → 52 bytes），大缓冲区精度低（Index 62 → 21956 bytes，Index 63 封顶 25000 bytes）；3GPP 标准表同构但上限为 150000 bytes（Index 63 表示 ">150000"）
 - 这是合理的，因为大缓冲区通常意味着大量背景流量，精确值对调度影响不大
 
 ### 8.3 自适应SR与预测性BSR
@@ -573,51 +581,65 @@ if (abs(new_period - current_period) / current_period < 0.2) return;
 | HARQ NDI | TS 36.321 §5.4.2.1 | 高 | NDI翻转判断新传/重传，TC-RNTI特殊处理 |
 | RV序列 | TS 36.212 §5.2.2 | 高 | {0,2,3,1}序列正确实现 |
 | PF调度 | 业界通用 | 中 | 实现基本PF算法，未包含QoS加权等高级特性 |
-| PHICH处理 | TS 36.213 §8.0 | 中 | 简化为概率模型，未实现完整的PHICH资源映射 |
+| PHICH处理 | TS 36.213 §8.0 | 中 | 确定性 SNR 阈值 + IR 软合并模型判定 CRC（eNB 侧 `enb_ul_harq_manager`），未实现完整的PHICH资源映射 |
 | MCS/TBS | TS 36.213 §7.1.7 | 低 | 教学近似: SNR→MCS区间映射表 + TBS 6点线性插值 (非完整查表, 偏差可达40%+); UL Grant资源计算已与TBS自洽 |
 | MAC PDU | TS 36.321 §6.1.2 | 中 | 已实现UL MAC PDU组包/解包: subheader(R/R/E/LCID)、Short/Long/Truncated BSR CE、SDU复用、Padding |
 
 **项目简化说明**：
-- 未实现完整的MAC PDU构造（Header + CE + SDU）
 - 未实现下行HARQ和下行调度
-- 信道模型简化为概率BLER模型
-- LCP已实现令牌桶两阶段调度，但未实现MAC PDU复用（多LCID子头组装）
+- 信道模型为确定性 SNR 阈值 + IR 软合并判定（无随机衰落/噪声建模），结果可复现
+- MAC PDU 为演示级实现：仅支持 <128B SDU（7-bit L 字段），不支持分段
+- LCP 已实现令牌桶两阶段调度（UE 桩侧 `consume_data()`）；PHR 仅预留接口未参与调度
+- 参数混用说明：LCG/BSR 格式采用 LTE（4 LCG、6-bit 索引），HARQ 进程数采用 NR 上限（16），属教学性简化
 
 ---
 
 ## 附录：性能指标示例输出
 
+以下为当前版本实测输出（主程序依次运行场景 1~4，每个场景间重置指标，故下方摘要为**场景 4**（单 UE、500 TTI、变化流量、好信道 20dB）的结果）：
+
 ```
 ==============================================================
-  最终系统性能指标
+              MAC层上行管理系统性能指标摘要
 ==============================================================
-
 仿真时长:           500 TTI (500 ms)
 --------------------------------------------------------------
 【调度请求 (SR)】
-  总发送次数:        1
-  成功次数:          1
+  总发送次数:        65
+  成功次数:          65
+  失败次数:          0
   成功率:            100.00%
 --------------------------------------------------------------
+【缓冲区状态报告 (BSR)】
+  总发送次数:        68
+  Short BSR:         0
+  Long BSR:          68
+  Truncated BSR:     0
+--------------------------------------------------------------
 【上行HARQ】
-  新传次数:          109
-  重传次数:          414
-  失败次数:          27
-  平均重传次数:      3.798
+  新传次数:          130
+  重传次数:          0
+  失败次数:          0
+  平均重传次数:      0.000
+  失败率:            0.00%
 --------------------------------------------------------------
 【上行吞吐】
-  总传输字节:        336798 bytes
-  系统吞吐率:        5388.77 kbps
+  总授权数:          65
+  总传输字节:        51475 bytes
+  系统吞吐率:        823.60 kbps
+==============================================================
 --------------------------------------------------------------
 【延迟统计】
-  样本数:            473
+  样本数:            65
   最小延迟:          0 TTI
-  P50 (中位数):      71 TTI
-  P90:               200 TTI
-  P99:               233 TTI
-  最大延迟:          235 TTI
-  平均延迟:          90.28 TTI
+  P50 (中位数):      1 TTI
+  P90:               1 TTI
+  P99:               1 TTI
+  最大延迟:          1 TTI
+  平均延迟:          0.98 TTI
 ```
+
+> 场景 3（弱信道 2dB）的 HARQ 部分则可观察到"每个 TB 新传 NACK、IR 软合并一次后 ACK"的确定性重传行为（`avg_retx ≈ 1.0`），与 §5.2 的理论分析一致。
 
 ---
 

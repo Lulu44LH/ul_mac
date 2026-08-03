@@ -107,15 +107,31 @@ mac_pdu_pack_result mac_pdu_packer::pack(uint8_t* buf, size_t grant_bytes,
     size_t pos = 0;
 
     // 1) BSR CE 优先 (控制信令优先级最高)
-    size_t bsr_len = encode_bsr_ce(bsr, buf + pos + 1); // 预留 1B 子头
-    if (bsr_len > 0 && pos + 1 + bsr_len <= grant_bytes) {
-        buf[pos] = make_subheader(static_cast<uint8_t>(
-            bsr.format == bsr_format::LONG_BSR ? mac_lcid::LONG_BSR
-            : bsr.format == bsr_format::TRUNCATED_BSR ? mac_lcid::TRUNCATED_BSR
-                                                     : mac_lcid::SHORT_BSR),
-            /*e=*/true);
-        pos += 1 + bsr_len;
-        res.bsr_bytes = 1 + bsr_len;
+    //    先按格式计算 CE 长度并校验空间, 再编码写入, 避免小 grant 下越界写
+    size_t bsr_body_len = 0;
+    switch (bsr.format) {
+        case bsr_format::SHORT_BSR:
+        case bsr_format::TRUNCATED_BSR:
+            bsr_body_len = bsr.reports.empty() ? 0 : 1;
+            break;
+        case bsr_format::LONG_BSR:
+            bsr_body_len = 3;
+            break;
+        default:
+            bsr_body_len = 0;
+            break;
+    }
+    if (bsr_body_len > 0 && pos + 1 + bsr_body_len <= grant_bytes) {
+        size_t enc_len = encode_bsr_ce(bsr, buf + pos + 1); // 预留 1B 子头
+        if (enc_len == bsr_body_len) {
+            buf[pos] = make_subheader(static_cast<uint8_t>(
+                bsr.format == bsr_format::LONG_BSR ? mac_lcid::LONG_BSR
+                : bsr.format == bsr_format::TRUNCATED_BSR ? mac_lcid::TRUNCATED_BSR
+                                                         : mac_lcid::SHORT_BSR),
+                /*e=*/true);
+            pos += 1 + enc_len;
+            res.bsr_bytes = 1 + enc_len;
+        }
     }
 
     // 2) SDU 复用 (按调用方传入顺序; 调用方应已按 LCP 优先级排序)

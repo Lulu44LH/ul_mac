@@ -66,8 +66,15 @@ add_executable(ul_mac_manager_tests
 target_link_libraries(ul_mac_manager_tests PRIVATE Threads::Threads)
 add_test(NAME unit_tests COMMAND ul_mac_manager_tests)
 
+# ---- MinGW 静态链接 ----
+# 避免 exe 运行时从 PATH 加载到其他 MinGW 发行版(如 Git for Windows)的旧版
+# libstdc++-6.dll, C++ ABI 不匹配会在静态初始化阶段段错误 (详见 PROTOCOL_NOTES.md §10.3 P2-4)
+if(MINGW)
+    set_target_properties(ul_mac_manager ul_mac_manager_tests PROPERTIES LINK_FLAGS "-static")
+endif()
+
 # =============================================================================
 # 备选: 纯 g++ 命令行编译 (无需 CMake)
-#   g++ -std=c++17 -Wall -Wextra -Iinclude src/main.cpp src/*.cpp -o ul_mac_manager -pthread
-#   g++ -std=c++17 -Wall -Wextra -Iinclude tests/test_main.cpp src/*.cpp -o ul_mac_manager_tests -pthread
+#   g++ -std=c++17 -Wall -Wextra -Wpedantic -O2 -static -Iinclude src/main.cpp src/*.cpp -o ul_mac_manager -pthread
+#   g++ -std=c++17 -Wall -Wextra -Wpedantic -O2 -static -Iinclude tests/test_main.cpp src/*.cpp -o ul_mac_manager_tests -pthread
 # =============================================================================
