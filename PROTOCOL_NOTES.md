@@ -82,7 +82,7 @@
 
 | 常量 | 值 | 协议含义 |
 |------|-----|---------|
-| `MAX_HARQ_PROCESSES` | 16 | HARQ 进程数上限（LTE 8 / NR 16，取 NR 上限） |
+| `MAX_HARQ_PROCESSES` | 8 | HARQ 进程数上限（LTE 4G 上行固定为 8，流水线填满 8ms HARQ RTT） |
 | `NOF_LCGS` | 4 | 逻辑信道组数量（3GPP 固定 4 个） |
 | `MAX_LCID` | 32 | 最大逻辑信道 ID |
 | `MAX_SR_TRANSMISSIONS` | 64 | SR 最大传输次数（dsr-TransMax 上限） |
@@ -289,7 +289,7 @@ bool enb_bsr_manager::receive_bsr(uint16_t rnti, const bsr_ce& bsr) {
 
 - **同步 HARQ**：进程 ID 由子帧号隐式确定（固定时序）
 - **RTT = 8 TTI**（FDD），一个进程发送后需等 8ms 才能收到 PHICH 反馈
-- **多进程并行**：LTE 8 个 / NR 最多 16 个（[common_types.h:35](include/ul_mac/common_types.h#L35) `MAX_HARQ_PROCESSES = 16`）
+- **多进程并行**：LTE 4G 上行固定 8 个（[common_types.h:37](include/ul_mac/common_types.h#L37) `MAX_HARQ_PROCESSES = 8`，已按 LTE 规范取值）
 
 ### 5.2 HARQ 进程状态机
 
@@ -443,7 +443,7 @@ flowchart LR
               └── ACK: 释放进程 / NACK: 置 pending_retx ─┘
 ```
 
-### 7.1 三种调度算法
+### 7.1 四种调度算法
 
 ```mermaid
 flowchart TD
@@ -451,10 +451,28 @@ flowchart TD
     B -->|PF| C["比例公平<br/>metric = R_current / R_avg^α<br/>重传优先"]
     B -->|RR| D[轮询<br/>UE 轮流获得授权]
     B -->|PRIORITY| E["优先级<br/>按 UE 缓冲区大小排序"]
+    B -->|EPF| G["增强型比例公平 (华为)<br/>metric = w_qos·R_inst/R_avg^α·(1+β·cqi_norm)<br/>重传优先 + 饿死保底"]
     C --> F[生成 UL Grant]
     D --> F
     E --> F
+    G --> F
 ```
+
+### 7.1b EPF 增强型比例公平算法（华为 EPF）
+
+EPF 在经典 PF 基础上引入 QoS 权重与信道感知增强项（[enb_ul_scheduler.cpp](src/enb_ul_scheduler.cpp) `schedule_epf` / `compute_epf_metric`）：
+
+```
+metric = w_qos · (R_instant / R_avg^α) · (1 + β · cqi_norm)
+  w_qos   : QoS 业务权重 (VoIP=3.0 > Video=2.0 > BE=1.0), 全局缩放 γ
+  R_inst  : 当前 TTI 按 CQI/SNR 可支持的瞬时速率
+  R_avg   : 长期平均吞吐 (复用 ul_avg_rate, EMA 更新)
+  α       : 公平性因子 (EPF 参数, 越大越偏向长期公平; 经典 PF=1.0)
+  β       : 信道感知因子 (EPF 参数, >0 时好信道用户额外加权)
+  cqi_norm: 归一化信道质量 CQI/CQI_MAX ∈ [0,1]
+```
+
+**饿死保护**（弱信道用户不饿死）：当 `tti_since_sched > starve_tti` 时度量 ×10 放大；并强制为长期未调度 UE 保留 `min_prb_ratio` 比例 PRB 底。四阶段：重传优先 → 饿死保底分配 → EPF 度量排序新传 → 每 TTI 推进饿死计时。所有参数经 `configure_epf(epf_params)` 可配（`alpha/beta/gamma/min_prb_ratio/starve_tti`）。
 
 ### 7.2 PF 比例公平算法
 
@@ -577,6 +595,7 @@ sequenceDiagram
 | HARQ RTT 建模 | [ue_ul_harq_manager.h:109](include/ul_mac/ue_ul_harq_manager.h#L109) | 真实模拟 PHICH 反馈时序 |
 | MAC PDU 编解码 | [mac_pdu.h:64](include/ul_mac/mac_pdu.h#L64) | 实现 UL-SCH 组包/解包，便于 eNB 侧校验 |
 | PF 信道速率度量 | [enb_ul_scheduler.cpp](src/enb_ul_scheduler.cpp) | 分子改用信道可支持速率，调度更合理 |
+| EPF 增强型比例公平 | [enb_ul_scheduler.cpp](src/enb_ul_scheduler.cpp) | QoS 权重 + 信道感知 + 饿死保护，可配 alpha/beta/gamma |
 | 调度耗时统计 | [enb_ul_scheduler.h](include/ul_mac/enb_ul_scheduler.h) | P50/P99 实时性评估 |
 
 ---

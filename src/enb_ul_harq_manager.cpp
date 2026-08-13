@@ -8,19 +8,8 @@
 
 namespace ul_mac {
 
-// 软合并模型常量
-namespace {
-constexpr int32_t IR_GAIN_X100       = 200; // 每次软合并(重传)的IR增益: 2 dB
-constexpr int32_t DECODE_MARGIN_X100 = 100; // 解码阈值相对选择阈值的余量: 1 dB
-
-// MCS -> 选择SNR阈值表 (x100 dB), 与 enb_ul_scheduler.cpp 中 SNR_MCS_THRESHOLD 一致
-// (接收端解码阈值 = 选择阈值 + DECODE_MARGIN, 体现MCS边缘处新传易失败)
-const int32_t SNR_MCS_THRESHOLD[29] = {
-    -1000, -600, -400, -200, -100,    0,  100,  200,  300,  400,
-      500,  600,  700,  800,  900, 1000, 1100, 1200, 1300, 1400,
-     1500, 1600, 1700, 1800, 1840, 1880, 1920, 1960, 2000
-};
-} // namespace
+// 软合并模型常量 (SNR_MCS_THRESHOLD / IR_GAIN_X100 / DECODE_MARGIN_X100)
+// 已统一定义于 common_types.h, 此处直接复用, 避免多文件重复定义。
 
 enb_ul_harq_manager::enb_ul_harq_manager(uint32_t max_harq_tx)
     : max_harq_tx_(max_harq_tx)
@@ -117,6 +106,12 @@ enb_ul_harq_manager::rx_result enb_ul_harq_manager::receive_tb(
     }
 
     // 步骤2: 软合并 + CRC解码
+    // 【协议说明 / 简化实现】
+    // 真实 eNB 接收端: 把当前 TB 的软比特与历史软缓冲 (enb_rx_process 的 soft buffer)
+    // 做 Max-Log-MAP 合并后再 turbo 解码得到 CRC 结果。
+    // 本项目不做真实编码/解码, 用 "有效 SNR 模型" 等效表达软合并增益:
+    //   eff_snr = ul_snr + (combined_count-1)*IR_GAIN, 再与 MCS 解码阈值比较得到 crc_ok。
+    // 这样可在无真实编译码器的情况下演示 IR 增益 (重传累积后边缘 MCS 也能解调)。
     int32_t eff = effective_snr_x100(ue.ul_snr_x100, p.combined_count);
     int32_t threshold = decode_threshold_x100(p.cur_mcs);
     bool crc_ok = (eff >= threshold);

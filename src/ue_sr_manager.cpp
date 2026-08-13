@@ -160,10 +160,14 @@ void sr_manager::step(uint32_t tti) {
                 }
             }
         } else {
-            // PUCCH未配置, 需要启动随机接入过程
+            // 【协议说明 / 简化实现】
+            // 真实协议 (TS 36.321 §5.4.4): PUCCH 未配置 SR 时, 数据到达应直接触发随机接入(RA),
+            // 且 RA 过程横跨 MAC/RLC/PHY 与 eNB 侧, 不属于 SR 模块职责。
+            // 本项目未实现 RA 模块, 此处仅通过 fail_callback_ 通知上层 "需要 RA"。
+            // 措辞上应为 "RA fallback required (deferred to upper layer)", 而非模块内触发。
             // 对应 srsRAN proc_sr.cc: "PUCCH not configured. Starting RA procedure"
             LOG_WARN("SR", rnti_, tti,
-                "PUCCH not configured, triggering Random Access");
+                "PUCCH not configured, SR-FAIL -> RA fallback required (deferred to upper layer)");
             state_ = sr_state::FAILED;
             do_fail = true;
             stats_.total_sr_fail++;

@@ -245,7 +245,7 @@ INACTIVE ──新传──► ACTIVE(IDLE)
 
 ### 3.4 上行调度器（eNB侧）
 
-**三种调度算法**：
+**四种调度算法（PF / RR / 优先级 / EPF）**：
 
 #### 比例公平调度（PF）
 ```
@@ -532,7 +532,7 @@ PF度量值 = R_current(t) / R_avg(t)^α
 **难点**：上行HARQ RTT为8ms（FDD），意味着一个HARQ进程发送后需等待8ms才能收到反馈。在这8ms内如果有新数据到达，必须使用其他空闲HARQ进程。
 
 **解决方案**：
-- 维护16个HARQ进程（`MAX_HARQ_PROCESSES = 16`）
+- 维护 8 个 HARQ 进程（`MAX_HARQ_PROCESSES = 8`，LTE 4G 上行固定 8 进程填满 8ms RTT）
 - 调度器轮转分配进程ID（`next_pid_ % MAX_HARQ_PROCESSES`）
 - 重传优先：调度器先处理pending_retx的进程
 

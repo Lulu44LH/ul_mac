@@ -31,8 +31,10 @@ namespace ul_mac {
 // 常量定义 - 对应3GPP协议中的固定参数
 // ============================================================================
 
-/// 最大HARQ进程数 (LTE为8, NR为16, 此处取NR上限)
-constexpr uint32_t MAX_HARQ_PROCESSES = 16;
+// 【协议说明】
+// LTE (TS 36.321 §5.4.2.1) 上行同步 HARQ 固定为 8 个进程; NR (TS 38.321) 上行为 16 个。
+// 本项目为 LTE 4G 上行仿真, 严格取 8 (流水线填满 8ms HARQ RTT)。
+constexpr uint32_t MAX_HARQ_PROCESSES = 8;
 
 /// 逻辑通道组(LCG)数量 - 3GPP规定最多4个LCG
 constexpr uint32_t NOF_LCGS = 4;
@@ -165,9 +167,23 @@ struct ul_grant {
     uint32_t n_prb;         ///< 分配的PRB数量
     uint32_t prb_start;     ///< eNB分配的起始PRB索引 (eNB侧填充, UE侧忽略)
     uint8_t  mcs;           ///< 调制编码方案索引
-    int8_t   rv;            ///< 冗余版本 (-1表示由HARQ进程内部计算)
+    int8_t   rv;            ///< 冗余版本
+                               // 【协议说明 / 简化实现】
+                               // 真实协议 (TS 36.321 §5.4.2.1): 上行 RV 序列 {0,2,3,1}。
+                               //  - 非自适应重传: 重传 RV 固定为 0 (UE 自行依据"已传次数"决定,
+                               //    不依赖 eNB 在 DCI 中重传 RV)。
+                               //  - 自适应重传: eNB 可在 DCI0 中显式指定 RV。
+                               // 本项目简化: rv=-1 表示"由 UE HARQ 进程按内部 IRV 序列自行推进"
+                               // (模拟非自适应); rv>=0 表示 eNB 显式指定 (模拟自适应)。
     bool     ndi;           ///< 新数据指示 (true=新传, false=重传)
+                               // 【协议说明】
+                               // NDI 是 UE 与 eNB 之间的 HARQ "契约": UE 翻转 NDI 表示新 TB,
+                               // eNB 检测 NDI 翻转判定新 TB。重传时 NDI 保持不变。
     bool     ndi_present;   ///< DCI中是否包含NDI (区分自适应/非自适应重传)
+                               // 【协议说明】
+                               // 真实上行 DCI0 始终携带 NDI (即便重传也携带以区分新旧 TB)。
+                               // 本项目用 ndi_present=false 表示"非自适应重传 (无显式 NDI)",
+                               // 此时 eNB 退化为依据进程状态 (INACTIVE->新TB) 判定。
     bool     is_rar;        ///< 是否为RAR(Random Access Response)中的授权
     bool     phich_available;  ///< PHICH是否可用 (上行HARQ反馈信道)
     bool     hi_value;      ///< PHICH反馈值 (true=ACK, false=NACK)
@@ -256,7 +272,8 @@ struct ue_identity {
 enum class sched_algorithm {
     ROUND_ROBIN,    ///< 轮询调度 (RR)
     PROPORTIONAL_FAIR, ///< 比例公平调度 (PF) - 参考 srsRAN_4G sched_time_pf.h
-    PRIORITY_BASED  ///< 优先级调度
+    PRIORITY_BASED, ///< 优先级调度
+    EPF             ///< 增强型比例公平调度 (华为 EPF: PF + QoS 权重 + 信道感知)
 };
 
 /// UE度量信息
@@ -332,8 +349,11 @@ inline std::string sr_state_to_string(sr_state state) {
 /// 对应3GPP TS 36.321 Table 6.1.3.1-1 (简化版)
 /// 参考: ocudu/lib/mac/mac_ul/ul_bsr.h 中的 buff_size_field_to_bytes
 inline uint32_t bsr_index_to_bytes(uint8_t index) {
-    // 简化映射: 索引0-63对应不同的缓冲区大小级别
-    // 实际3GPP标准使用对数尺度, 此处简化为近似值
+    // 【协议说明 / 简化实现】
+    // 真实 3GPP TS 36.321 Table 6.1.3.1-1 的 6-bit 缓冲区大小字段采用非均匀(近似对数)尺度:
+    //   索引 0~10 为线性(0,10,12,14,...30), 索引 10 之后为指数增长直到 ~150000 字节。
+    // 本项目用一组单调递增的近似表替代, 仅保证"索引越大缓冲区越大"的单调语义,
+    // 不保证与标准表逐档一致。用于教学演示 BSR 编解码流程足够, 不可用于互操作。
     static const uint32_t size_table[BSR_BUFFER_SIZE_LEVELS] = {
         0, 10, 14, 18, 22, 26, 30, 34,          // 0-7: 极小缓冲区
         40, 46, 52, 58, 64, 70, 76, 82,         // 8-15: 小缓冲区
@@ -366,6 +386,22 @@ inline uint8_t bytes_to_bsr_index(uint32_t bytes) {
     return 0;
 }
 
+/// 构建 Long BSR 负载: 报告所有 buffer>0 的 LCG (每个用 6-bit 索引)
+/// 该逻辑被 ue_bsr_manager::generate_bsr (Long BSR 分支) 与 main.cpp 的
+/// 演示编码函数共同复用, 提取为避免重复实现。
+/// @param lcg_sizes 各 LCG 的字节数 (长度 = NOF_LCGS)
+/// @param bsr       输出的 BSR CE (format 置为 LONG_BSR)
+inline void build_long_bsr(const uint32_t* lcg_sizes, bsr_ce& bsr) {
+    bsr.format = bsr_format::LONG_BSR;
+    for (uint32_t i = 0; i < NOF_LCGS; i++) {
+        if (lcg_sizes[i] > 0) {
+            bsr.reports.push_back(
+                bsr_report(static_cast<uint8_t>(i),
+                           bytes_to_bsr_index(lcg_sizes[i])));
+        }
+    }
+}
+
 /// RV序列计算 - 对应3GPP TS 36.321 Section 5.4.2.1
 /// RV序列: {0, 2, 3, 1}, 循环使用
 /// 参考: srsRAN_4G/srsue/src/stack/mac/ul_harq.cc 中的 rv_of_irv
@@ -389,5 +425,96 @@ inline std::string format_tti(uint32_t tti) {
     oss << "TTI[" << std::setw(5) << std::setfill('0') << tti << "]";
     return oss.str();
 }
+
+// ============================================================================
+// HARQ / 调度共用物理层参数表 (避免多文件重复定义)
+// 接收端解码阈值 = SNR_MCS_THRESHOLD[mcs] + DECODE_MARGIN_X100
+// ============================================================================
+
+/// MCS -> 最小可解码 SNR 阈值表 (x100 dB), 索引 0..28 对应 MCS 0..28
+/// 接收端解码阈值 = 选择阈值 + DECODE_MARGIN, 体现 MCS 边缘处新传易失败
+inline constexpr int32_t SNR_MCS_THRESHOLD[29] = {
+    -1000, -600, -400, -200, -100,    0,  100,  200,  300,  400,
+      500,  600,  700,  800,  900, 1000, 1100, 1200, 1300, 1400,
+     1500, 1600, 1700, 1800, 1840, 1880, 1920, 1960, 2000
+};
+
+/// 每次软合并(重传)的 IR 增益: 2 dB (等效软缓冲合并带来的等效 SNR 提升)
+inline constexpr int32_t IR_GAIN_X100 = 200;
+
+/// 解码阈值相对选择阈值的余量: 1 dB
+inline constexpr int32_t DECODE_MARGIN_X100 = 100;
+
+// ============================================================================
+// QoS / 业务类型 (用于 EPF 增强型比例公平调度)
+// ============================================================================
+
+// 【协议说明】 LTE 通过 QCI (QoS Class Identifier, TS 23.203) 区分业务, 不同
+//   业务对速率/时延/丢包率要求不同。此处简化为 3 类典型业务:
+//   - VOIP  : 语音, 极小包、严格时延、GBR, 高调度权重
+//   - VIDEO : 视频流, 较大包、中等时延, 较高权重
+//   - BE    : 尽力而为 (网页/下载), 时延不敏感, 基础权重
+// 【简化实现】 真实网络 QCI 由核心网下发, MAC 仅执行; 本项目在 UE 创建时静态
+//   指定业务类型, 用于演示差异化调度权重, 不做动态 QCI 重映射。
+enum class qos_class : uint8_t {
+    VOIP = 0,   ///< 语音 (GBR, 高优先级)
+    VIDEO = 1,  ///< 视频流
+    BE = 2,     ///< 尽力而为
+};
+
+/// QoS 业务配置: 调度权重与 GBR 保障
+struct qos_profile {
+    qos_class cls = qos_class::BE;
+    float     weight = 1.0f;  ///< QoS 调度权重 (>=1 表示高于尽力而为)
+    bool      is_gbr = false; ///< 是否为保证比特速率业务 (GBR)
+    uint32_t  gbr_prb = 0;    ///< GBR 业务期望的最小 PRB 保障 (饿死保护备用)
+
+    qos_profile() = default;
+    qos_profile(qos_class c, float w, bool gbr, uint32_t g)
+        : cls(c), weight(w), is_gbr(gbr), gbr_prb(g) {}
+};
+
+/// 不同业务类型的默认 QoS 配置 (按 36.213/23.203 典型取值简化)
+inline const qos_profile& default_qos(qos_class c) {
+    static const qos_profile VOIP_Q{qos_class::VOIP,  3.0f, true,  2};
+    static const qos_profile VIDEO_Q{qos_class::VIDEO, 2.0f, false, 1};
+    static const qos_profile BE_Q{qos_class::BE,    1.0f, false, 0};
+    switch (c) {
+        case qos_class::VOIP:  return VOIP_Q;
+        case qos_class::VIDEO: return VIDEO_Q;
+        default:               return BE_Q;
+    }
+}
+
+// ============================================================================
+// EPF (Enhanced Proportional Fair) 参数
+// ============================================================================
+// 【算法说明】 华为 EPF 在经典比例公平 (PF) 基础上, 引入 QoS 权重与信道感知
+//   增强项。本项目实现的调度度量公式:
+//
+//     metric = w_qos * (R_instant / R_avg^alpha) * (1 + beta * cqi_norm)
+//
+//   其中:
+//     - R_instant : 当前 TTI 按 CQI 可支持的瞬时速率 (PRB * tbs_per_rb[cqi])
+//     - R_avg     : 长期平均吞吐 (指数滑动平均, 见 ue_sched_context::avg_rate)
+//     - alpha     : 公平性因子. 越大越偏向长期公平 (抑制长期高速用户);
+//                   越小越偏向系统吞吐量. 经典 PF 取 1.0.
+//     - beta      : 信道感知因子. beta>0 时信道好的用户额外加权 (提升频谱效率).
+//     - w_qos     : 业务 QoS 权重 (VoIP/视频 > 尽力而为).
+//     - cqi_norm  : 归一化信道质量 CQI/CQI_MAX, 范围 [0,1].
+//
+// 【饿死保护】 当 R_avg 趋近 0 (长期未被调度) 或距上次调度 TTI 过大时,
+//   R_avg^alpha 项趋近 0 -> 瞬时项被放大, 自动获得高优先级; 另有 min_prb_ratio
+//   强制为"很久未调度"的 UE 保留最低 PRB 份额, 避免差信道用户长期饿死。
+struct epf_params {
+    float    alpha = 1.0f;                 ///< 公平性因子 (PF 指数)
+    float    beta = 0.5f;                  ///< 信道感知增益因子
+    float    gamma = 1.0f;                 ///< QoS 权重全局缩放 (平衡吞吐与业务优先级)
+    float    min_prb_ratio = 0.10f;        ///< 饿死保护: 长期未调度 UE 保底 PRB 比例
+    uint32_t starve_tti = 200;             ///< 距上次调度超过该 TTI 数视为"濒临饿死"
+    static constexpr uint32_t cqi_max = 15;///< CQI 取值范围上限 (36.213)
+
+    epf_params() = default;
+};
 
 } // namespace ul_mac

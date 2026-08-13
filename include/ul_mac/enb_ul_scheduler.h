@@ -59,7 +59,7 @@ struct ue_sched_context {
     int      phr;               ///< 功率余量 (dB)
     int32_t  ul_snr;            ///< 上行SNR (x100, 可为负; 低SNR区间需负值)
     double   dl_avg_rate;       ///< 下行平均速率 (PF调度用)
-    double   ul_avg_rate;       ///< 上行平均速率 (PF调度用)
+    double   ul_avg_rate;       ///< 上行平均速率 (PF调度用, EPF 复用为 R_avg)
     uint32_t ul_nof_samples;    ///< 上行调度次数 (PF调度用)
     uint32_t last_scheduled_tti; ///< 上次被调度的TTI
     std::array<bool, MAX_HARQ_PROCESSES> pending_retx{};  ///< 各进程是否有待重传 (位图, 避免单值覆盖导致进程泄漏)
@@ -68,17 +68,26 @@ struct ue_sched_context {
     bool     harq_pid_busy[MAX_HARQ_PROCESSES]; ///< 该UE各HARQ进程忙闲 (eNB跟踪, 避免多UE重复分配)
     harq_tb_info harq_tb[MAX_HARQ_PROCESSES];    ///< 各进程最近新传的TB信息 (重传时回放)
 
+    // ---- EPF (增强型比例公平) 相关字段 ----
+    qos_profile qos;            ///< 业务 QoS 配置 (差异化调度权重)
+    double   inst_rate;         ///< 最近一次调度的瞬时速率 (PRB*tbs_per_rb[cqi]), 即 R_instant
+    uint32_t tti_since_sched;   ///< 距上次调度经历的 TTI 数 (饿死保护计数)
+
     ue_sched_context()
         : rnti(0), sr_pending(false), total_ul_buffer(0)
         , phr(0), ul_snr(200), dl_avg_rate(0.0), ul_avg_rate(0.0)
         , ul_nof_samples(0), last_scheduled_tti(0)
         , cqi(0)
+        , qos(default_qos(qos_class::BE)), inst_rate(0.0), tti_since_sched(0)
     {
         memset(ul_buffer, 0, sizeof(ul_buffer));
         memset(ndi, 0, sizeof(ndi));
         memset(harq_pid_busy, 0, sizeof(harq_pid_busy));
         pending_retx.fill(false);
     }
+
+    /// 设置 UE 业务类型 (同时写入默认 QoS 权重)
+    void set_qos(qos_class cls) { qos = default_qos(cls); }
 };
 
 /// 上行调度器
@@ -143,6 +152,19 @@ public:
     /// 设置调度算法
     void set_algorithm(sched_algorithm algo) { algorithm_ = algo; }
 
+    /// 配置 EPF 参数 (公平性因子/信道感知因子/QoS 缩放/饿死保护)
+    void configure_epf(const epf_params& p) { epf_ = p; }
+
+    /// 获取当前 EPF 参数
+    epf_params get_epf_params() const { return epf_; }
+
+    /// 设置 UE 业务类型 (差异化 QoS 权重), 需在 add_ue 之后调用
+    void set_ue_qos(uint16_t rnti, qos_class cls);
+
+    /// 获取指定 UE 的 EPF 调度度量 (调试/日志用)
+    /// @return 该 UE 当前 TTI 的 EPF 度量值, 无数据返回 0
+    double get_epf_metric(uint16_t rnti, uint32_t tti) const;
+
     /// 获取当前调度UE数量
     size_t get_nof_ues() const;
 
@@ -161,6 +183,14 @@ private:
     /// 优先级调度算法
     std::vector<ul_sched_result> schedule_priority(uint32_t tti);
 
+    /// 增强型比例公平(EPF)调度算法 (华为 EPF: PF + QoS 权重 + 信道感知)
+    /// 度量: metric = w_qos * (R_instant / R_avg^alpha) * (1 + beta*cqi_norm)
+    /// 含饿死保护 (长期未调度 UE 自动升优先级, 并保留最低 PRB 份额)
+    std::vector<ul_sched_result> schedule_epf(uint32_t tti);
+
+    /// 计算 EPF 调度度量 (供 schedule_epf 与日志复用)
+    double compute_epf_metric(const ue_sched_context& ctx, uint32_t tti) const;
+
     /// 为UE生成上行授权 (无锁版本, 供内部调度方法使用)
     ul_grant generate_ul_grant_unlocked(uint16_t rnti, uint32_t tti,
                                          uint32_t pid, bool is_retx);
@@ -170,13 +200,13 @@ private:
     void deduct_ul_buffer_unlocked(ue_sched_context& ctx, uint32_t bytes);
 
     /// 根据SNR(x100, 可为负)计算MCS
-    uint8_t calculate_mcs(int32_t snr_x100);
+    uint8_t calculate_mcs(int32_t snr_x100) const;
 
     /// 根据MCS和PRB计算TBS
-    uint32_t calculate_tbs(uint8_t mcs, uint32_t n_prb);
+    uint32_t calculate_tbs(uint8_t mcs, uint32_t n_prb) const;
 
     /// 根据CQI(0-15)计算MCS (CQI=0返回0, 由调用方回退SNR)
-    uint8_t calculate_mcs_from_cqi(uint8_t cqi);
+    uint8_t calculate_mcs_from_cqi(uint8_t cqi) const;
 
     /// 为UE分配一个空闲HARQ进程ID (无锁版本)
     /// @return 进程ID (0..MAX_HARQ_PROCESSES-1), -1表示全部忙
@@ -198,6 +228,7 @@ private:
     std::vector<uint8_t> prb_busy_; ///< PRB占用表 (1=已分配), 每TTI重置
 
     double fairness_coeff_; ///< PF公平性系数
+    epf_params epf_;        ///< EPF 参数 (公平性因子/信道感知/QoS缩放/饿死保护)
 
     // 调度耗时采样 (微秒), 用于 P50/P99 统计
     mutable std::mutex latency_mutex_;

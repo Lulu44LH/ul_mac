@@ -182,6 +182,13 @@ bsr_format bsr_manager::select_bsr_format(uint32_t pdu_space,
     //   - 空间不足Long BSR但够Short BSR, 多个LCG有数据 -> Truncated BSR
     //   - 空间不足Long BSR但够Short BSR, 仅1个LCG有数据 -> Short BSR
     //
+    // 【协议说明 / 简化实现】
+    // 真实 TS 36.321 §5.4.5 的 BSR 格式选择规则:
+    //   - 若只有一个 LCG 有数据 → Short BSR (不论触发类型)
+    //   - 若有多个 LCG 有数据:
+    //       * Regular/Periodic → Long BSR
+    //       * Padding 且空间仅够 Short → Truncated BSR (只报最高优先级 LCG)
+    //   本项目用 pdu_space 与 nof_lcg_with_data 近似该逻辑, 仅作演示。
     // 注意: Padding BSR空间足够时优先用Long BSR (3GPP TS 36.321 §5.4.5:
     // 填充空间本就要浪费, 不如携带更完整的缓冲区信息)
 
@@ -292,12 +299,11 @@ bool bsr_manager::generate_bsr(bsr_ce& bsr, uint32_t pdu_space) {
 
     } else {
         // Long BSR: 报告所有有数据的LCG
-        for (uint32_t i = 0; i < NOF_LCGS; i++) {
-            if (lcg_sizes[i] > 0) {
-                uint8_t idx = bytes_to_bsr_index(lcg_sizes[i]);
-                bsr.reports.push_back(bsr_report(static_cast<uint8_t>(i), idx));
-            }
-        }
+        // 【协议说明】UE 端只编码 buffer>0 的 LCG; 对应的 eNB 端 receive_bsr() 对
+        // Long BSR 先 view.fill(0) 再填充, 二者语义镜像, 保证不产生残留高估。
+        // (见 enb_bsr_manager.cpp::receive_bsr)
+        // 复用 common_types.h 的 build_long_bsr, 避免与演示代码重复实现。
+        build_long_bsr(lcg_sizes.data(), bsr);
     }
 
     // 生成BSR后, 重启周期定时器 (非Truncated BSR)

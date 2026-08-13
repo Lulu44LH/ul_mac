@@ -92,18 +92,11 @@ void print_enb_rx_stats(const enb_bsr_manager& enb_bsr,
 }
 
 /// 模拟 UE 侧 bsr_manager 编码 BSR CE (UE 发送桩)
-/// 对应 bsr_manager::generate_bsr 中的 Long BSR 分支:
-///   报告所有 buffer>0 的 LCG, 每个用 6-bit 索引
+/// 演示用 UE 侧 BSR 编码 (对应 bsr_manager::generate_bsr 的 Long BSR 分支)。
+/// 复用 common_types.h 的 build_long_bsr, 与真实 bsr_manager 保持编解码一致。
 bsr_ce make_ue_bsr_ce(const uint32_t* lcg_sizes) {
     bsr_ce bsr;
-    bsr.format = bsr_format::LONG_BSR;
-    for (uint32_t i = 0; i < NOF_LCGS; i++) {
-        if (lcg_sizes[i] > 0) {
-            bsr.reports.push_back(
-                bsr_report(static_cast<uint8_t>(i),
-                           bytes_to_bsr_index(lcg_sizes[i])));
-        }
-    }
+    build_long_bsr(lcg_sizes, bsr);
     return bsr;
 }
 
@@ -456,6 +449,125 @@ void scenario4_enhanced_features() {
 }
 
 // ============================================================================
+// 场景5: 华为增强型比例公平调度 (EPF)
+//   演示: 差异化 QoS 权重 (VoIP/视频/尽力而为) + 弱信道 UE 不饿死
+// ============================================================================
+
+void scenario5_epf() {
+    print_separator("场景5: 华为增强型比例公平调度 (EPF)");
+
+    mac_logger::instance().set_level(log_level::WARNING);
+
+    // 5 个 UE, 差异化业务 + 差异化信道
+    //   UE1: VoIP  (GBR, 最高权重), 好信道
+    //   UE2: 视频  (高权重),        好信道
+    //   UE3: 尽力而为(基础权重),    好信道
+    //   UE4: 尽力而为(基础权重),    好信道
+    //   UE5: 尽力而为(基础权重),    弱信道 (差SNR, 验证不饿死)
+    uint16_t rntis[] = {0x0001, 0x0002, 0x0003, 0x0004, 0x0005};
+    qos_class qos[]  = {qos_class::VOIP, qos_class::VIDEO, qos_class::BE,
+                        qos_class::BE,    qos_class::BE};
+    int32_t   snr[]  = {2000, 2000, 2000, 2000, 200}; // UE5 弱信道 2dB
+
+    ul_scheduler scheduler(sched_algorithm::EPF, 100);
+    // 可配置公平性因子: 偏向公平 (alpha=1.0 标准PF), 信道感知 beta=0.5
+    epf_params epf;
+    epf.alpha = 1.0f;
+    epf.beta = 0.5f;
+    epf.gamma = 1.0f;
+    epf.min_prb_ratio = 0.10f;   // 饿死保护: 弱信道UE保底 10% PRB
+    epf.starve_tti = 200;        // 超过 200 TTI 未调度视为濒临饿死
+    scheduler.configure_epf(epf);
+
+    enb_bsr_manager enb_bsr;
+    enb_ul_harq_manager enb_harq(4);
+
+    std::vector<std::unique_ptr<ue_context>> ues;
+    for (int i = 0; i < 5; i++) {
+        ues.push_back(std::make_unique<ue_context>(rntis[i]));
+        ues.back()->setup_lcid(2, 0, 8);
+        scheduler.add_ue(rntis[i]);
+        scheduler.set_ue_qos(rntis[i], qos[i]); // 注入差异化 QoS 权重
+        enb_bsr.add_ue(rntis[i]);
+        enb_harq.add_ue(rntis[i]);
+        enb_harq.set_ul_snr(rntis[i], snr[i]);
+    }
+
+    std::cout << ">>> 仿真开始: 1000 TTI, 5个UE, EPF调度\n";
+    std::cout << ">>> QoS: UE1=VoIP(W=3) UE2=Video(W=2) UE3-5=BE(W=1)\n";
+    std::cout << ">>> UE5 弱信道(2dB), 验证饿死保护 (min_prb=10%)\n\n";
+
+    // 统计各 UE 每 100 TTI 调度次数 (验证公平 + 弱信道不饿死)
+    std::vector<uint32_t> sched_count(5, 0);
+
+    for (uint32_t tti = 0; tti < 1000; tti++) {
+        for (int i = 0; i < 5; i++) {
+            // 各 UE 持续产生数据, VoIP/视频产生更频繁 (业务特征)
+            uint32_t period = (qos[i] == qos_class::VOIP) ? 2u
+                            : (qos[i] == qos_class::VIDEO) ? 4u : 5u;
+            if (tti % period == static_cast<uint32_t>(i % period)) {
+                uint32_t bytes = (qos[i] == qos_class::VOIP) ? 100u   // 语音小包
+                                : (qos[i] == qos_class::VIDEO) ? 800u // 视频大包
+                                : 500u;                                // BE
+                ues[i]->data_arrived(2, bytes);
+            }
+            ues[i]->run_tti(tti);
+        }
+
+        for (int i = 0; i < 5; i++) {
+            if (ues[i]->get_sr_manager().get_state() == sr_state::PENDING) {
+                scheduler.handle_sr(rntis[i]);
+            }
+            auto sizes = ues[i]->get_buffer_manager().get_all_lcg_buffer_sizes();
+            enb_handle_bsr_ul(enb_bsr, scheduler, rntis[i], sizes.data());
+        }
+
+        auto results = scheduler.schedule_ul(tti);
+        for (const auto& res : results) {
+            for (int i = 0; i < 5; i++) {
+                if (res.rnti != rntis[i]) continue;
+                sched_count[i]++;
+                ul_grant grant = res.grant;
+                auto rx = enb_harq.receive_tb(rntis[i], grant);
+                grant.phich_available = true;
+                grant.hi_value = rx.crc_ok;
+                ues[i]->handle_ul_grant(grant);
+                ues[i]->handle_harq_feedback(grant.pid, grant.hi_value);
+                scheduler.handle_ul_crc(rntis[i], grant.pid,
+                                        rx.discarded ? true : rx.crc_ok);
+                break;
+            }
+        }
+
+        // 每 200 TTI 打印一次 EPF 度量快照
+        if (tti % 200 == 199) {
+            std::cout << "  TTI=" << (tti + 1) << " EPF 度量快照:\n";
+            for (int i = 0; i < 5; i++) {
+                std::cout << "    UE" << (i + 1)
+                          << " QoS=" << static_cast<int>(qos[i])
+                          << " metric=" << std::fixed << std::setprecision(1)
+                          << scheduler.get_epf_metric(rntis[i], tti)
+                          << " sched=" << sched_count[i] << "\n";
+            }
+        }
+    }
+
+    metrics_collector::instance().set_simulation_tti(1000);
+    std::cout << "\n>>> 总调度次数 (公平性/不饿死验证):\n";
+    for (int i = 0; i < 5; i++) {
+        const char* qname = (qos[i] == qos_class::VOIP) ? "VoIP"
+                          : (qos[i] == qos_class::VIDEO) ? "Video" : "BE";
+        const char* ch = (snr[i] < 1000) ? "弱" : "好";
+        std::cout << "  UE" << (i + 1) << " [" << qname << "," << ch << "信道]"
+                  << " 调度=" << sched_count[i]
+                  << " 次, 吞吐=" << std::fixed << std::setprecision(2)
+                  << ues[i]->get_metrics().ul_throughput_kbps << " kbps\n";
+    }
+    for (int i = 0; i < 5; i++) print_ue_metrics(ues[i]->get_metrics());
+    print_enb_rx_stats(enb_bsr, enb_harq);
+}
+
+// ============================================================================
 // 主函数
 // ============================================================================
 
@@ -487,6 +599,9 @@ int main(int argc, char* argv[]) {
     metrics_collector::instance().reset();
 
     scenario4_enhanced_features();
+    metrics_collector::instance().reset();
+
+    scenario5_epf();
 
     print_separator("最终系统性能指标");
     metrics_collector::instance().print_summary();
@@ -495,7 +610,8 @@ int main(int argc, char* argv[]) {
     std::cout << "  - BSR解码 (enb_bsr_manager): UE编码CE → eNB解码 → per-UE LCG视图\n";
     std::cout << "  - 上行调度 (ul_scheduler): SR/BSR驱动 + PRB分配 + HARQ PID管理\n";
     std::cout << "  - HARQ接收 (enb_ul_harq_manager): IR软合并 + CRC + PHICH反馈\n";
-    std::cout << "  - 调度算法: PF/RR/优先级调度\n";
+    std::cout << "  - 调度算法: PF/RR/优先级调度 + EPF(华为增强型比例公平)\n";
+    std::cout << "  - EPF: QoS权重 + 信道感知 + 饿死保护 (可配置 alpha/beta/gamma)\n";
     std::cout << "  - UE桩增强: 自适应SR、预测性BSR (保留作发送端行为)\n";
 
     return 0;

@@ -125,7 +125,7 @@ C++ 是编译型语言，从源码到运行要经过 4 步：
   cmake .. && make -j$(nproc)
   ./ul_mac_manager
   ```
-- [ ] 观察 4 个仿真场景的输出，找到这几类关键日志（对照 README §5.3）：
+- [ ] 观察 5 个仿真场景的输出，找到这几类关键日志（对照 README §5.3）：
   - `Sending SR on PUCCH` —— SR 发送
   - `Triggering Regular BSR` —— BSR 触发
   - `New TX, RV=0, TBS=xxx` —— HARQ 新传
@@ -165,12 +165,12 @@ C++ 是编译型语言，从源码到运行要经过 4 步：
 #### 1.2 constexpr 常量（取代 #define）
 
 ```cpp
-constexpr uint32_t MAX_HARQ_PROCESSES = 16;  // 编译期常量, 有类型、有作用域
+constexpr uint32_t MAX_HARQ_PROCESSES = 8;   // 编译期常量, 有类型、有作用域
 constexpr uint32_t NOF_LCGS = 4;             // 3GPP 规定最多 4 个 LCG
 ```
 
-比 `#define MAX_HARQ_PROCESSES 16` 好在：有类型检查、遵守作用域规则、可调试。
-**协议对应**：LTE HARQ 8 进程 / NR 16 进程，本项目取 NR 上限；LCG 数量 4 是 3GPP 硬性规定。
+比 `#define MAX_HARQ_PROCESSES 8` 好在：有类型检查、遵守作用域规则、可调试。
+**协议对应**：LTE 4G 上行 HARQ **固定 8 进程**（同步 HARQ，流水线填满 8ms RTT）；NR 上行 16 进程（异步）。本项目为 LTE 4G 上行仿真，取 8；LCG 数量 4 是 3GPP 硬性规定。
 
 #### 1.3 enum class（强类型枚举）
 
@@ -647,9 +647,9 @@ history_idx_++;   // 下标一直递增, 取模后循环覆盖最旧数据
 
 ### 📖 知识讲解 1：HARQ 协议知识（TS 36.321 §5.4.2）
 
-#### 4.1 为什么需要 16 个并行进程？
+#### 4.1 为什么需要 8 个并行进程？
 
-一次传输后要等约 8ms（HARQ RTT）才能收到 ACK/NACK。如果只有 1 个进程，这 8ms 里 UE 只能干等。解法：**流水线**——进程 0 在等反馈时，进程 1、2、3…继续发新数据。LTE 用 8 个进程刚好填满 8ms RTT，NR 最多 16 个（本项目 `MAX_HARQ_PROCESSES = 16`）。
+一次传输后要等约 8ms（HARQ RTT）才能收到 ACK/NACK。如果只有 1 个进程，这 8ms 里 UE 只能干等。解法：**流水线**——进程 0 在等反馈时，进程 1、2、3…继续发新数据。LTE 4G 上行用 **8 个进程**刚好填满 8ms RTT（同步 HARQ，进程号由时序隐式确定）；NR 上行为异步 HARQ，最多 16 个。本项目为 LTE 4G 上行仿真，取 `MAX_HARQ_PROCESSES = 8`。
 
 #### 4.2 NDI 机制：一个 bit 判断新传/重传
 
@@ -790,12 +790,12 @@ average_retx_.store(static_cast<float>(stats_.avg_retx_per_pkt));
 | 顺序 | 文件 | 行数 | 主题 |
 |---|---|---|---|
 | 1 | `include/ul_mac/enb_ul_scheduler.h` | 149 | **eNB 侧调度器接口**（重心） |
-| 2 | `src/enb_ul_scheduler.cpp` | 309 | **三种调度算法 + grant 生成 + HARQ 管理**（重心） |
+| 2 | `src/enb_ul_scheduler.cpp` | 309 | **四种调度算法（PF/RR/优先级/EPF）+ grant 生成 + HARQ 管理**（重心） |
 | 3 | `include/ul_mac/enb_bsr_manager.h` / `src/enb_bsr_manager.cpp` | — | **eNB 侧 BSR 解码器**（接收 UE 上报→LCG 视图） |
 | 4 | `include/ul_mac/enb_ul_harq_manager.h` / `src/enb_ul_harq_manager.cpp` | — | **eNB 侧 HARQ 软合并/重传判定**（接收 TB + CRC） |
 | 5 | `include/ul_mac/mac_pdu.h` / `src/mac_pdu.cpp` | — | UL-SCH MAC PDU 组包/解包（P1 新增，eNB 侧校验用） |
 | 6 | `include/ul_mac/ue_context.h` | 205 | UE 侧组件整合（桩，仅了解数据怎么来） |
-| 7 | `src/main.cpp` | 429 | 4 个仿真场景 + TTI 主循环 |
+| 7 | `src/main.cpp` | 429 | 5 个仿真场景 + TTI 主循环 |
 
 ### 📖 知识讲解 1：eNB 侧调度器（ul_scheduler）
 
@@ -809,9 +809,9 @@ average_retx_.store(static_cast<float>(stats_.avg_retx_per_pkt));
 | `ul_buffer[4]` / `total_ul_buffer` | `handle_bsr()`（BSR 索引→字节数） | 决定分配多少资源 |
 | `ul_snr` / `cqi` | 信道测量（SNR 固定 200=x100=2dB；CQI 0-15） | 决定 MCS（CQI 优先，SNR 回退） |
 | `ul_avg_rate` / `ul_nof_samples` | 每次调度后 EMA 更新 | PF 算法的"历史平均速率" |
-| `pending_retx[16]` | `handle_ul_crc()` CRC 失败时置位（位图） | 重传优先调度；多进程并行不互相覆盖（P0 修复） |
-| `ndi[16]` | 每次发新传授权时翻转 | 每个 HARQ 进程的 NDI 状态（新传翻转/重传保持，与 UE 侧对齐） |
-| `harq_tb[16]` | 新传时记录 tbs/mcs/prb | 重传锁定，保证 TBS 不变（P0 修复关键点） |
+| `pending_retx[8]` | `handle_ul_crc()` CRC 失败时置位（位图） | 重传优先调度；多进程并行不互相覆盖（P0 修复） |
+| `ndi[8]` | 每次发新传授权时翻转 | 每个 HARQ 进程的 NDI 状态（新传翻转/重传保持，与 UE 侧对齐） |
+| `harq_tb[8]` | 新传时记录 tbs/mcs/prb | 重传锁定，保证 TBS 不变（P0 修复关键点） |
 
 #### 5.1b 授权生成中的 NDI/RV 管理（generate_ul_grant_unlocked）
 
@@ -842,7 +842,9 @@ tbs = calculate_tbs(mcs, n_prb);  // 锚点插值 × n_prb / 8
 
 `(a + b - 1) / b` 是整数向上取整的标准写法，务必记住。MCS/TBS 已从简化线性公式升级为基于 TS 36.213 的区间映射表 + 锚点插值表，符合协议标准的查找表方法。
 
-#### 5.3 PF 调度算法三阶段（schedule_pf，第 137 行）
+#### 5.3 PF / EPF 调度算法（schedule_pf / schedule_epf）
+
+**PF（schedule_pf，第 137 行）三阶段**：
 
 ```
 阶段1: 重传优先 —— 遍历所有UE, 对任一HARQ进程pending_retx[pid]置位的先分配 (位图, 支持多进程并行重传)
@@ -864,9 +866,26 @@ tbs = calculate_tbs(mcs, n_prb);  // 锚点插值 × n_prb / 8
 
 **PF 公式的直觉**：分子是"你现在能跑多快"，分母是"你历史上已经吃了多少"。吃得多的 UE 分母大 → 度量值低 → 让位给吃得少的。这样信道好的 UE 多拿资源（效率），但饿着的 UE 度量值会逐渐升高最终被调度（公平）——**效率与公平的平衡**就体现在这个除法里。
 
-对比另两种算法（同一文件，结构几乎相同，读起来很快）：
+**EPF（schedule_epf，华为增强型比例公平）**：在 PF 基础上叠加 QoS 权重与信道感知增强项，度量公式：
+
+```
+metric = w_qos * (R_instant / R_avg^alpha) * (1 + beta * cqi_norm)
+  - R_instant    : 当前TTI按CQI/SNR可支持的瞬时速率 (PRB * tbs_per_rb[cqi])
+  - R_avg        : 长期平均吞吐 (复用 ul_avg_rate, 指数滑动平均)
+  - alpha        : 公平性因子 (EPF参数, 越大越偏向长期公平; 经典PF取1.0)
+  - beta         : 信道感知因子 (EPF参数, >0 时好信道用户额外加权)
+  - w_qos        : 业务QoS权重 (VoIP=3.0 > Video=2.0 > BE=1.0, 全局缩放gamma)
+  - cqi_norm     : 归一化信道质量 CQI/CQI_MAX ∈ [0,1]
+  - 饿死保护     : tti_since_sched > starve_tti 时 metric ×10 放大; 并强制为
+                   长期未调度UE保留 min_prb_ratio 比例的PRB底, 避免弱信道用户饿死
+```
+
+EPF 调度四阶段：**重传优先 → 饿死保底分配(min_prb) → EPF 度量排序新传 → 每 TTI 推进饿死计时器**。四类差异：PF 只看"瞬时/平均速率"，EPF 额外感知业务优先级（QoS）与信道质量（cqi_norm），且内置饿死保护兜底。所有 EPF 参数通过 `configure_epf(epf_params)` 可配（详见 PROTOCOL_NOTES.md §7.1、docs/MAIN_FLOW.md 场景5）。
+
+对比另外三种算法（同一文件，结构高度相似，读起来很快）：
 - **RR**（schedule_rr）：不排序，按 map 顺序轮流，绝对公平但不看信道
 - **Priority**（schedule_priority）：按 `total_ul_buffer` 降序，谁积压多先调度谁，吞吐优先
+- **EPF**（schedule_epf）：PF 度量 × QoS 权重 × 信道感知项，兼顾业务优先级与弱用户公平
 
 #### 5.4 排序 + lambda 比较器（第 173 行）
 
@@ -1231,7 +1250,7 @@ NR 补充：还有 2-step RA（MsgA=preamble+数据，MsgB=响应），降低时
 
 | # | 问题 | 为什么错 | 修复 | 验证 |
 |---|---|---|---|---|
-| ① | 调度器 `grant.ndi = !is_retx` | 把 NDI 当"新传=1"的绝对值，而协议是**每进程翻转标志**；UE 侧比较"是否变化"，会把连续新传误判为重传 | eNB 侧为每 UE 每进程维护 `ndi[16]`：新传翻转、重传保持（TS 36.321 §5.4.2.1） | 日志中新传/重传判定与调度器意图一致 |
+| ① | 调度器 `grant.ndi = !is_retx` | 把 NDI 当"新传=1"的绝对值，而协议是**每进程翻转标志**；UE 侧比较"是否变化"，会把连续新传误判为重传 | eNB 侧为每 UE 每进程维护 `ndi[8]`：新传翻转、重传保持（TS 36.321 §5.4.2.1） | 日志中新传/重传判定与调度器意图一致 |
 | ② | `avg_retx` 恒为 1.0 | 统计时把"本次是否重传(0/1)"当样本求均值，样本集只含重传事件 | 改为比率式：`total_retx / total_new_tx` | BLER=0.3 时实测 0.49 ≈ 几何分布理论值 p/(1-p)=0.43 |
 | ③ | BSR 统计 regular_count 恒为 0 | `need_to_send_bsr_on_ul_grant()` 先调 `generate_bsr()`（内部清 `triggered_type_`）再读它做统计 | 调用前先把触发类型存局部变量（"先存后清"） | 场景 4 三种触发计数均非零 |
 | ④ | 注释/文档写 "5-bit、Long BSR 4 字节" | 协议是 **6-bit** 缓冲区索引（64 级）、Long BSR **3 字节**（4×6bit=24bit） | 全部注释与 `LONG_BSR_SIZE` 修正 | 对照 TS 36.321 §6.1.3.1 |
@@ -1488,7 +1507,7 @@ if (action.is_discarded) {
 
 `unique_ptr`：无引用计数、零开销，独占语义天然适合"单一所有者"——本身不提供任何线程安全保证，但也不需要（不共享就没有竞争）。
 
-**项目实例**：项目全部用 `unique_ptr`、零 `shared_ptr`——`ul_harq_manager` 独占 16 个进程（`std::unique_ptr<ul_harq_process[]>`），main.cpp 用 `std::vector<std::unique_ptr<ue_context>>` 因为 ue_context 含 mutex 不可拷贝。可以讲："我的设计原则是所有权层次化，能用 unique 就不用 shared——shared_ptr 的原子计数在多核下有缓存行乖乖开销。"
+**项目实例**：项目全部用 `unique_ptr`、零 `shared_ptr`——`ul_harq_manager` 独占 8 个进程（`std::unique_ptr<ul_harq_process[]>`），main.cpp 用 `std::vector<std::unique_ptr<ue_context>>` 因为 ue_context 含 mutex 不可拷贝。可以讲："我的设计原则是所有权层次化，能用 unique 就不用 shared——shared_ptr 的原子计数在多核下有缓存行乖乖开销。"
 
 ### E.8 条件变量与生产者-消费者
 

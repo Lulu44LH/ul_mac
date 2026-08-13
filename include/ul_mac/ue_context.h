@@ -141,6 +141,10 @@ public:
         bsr_mgr_.update_bsr_tti_end(bsr);
 
         // 5. 新传时: 统计传输字节, 并从缓冲区取走已发送的数据 (简化版LCP)
+        //    【协议说明 / 简化实现】
+        //    真实协议 (TS 36.321 §5.4.3) 的 LCP 需按优先级逐 LC 分配、遵守令牌桶(PBR/BSD)。
+        //    本项目用 lcg_buffer_manager::consume_data() 做两阶段近似 (先高优先级 LC 后低优先级),
+        //    且用 new_buffer 实时值而非"已上报值"扣减, 因此不存在 BSR 上报值与实际发送不一致问题。
         //    重传发送的是同一个TB, 不重复计入也不重复消耗缓冲区
         if (action.tbs > 0 && action.is_new_tx) {
             total_tx_bytes_ += action.tbs;
@@ -218,8 +222,12 @@ private:
     }
 
     void on_sr_failed(uint16_t rnti) {
+        // 【协议说明 / 简化实现】
+        // 真实协议: SR 达到 dsr-TransMax 后 UE 应释放 SR/PUCCH 配置并触发随机接入(RA)。
+        // 本项目未在 MAC 层实现 RA 过程 (RA 跨层且需 eNB 配合), 此处仅作日志占位,
+        // 表达 "SR 失败 → 应由上层启动 RA" 的语义。详情见 ue_sr_manager.cpp 对应注释。
         LOG_ERROR("UE", rnti, current_tti_,
-            "SR failed - would trigger RA procedure");
+            "SR failed - RA fallback should be triggered by upper layer (not implemented here)");
     }
 
     void on_bsr_sent(uint16_t rnti, const bsr_ce& bsr) {
