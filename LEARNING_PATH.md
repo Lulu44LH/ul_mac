@@ -603,17 +603,6 @@ if (grant_size >= total_data) {
 1. **Truncated BSR 不取消触发**：`generate_bsr()` 仅在格式非 Truncated 时才清除 `triggered_type_`——因为截断报告不完整，下次授权仍需补发完整 BSR（3GPP 规定）
 2. **先存后清**：`need_to_send_bsr_on_ul_grant()` 在调用 `generate_bsr()` 前先把 `triggered_type_` 存入局部变量再用于统计——因为 `generate_bsr()` 内部会把它清成 NONE（早期版本在这里有个统计 bug，见附录 D）
 
-#### 3.9 预测性 BSR（增强功能，predict_buffer_demand，第 387 行）
-
-用 `std::array<uint32_t, 10>` 做**环形缓冲区**记录最近 10 个 TTI 的缓冲量：
-
-```cpp
-buffer_history_[history_idx_ % buffer_history_.size()] = current_buffer;
-history_idx_++;   // 下标一直递增, 取模后循环覆盖最旧数据
-```
-
-预测时做**最小二乘线性回归**：对历史样本拟合 `y = slope*x + intercept`（x为时间索引，y为缓冲区大小），预测下一采样点 `y_pred = slope*count + intercept`。相比加权平均，线性回归能真正捕捉增长/下降趋势——加权平均只能"跟着最新值走"，而回归能"预测拐点"。环形缓冲 + 线性回归是时间序列预测的基础组合，值得掌握。
-
 ### 🔍 代码精读指南
 
 - [ ] 第 1 天：`lcg_buffer.h` 全文 + `ue_bsr_manager.cpp` 的 `step()` → `handle_timer_expiry()` → `check_regular_bsr_trigger()` → `set_trigger()`（触发链）
@@ -790,7 +779,7 @@ average_retx_.store(static_cast<float>(stats_.avg_retx_per_pkt));
 | 顺序 | 文件 | 行数 | 主题 |
 |---|---|---|---|
 | 1 | `include/ul_mac/enb_ul_scheduler.h` | 149 | **eNB 侧调度器接口**（重心） |
-| 2 | `src/enb_ul_scheduler.cpp` | 309 | **四种调度算法（PF/RR/优先级/EPF）+ grant 生成 + HARQ 管理**（重心） |
+| 2 | `src/enb_ul_scheduler.cpp` | 309 | **三种调度算法（PF/RR/EPF）+ grant 生成 + HARQ 管理**（重心） |
 | 3 | `include/ul_mac/enb_bsr_manager.h` / `src/enb_bsr_manager.cpp` | — | **eNB 侧 BSR 解码器**（接收 UE 上报→LCG 视图） |
 | 4 | `include/ul_mac/enb_ul_harq_manager.h` / `src/enb_ul_harq_manager.cpp` | — | **eNB 侧 HARQ 软合并/重传判定**（接收 TB + CRC） |
 | 5 | `include/ul_mac/mac_pdu.h` / `src/mac_pdu.cpp` | — | UL-SCH MAC PDU 组包/解包（P1 新增，eNB 侧校验用） |
@@ -880,11 +869,12 @@ metric = w_qos * (R_instant / R_avg^alpha) * (1 + beta * cqi_norm)
                    长期未调度UE保留 min_prb_ratio 比例的PRB底, 避免弱信道用户饿死
 ```
 
-EPF 调度四阶段：**重传优先 → 饿死保底分配(min_prb) → EPF 度量排序新传 → 每 TTI 推进饿死计时器**。四类差异：PF 只看"瞬时/平均速率"，EPF 额外感知业务优先级（QoS）与信道质量（cqi_norm），且内置饿死保护兜底。所有 EPF 参数通过 `configure_epf(epf_params)` 可配（详见 PROTOCOL_NOTES.md §7.1、docs/MAIN_FLOW.md 场景5）。
+EPF 调度四阶段：**重传优先 → 饿死保底分配(min_prb) → EPF 度量排序新传 → 每 TTI 推进饿死计时器**。三类差异：PF 只看"瞬时/平均速率"，EPF 额外感知业务优先级（QoS）与信道质量（cqi_norm），且内置饿死保护兜底。所有 EPF 参数通过 `configure_epf(epf_params)` 可配（详见 PROTOCOL_NOTES.md §7.1、docs/MAIN_FLOW.md 场景5）。
 
-对比另外三种算法（同一文件，结构高度相似，读起来很快）：
+> **已移除**：原"基于缓冲区大小的优先级调度"（`schedule_priority`，按 `total_ul_buffer` 降序）已删除——仅按缓冲区排序在真实系统中不可行：不感知信道质量（弱信道 UE 会被高吞吐 UE 长期挤占而饿死），且无业务区分度。其吞吐优先目标可由 EPF（高 `alpha` 趋向公平 / 低 `alpha` 趋向吞吐）参数化替代。
+
+对比另外两种算法（同一文件，结构高度相似，读起来很快）：
 - **RR**（schedule_rr）：不排序，按 map 顺序轮流，绝对公平但不看信道
-- **Priority**（schedule_priority）：按 `total_ul_buffer` 降序，谁积压多先调度谁，吞吐优先
 - **EPF**（schedule_epf）：PF 度量 × QoS 权重 × 信道感知项，兼顾业务优先级与弱用户公平
 
 #### 5.4 排序 + lambda 比较器（第 173 行）
@@ -1044,7 +1034,7 @@ for (uint32_t tti = 0; tti < 200; tti++) {
 
 ### 🏁 里程碑
 
-✅ 能脱稿回答 README 全部 7 道面试题；能指出项目相对协议/srsRAN 的简化点与增强点（自适应 SR、预测性 BSR、负载均衡）。
+✅ 能脱稿回答 README 全部 7 道面试题；能指出项目相对协议/srsRAN 的简化点与增强点（自适应 SR[仿真增强]、Padding BSR 抑制[非标准]、EPF 增强型比例公平调度）。
 
 ---
 
@@ -1072,7 +1062,7 @@ for (uint32_t tti = 0; tti < 200; tti++) {
 | C++17 结构化绑定 | lcg_buffer.h 的 `for (auto& [lcid, state] : ...)` | 3 |
 | mutable mutex + const 成员函数 | lcg_buffer_manager | 3 |
 | _unlocked 私有方法防死锁 | get_buffer_state_lcg_unlocked() / generate_ul_grant_unlocked() | 3, 5 |
-| 环形缓冲区 (取模下标) | bsr_manager 的 buffer_history_ | 3 |
+| HARQ 进程时间轮转 (TTI mod 8 隐式环形流水线) | ul_harq_manager::processes_ | 4 |
 | 对象组合 (has-a) | harq_manager→process / ue_context→四组件 | 4, 5 |
 | std::unique_ptr / make_unique | harq processes_ / main.cpp 的 UE 容器 | 4, 5 |
 | std::atomic vs mutex 选型 | ul_harq_process 的成员 | 4 |
@@ -1265,8 +1255,8 @@ NR 补充：还有 2-step RA（MsgA=preamble+数据，MsgB=响应），降低时
 | ⑬ | MCS/TBS 用线性公式 `mcs=snr*28/30`、`tbs=n_prb*(mcs+1)*72/8` | 不符合 TS 36.213 标准查找表，高/低SNR区间偏差大 | `calculate_mcs()` 改为29阈值区间映射表；`calculate_tbs()` 改为6锚点TS 36.213效率表+线性插值 | SNR=2dB→MCS=7 与标准一致；TBS随MCS单调递增 |
 | ⑭ | HARQ 无 RTT 延迟建模，反馈即时处理 | 实际 PHICH 反馈需 8 TTI 延迟，即时处理导致重传时序不真实 | `ul_harq_process` 新增 `tx_tti_`/`rtt_ttis_`/`feedback_pending_`；RTT 内不处理反馈 | 单测验证 RTT 内 ACK 不生效，RTT 后生效 |
 | ⑮ | 无自动测试，只能人工验证 | 代码变更无回归保障 | 新增19个单元测试覆盖LCP/MCS-TBS/HARQ/SR/BSR/延迟/死锁/线程安全；CMakeLists 添加 test target | `ctest` 19/19 全通过 |
-| ⑯ | SR自适应4档if-else；BSR预测仅加权平均 | 离散阈值导致周期跳变；加权平均无法预测趋势 | SR改为对数连续映射`K/log2(1+rate)`+20%迟滞；BSR改为最小二乘线性回归 | SR周期变化平滑；BSR预测能捕捉递增/递减趋势 |
-| ⑰ | 早期终止/差分BSR 头文件声明但未实现 | 注释提到功能但代码为空 | HARQ：连续NACK≥3+重传≥2→提前丢弃；BSR：Padding BSR全部LCG无变化→跳过 | 单测验证早期终止触发；Padding BSR数量减少 |
+| ⑯ | SR自适应4档if-else | 离散阈值导致周期跳变 | SR改为对数连续映射`K/log2(1+rate)`+20%迟滞 | SR周期变化平滑，高流量低延迟、低流量省资源 |
+| ⑰ | 早期终止/Padding BSR 抑制(非标准) 头文件声明但未实现 | 注释提到功能但代码为空 | HARQ：连续NACK≥3+重传≥2→提前丢弃；BSR：Padding BSR全部LCG无变化→跳过 | 单测验证早期终止触发；Padding BSR数量减少 |
 | ⑱ | 无延迟统计（P50/P90/P99） | 缺少端到端延迟分布，无法评估QoS | `metrics_collector` 新增 `latency_stats`；`ue_context` 追踪数据到达→发送的TTI差 | 场景4输出 P50=71/P90=200/P99=233 TTI |
 | ⑲ | `get_all_process_info()` 16次重复加锁+`cur_tbs_`数据竞争 | manager mutex 重复加锁16次效率低；`get_current_tbs()` 无锁访问非原子字段 | 新增 `fill_process_info()` 在process锁内一次性读取；`get_all_process_info()` 改为1次加锁 | 并发读写测试无崩溃 |
 

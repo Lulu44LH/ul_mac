@@ -14,7 +14,9 @@
 //   1. 轮询调度 (RR): 公平轮转, 每个UE获得相同机会
 //   2. 比例公平 (PF): 基于历史吞吐率加权, 平衡公平性和效率
 //      参考 srsRAN_4G/srsenb/hdr/stack/mac/schedulers/sched_time_pf.h
-//   3. 优先级调度: 按UE优先级排序, 高优先级UE优先
+//   3. 增强型比例公平 (EPF): 华为 EPF, PF + QoS 权重 + 信道感知 + 饿死保护
+//      (原"基于缓冲区大小的优先级调度"已移除: 仅按缓冲区排序在真实系统中
+//       不可行——不感知信道质量, 弱信道UE会被长期饿死, 且缺乏业务区分度)
 //
 // 关键参考:
 //   - srsRAN_4G/srsenb/hdr/stack/mac/sched.h        调度器主类
@@ -179,9 +181,6 @@ private:
 
     /// 轮询(RR)调度算法
     std::vector<ul_sched_result> schedule_rr(uint32_t tti);
-
-    /// 优先级调度算法
-    std::vector<ul_sched_result> schedule_priority(uint32_t tti);
 
     /// 增强型比例公平(EPF)调度算法 (华为 EPF: PF + QoS 权重 + 信道感知)
     /// 度量: metric = w_qos * (R_instant / R_avg^alpha) * (1 + beta*cqi_norm)

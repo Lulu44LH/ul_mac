@@ -135,7 +135,7 @@ eNB 把索引解回字节（`receive_bsr` 内部 `bsr_index_to_bytes`），再�
 | 1 | `scenario1_basic_ul_scheduling` | 1 | 2000 (20dB) | PF | 基本链路：SR→BSR解码→Grant→HARQ |
 | 2 | `scenario2_multi_ue_pf` | 5 | 2000 (20dB) | PF | 多 UE 公平共享 PRB |
 | 3 | `scenario3_harq_retx` | 1 | **200 (2dB)** | RR | **弱信道新传 NACK→重传 IR 增益后 ACK** |
-| 4 | `scenario4_enhanced_features` | 1 | 2000 (20dB) | PF | 自适应 SR 周期 + 预测性 BSR + 调度实时性度量 |
+| 4 | `scenario4_enhanced_features` | 1 | 2000 (20dB) | PF | 自适应 SR 周期 + 调度实时性度量 |
 | 5 | `scenario5_epf` | 5 | 2000/200(弱) | **EPF** | 华为增强型PF：QoS权重(VoIP/视频/BE) + 信道感知 + 饿死保护 |
 
 ### 场景3 的 HARQ 软合并验证逻辑（`:294-296`）
@@ -169,7 +169,7 @@ enb_harq.set_ul_snr(0x0001, 200);   // 弱信道 2dB
 |------|------|------|
 | `ul_scheduler::handle_sr(rnti)` | enb_ul_scheduler.cpp:42 | 置 `sr_pending` 标志（**无独立 SR Manager**） |
 | `ul_scheduler::handle_bsr(rnti, lcg, idx)` | enb_ul_scheduler.cpp | 接收 BSR 索引，更新 `ul_buffer[lcg]` |
-| `ul_scheduler::schedule_ul(tti)` | enb_ul_scheduler.cpp | 执行 PF/RR/优先级/EPF 算法，分配 PRB + HARQ PID，输出 `ul_grant` |
+| `ul_scheduler::schedule_ul(tti)` | enb_ul_scheduler.cpp | 执行 PF/RR/EPF 三种算法，分配 PRB + HARQ PID，输出 `ul_grant` |
 | `ul_scheduler::schedule_epf(tti)` | enb_ul_scheduler.cpp | EPF 核心：重传优先 → 饿死保底 → EPF 度量排序新传 |
 | `ul_scheduler::compute_epf_metric(ctx, tti)` | enb_ul_scheduler.cpp | EPF 度量 = w_qos·(R_inst/R_avg^α)·(1+β·cqi_norm)，含饿死放大 |
 | `ul_scheduler::configure_epf(epf_params)` | enb_ul_scheduler.cpp | 配置公平性因子 α / 信道感知 β / QoS 缩放 γ / 饿死参数 |

@@ -304,7 +304,6 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_ul(uint32_t tt
     switch (algorithm_) {
         case sched_algorithm::PROPORTIONAL_FAIR: results = schedule_pf(tti); break;
         case sched_algorithm::ROUND_ROBIN:       results = schedule_rr(tti); break;
-        case sched_algorithm::PRIORITY_BASED:    results = schedule_priority(tti); break;
         case sched_algorithm::EPF:               results = schedule_epf(tti); break;
         default:                                 results = schedule_pf(tti); break;
     }
@@ -416,55 +415,6 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_rr(uint32_t tt
     // 轮询新传
     for (auto& [rnti, ctx] : ue_db_) {
         if (ctx.total_ul_buffer == 0 && !ctx.sr_pending) continue;
-        int32_t pid = alloc_free_pid_unlocked(ctx);
-        if (pid < 0) continue;
-        ul_sched_result res;
-        res.rnti = rnti;
-        res.grant = generate_ul_grant_unlocked(rnti, tti, static_cast<uint32_t>(pid), false);
-        res.is_retx = false;
-        if (res.grant.tbs > 0) {
-            ctx.harq_pid_busy[pid] = true;
-            ctx.sr_pending = false;
-            deduct_ul_buffer_unlocked(ctx, res.grant.tbs);
-            results.push_back(res);
-            metrics_collector::instance().record_ul_grant();
-        }
-    }
-    return results;
-}
-
-std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_priority(uint32_t tti) {
-    std::vector<ul_sched_result> results;
-    std::lock_guard<std::mutex> lock(mutex_);
-    prb_reset_unlocked();
-
-    // 重传优先
-    for (auto& [rnti, ctx] : ue_db_) {
-        for (uint32_t pid = 0; pid < MAX_HARQ_PROCESSES; ++pid) {
-            if (!ctx.pending_retx[pid]) continue;
-            ul_sched_result res;
-            res.rnti = rnti;
-            res.grant = generate_ul_grant_unlocked(rnti, tti, pid, true);
-            res.is_retx = true;
-            if (res.grant.tbs > 0) {
-                ctx.pending_retx[pid] = false;
-                results.push_back(res);
-                metrics_collector::instance().record_ul_grant();
-            }
-        }
-    }
-    // 按缓冲区大小排序新传
-    std::vector<std::pair<uint16_t, uint32_t>> sorted;
-    for (auto& [rnti, ctx] : ue_db_) {
-        if (ctx.total_ul_buffer > 0 || ctx.sr_pending) {
-            sorted.push_back({rnti, ctx.total_ul_buffer});
-        }
-    }
-    std::sort(sorted.begin(), sorted.end(),
-        [](const auto& a, const auto& b) { return a.second > b.second; });
-    for (const auto& [rnti, buf] : sorted) {
-        (void)buf;
-        auto& ctx = ue_db_[rnti];
         int32_t pid = alloc_free_pid_unlocked(ctx);
         if (pid < 0) continue;
         ul_sched_result res;
@@ -616,7 +566,10 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
     std::sort(queue.begin(), queue.end(),
         [](const ue_epf& a, const ue_epf& b) { return a.metric > b.metric; });
 
-    // 阶段3: 饿死保护保底分配
+    // 阶段3: 饿死保护保底分配 (EPF 增强, 非 3GPP 标准机制)
+    //  【协议澄清】3GPP 标准上行调度无"min_prb_ratio 保底份额"概念; 比例公平本身
+    //  已通过 R_avg 提供长期公平。本保底分配是华为 EPF 风格的资源保障增强, 用于
+    //  保证弱信道/小缓冲 UE 不被好信道 UE 长期挤占。
     //  为"濒临饿死"的 UE 在 PRB 池中先预留 min_prb_ratio 份额, 防止被大缓冲/好信道 UE 挤占
     uint32_t min_prb_total = static_cast<uint32_t>(
         std::ceil(epf_.min_prb_ratio * static_cast<double>(total_prb_)));
@@ -642,6 +595,9 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
         grant.prb_start = static_cast<uint32_t>(start);
         grant.mcs = mcs;
         grant.tbs = calculate_tbs(mcs, n);
+        // 保底分配视为"新传", 按标准翻转 NDI (与 generate_ul_grant_unlocked 新传分支一致)。
+        // 此处手动翻转而非复用 generate_ul_grant_unlocked, 是因为保底仅用最小 PRB 份额,
+        // 不依赖缓冲区需求反推, 故独立构造授权以避免与阶段4重复分配同一 UE。
         grant.ndi = !ctx.ndi[pid];
         ctx.ndi[pid] = grant.ndi;
         grant.ndi_present = true;

@@ -45,7 +45,7 @@
 │   │             │   SR/BSR     │                   │    │
 │   │ • PF算法    │              │ ┌───────────────┐ │    │
 │   │ • RR算法    │              │ │ sr_manager    │ │    │
-│   │ • 优先级算法│              │ │ (SR调度请求)   │ │    │
+│   │ • EPF算法   │              │ │ (SR调度请求)   │ │    │
 │   │             │              │ ├───────────────┤ │    │
 │   │ • UL Grant  │              │ │ bsr_manager   │ │    │
 │   │   生成      │              │ │ (BSR缓冲区)   │ │    │
@@ -119,7 +119,7 @@ ul_mac_manager/
 │   ├── ue_sr_manager.cpp            # SR管理器实现
 │   ├── ue_bsr_manager.cpp           # BSR管理器实现
 │   ├── ue_ul_harq_manager.cpp       # HARQ管理器实现
-│   ├── enb_ul_scheduler.cpp         # 调度器实现 (含PF/RR/优先级 + 实时性统计)
+│   ├── enb_ul_scheduler.cpp         # 调度器实现 (含PF/RR/EPF + 实时性统计)
 │   ├── enb_bsr_manager.cpp          # eNB侧BSR解码器
 │   ├── enb_ul_harq_manager.cpp      # eNB侧HARQ接收 (IR软合并 + PHICH)
 │   └── mac_pdu.cpp                  # MAC PDU 组包/解包实现 (P1新增)
@@ -130,10 +130,10 @@ ul_mac_manager/
 | 类名 | 文件 | 职责 | 对应 srsRAN 原型 |
 |------|------|------|-----------------|
 | `sr_manager` | ue_sr_manager.h/cpp | SR状态机、PUCCH资源管理、自适应SR周期 | `srsue::mac::sr_proc` |
-| `bsr_manager` | ue_bsr_manager.h/cpp | BSR触发、格式选择、定时器管理、预测性BSR | `srsue::mac::bsr_proc` |
+| `bsr_manager` | ue_bsr_manager.h/cpp | BSR触发、格式选择、定时器管理、Padding BSR抑制(非标准优化) | `srsue::mac::bsr_proc` |
 | `ul_harq_process` | ue_ul_harq_manager.h/cpp | 单HARQ进程状态机（NDI/RV管理） | `srsue::mac::ul_harq_process` |
-| `ul_harq_manager` | ue_ul_harq_manager.h/cpp | HARQ实体（16进程管理、统计） | `srsue::mac::ul_harq_entity` |
-| `ul_scheduler` | enb_ul_scheduler.h/cpp | eNB调度器（PF/RR/优先级） | `srsenb::mac::sched` |
+| `ul_harq_manager` | ue_ul_harq_manager.h/cpp | HARQ实体（8进程管理、统计） | `srsue::mac::ul_harq_entity` |
+| `ul_scheduler` | enb_ul_scheduler.h/cpp | eNB调度器（PF/RR/EPF 三种） | `srsenb::mac::sched` |
 | `enb_bsr_manager` | enb_bsr_manager.h/cpp | eNB侧BSR解码、per-UE LCG缓冲视图 | `srsenb::mac`（BSR处理） |
 | `enb_ul_harq_manager` | enb_ul_harq_manager.h/cpp | eNB侧HARQ接收（IR软合并 + 确定性SNR CRC判定 + PHICH反馈） | `srsenb::mac::ul_harq` |
 | `mac_pdu_packer` / `mac_pdu_unpacker` | mac_pdu.h/cpp | UL MAC PDU 组包/解包（subheader + BSR CE + SDU复用 + Padding） | `srsenb::mac::mac_pdu` |
@@ -195,10 +195,9 @@ UL Grant可用空间 → 计算可报告LCG数
   └─ 空间不够报全部   → Truncated BSR (按优先级截断)
 ```
 
-**增强功能 — 预测性BSR**：
-- 使用最小二乘线性回归预测未来缓冲区需求，捕捉增长/下降趋势
-- 帮助调度器提前规划资源分配，减少调度延迟
-- 差分BSR：Padding BSR场景下，若所有LCG缓冲区大小未变化则跳过发送，减少信令开销
+**增强功能 — Padding BSR 抑制（非 3GPP 标准，仅本项目开销优化）**：
+- Padding BSR场景下，若所有LCG缓冲区索引未变化则跳过发送，减少空口信令开销
+- 注意：3GPP 标准无"差分 BSR"机制；Regular/Periodic BSR 仍按标准完整上报
 
 **BSR缓冲区大小映射**：
 - 3GPP 标准表（TS 36.321 Table 6.1.3.1-1）为 64 级指数映射（Index 0~63 → 0~150000 bytes，比值约 1.12，Index 63 表示 ">150000"）
@@ -245,7 +244,7 @@ INACTIVE ──新传──► ACTIVE(IDLE)
 
 ### 3.4 上行调度器（eNB侧）
 
-**四种调度算法（PF / RR / 优先级 / EPF）**：
+**三种调度算法（PF / RR / EPF）**：
 
 #### 比例公平调度（PF）
 ```
@@ -259,9 +258,12 @@ PF度量值 = 当前请求速率 / (历史平均速率 ^ fairness_coeff)
 - 简单公平轮转，每个 UE 获得均等机会
 - 适合对公平性要求严格的场景
 
-#### 优先级调度
-- 按 UE 缓冲区大小排序，缓冲区大的优先
-- 适合最大化系统吞吐
+#### 增强型比例公平调度（EPF，华为）
+- 在 PF 基础上叠加 QoS 权重与信道感知增强项：`metric = w_qos·(R_inst/R_avg^α)·(1+β·cqi_norm)`
+- 内置饿死保护（弱信道 UE 自动升优先级并保留最低 PRB 份额）
+- 可配公平性因子 `alpha` / 信道感知 `beta` / QoS 缩放 `gamma`
+
+> 原"基于缓冲区大小的优先级调度"已移除：仅按缓冲区排序不感知信道质量（弱信道 UE 会被长期挤占饿死）且无业务区分度。
 
 **UL Grant 生成**：
 - MCS 计算：基于 SNR→MCS 区间映射表（29 个阈值点，`calculate_mcs()`），替代早期线性公式
@@ -345,7 +347,7 @@ make -j$(nproc)
 | 场景1 | 单UE, 200TTI, PF, ul_snr=20dB（好信道） | SR→BSR→Grant→HARQ完整流程（一次成功为主） |
 | 场景2 | 5UE, 1000TTI, PF, ul_snr=20dB（好信道） | 多UE比例公平调度公平性 |
 | 场景3 | 单UE, 500TTI, RR, ul_snr=2dB（弱信道） | HARQ重传机制：新传 NACK、IR 软合并（+2dB/次）后 ACK |
-| 场景4 | 单UE, 500TTI, 变化流量, ul_snr=20dB | 自适应SR周期、预测性BSR |
+| 场景4 | 单UE, 500TTI, 变化流量, ul_snr=20dB | 自适应SR周期 |
 
 > 信道为**确定性 SNR 模型**：`enb_ul_harq_manager::receive_tb()` 按 `eff_snr = ul_snr + (合并次数-1)×2dB` 与 `MCS 解码阈值+1dB` 比较判定 CRC，无随机性、结果可复现（取代了早期的概率 BLER 模型）。
 
@@ -389,7 +391,7 @@ ctest --output-on-failure
 | MCS/TBS | 2 | SNR→MCS区间映射、TBS单调性 |
 | HARQ | 5 | 新传/重传/最大重传丢弃/RTT延迟/早期终止 |
 | SR | 2 | 状态机转换、自适应周期 |
-| BSR | 3 | Regular触发、线性回归预测、差分BSR |
+| BSR | 2 | Regular触发、Padding BSR抑制(非标准) |
 | 延迟统计 | 2 | P50/P90/P99计算、样本记录 |
 | 死锁修复 | 1 | TB丢弃后pending_retx清除 |
 | 线程安全 | 1 | get_all_process_info并发访问 |
@@ -544,7 +546,7 @@ PF度量值 = R_current(t) / R_avg(t)^α
 - 指数（对数）量化表：小缓冲区精度高（本项目简化表中 Index 10 → 52 bytes），大缓冲区精度低（Index 62 → 21956 bytes，Index 63 封顶 25000 bytes）；3GPP 标准表同构但上限为 150000 bytes（Index 63 表示 ">150000"）
 - 这是合理的，因为大缓冲区通常意味着大量背景流量，精确值对调度影响不大
 
-### 8.3 自适应SR与预测性BSR
+### 8.3 自适应SR
 
 **难点**：标准SR周期固定，无法适应突发流量变化。高流量时需要更频繁的SR以降低延迟，低流量时需要更长的SR周期以节省PUCCH资源。
 
@@ -557,8 +559,6 @@ uint32_t new_period = clamp(K / log_rate, MIN_PERIOD, MAX_PERIOD);
 // 迟滞：变化不超过20%则不调整
 if (abs(new_period - current_period) / current_period < 0.2) return;
 ```
-
-预测性BSR使用线性趋势预测未来50ms的缓冲区增长，帮助调度器提前规划。
 
 ### 8.4 线程安全设计
 

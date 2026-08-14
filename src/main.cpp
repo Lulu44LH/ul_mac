@@ -17,7 +17,7 @@
 //   - 场景1: 基本接收链路 (单UE, 验证 SR→BSR解码→Grant→HARQ软合并)
 //   - 场景2: 多UE比例公平调度 (5 UE, 好信道, 一次成功率为主)
 //   - 场景3: HARQ软合并重传 (弱信号新传 NACK, 重传 IR 增益后 ACK)
-//   - 场景4: 增强功能 (UE 桩自适应 SR + 预测性 BSR, eNB 接收侧统计)
+//   - 场景4: 增强功能 (UE 桩自适应 SR, eNB 接收侧统计)
 // =============================================================================
 
 #include "ul_mac/ue_context.h"
@@ -342,11 +342,11 @@ void scenario3_harq_retx() {
 }
 
 // ============================================================================
-// 场景4: 增强功能演示 (UE 桩自适应SR + 预测性BSR, eNB 接收侧统计)
+// 场景4: 增强功能演示 (UE 桩自适应SR, eNB 接收侧统计)
 // ============================================================================
 
 void scenario4_enhanced_features() {
-    print_separator("场景4: 增强功能 (UE桩自适应SR + 预测性BSR, eNB接收侧统计)");
+    print_separator("场景4: 增强功能 (UE桩自适应SR, eNB接收侧统计)");
 
     mac_logger::instance().set_level(log_level::INFO);
 
@@ -363,7 +363,7 @@ void scenario4_enhanced_features() {
     enb_harq.set_ul_snr(0x0001, 2000); // 好信道
 
     std::cout << ">>> 仿真开始: 500 TTI\n";
-    std::cout << ">>> 演示 UE 桩自适应 SR 周期 + 预测性 BSR, eNB 侧统计接收\n\n";
+    std::cout << ">>> 演示 UE 桩自适应 SR 周期, eNB 侧统计接收\n\n";
 
     for (uint32_t tti = 0; tti < 500; tti++) {
         // 模拟变化的流量模式
@@ -379,16 +379,9 @@ void scenario4_enhanced_features() {
             traffic_rate = 50.0;
         }
 
-        // UE 桩: 自适应 SR 周期调整
+        // UE 桩: 自适应 SR 周期调整 (高流量缩短SR周期, 低流量延长以省功耗)
         ue.get_sr_manager().adjust_sr_period(traffic_rate);
         ue.run_tti(tti);
-
-        // UE 桩: 预测性 BSR (UE 侧预测, eNB 侧不关心, 仅日志)
-        if (tti % 50 == 0 && tti > 0) {
-            uint32_t predicted = ue.get_bsr_manager().predict_buffer_demand();
-            LOG_INFO("BSR", 0x0001, tti,
-                "UE predicted buffer demand: " + std::to_string(predicted) + " bytes");
-        }
 
         if (ue.get_sr_manager().get_state() == sr_state::PENDING) {
             scheduler.handle_sr(0x0001);
@@ -610,9 +603,9 @@ int main(int argc, char* argv[]) {
     std::cout << "  - BSR解码 (enb_bsr_manager): UE编码CE → eNB解码 → per-UE LCG视图\n";
     std::cout << "  - 上行调度 (ul_scheduler): SR/BSR驱动 + PRB分配 + HARQ PID管理\n";
     std::cout << "  - HARQ接收 (enb_ul_harq_manager): IR软合并 + CRC + PHICH反馈\n";
-    std::cout << "  - 调度算法: PF/RR/优先级调度 + EPF(华为增强型比例公平)\n";
+    std::cout << "  - 调度算法: PF/RR/EPF(华为增强型比例公平) 三种\n";
     std::cout << "  - EPF: QoS权重 + 信道感知 + 饿死保护 (可配置 alpha/beta/gamma)\n";
-    std::cout << "  - UE桩增强: 自适应SR、预测性BSR (保留作发送端行为)\n";
+    std::cout << "  - UE桩增强: 自适应SR (发送端行为)\n";
 
     return 0;
 }

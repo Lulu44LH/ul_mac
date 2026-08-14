@@ -60,7 +60,7 @@
 本项目聚焦 **eNB 基站侧上行 MAC 调度**，参考 srsRAN_4G `srsenb` (LTE) 与 ocudu scheduler (NR) 实现。
 
 **eNB 侧核心模块（重点学习）**：
-- [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h)：上行调度器——接收 SR/BSR/CQI/PHR/CRC，运行 PF/RR/Priority 算法，生成 UL Grant，管理 HARQ 进程
+- [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h)：上行调度器——接收 SR/BSR/CQI/PHR/CRC，运行 PF/RR/EPF 三种算法，生成 UL Grant，管理 HARQ 进程
 - [enb_bsr_manager](include/ul_mac/enb_bsr_manager.h)：eNB 侧 BSR 解码器——把 UE 上报的 BSR CE 解码为 per-UE LCG 缓冲区视图
 - [enb_ul_harq_manager](include/ul_mac/enb_ul_harq_manager.h)：eNB 侧 HARQ 软合并/重传决策——维护 per-UE 软缓冲与 NDI，输出 CRC 解码成败
 
@@ -259,17 +259,9 @@ bool enb_bsr_manager::receive_bsr(uint16_t rnti, const bsr_ce& bsr) {
 
 > 以下增强位于 UE 侧 `ue_bsr_manager`，属于"对端更聪明地编码 BSR"的演示，**未接入 eNB 调度器决策**，仅作协议扩展认知，不必深究。
 
-#### 4.5.1 预测性 BSR
+#### 4.5.1 Padding BSR 抑制（非 3GPP 标准，仅本项目开销优化）
 
-[ue_bsr_manager.h:117-119](include/ul_mac/ue_bsr_manager.h#L117-L119) `predict_buffer_demand()`：
-
-- 保留最近 10 个 TTI 的缓冲区历史（[ue_bsr_manager.h:204](include/ul_mac/ue_bsr_manager.h#L204) `buffer_history_`）
-- 使用最小二乘线性回归预测未来缓冲区需求
-- *注：场景4 中每 50 TTI 调用一次并打印预测值作演示，但预测结果**未接入 eNB 调度器决策**，仅作协议扩展认知*
-
-#### 4.5.2 差分 BSR
-
-[ue_bsr_manager.h:139-151](include/ul_mac/ue_bsr_manager.h#L139-L151) `set_differential_enabled()`：
+[ue_bsr_manager.h:139-151](include/ul_mac/ue_bsr_manager.h#L139-L151) `set_differential_enabled()`（注：函数名保留 `differential` 仅为兼容，语义为 Padding BSR 抑制）：
 
 - **仅在 Padding BSR 场景生效**（Regular/Periodic 标准要求必须发送）
 - 比较当前各 LCG 的 BSR 索引与上次报告值（[ue_bsr_manager.h:211](include/ul_mac/ue_bsr_manager.h#L211) `last_reported_bsr_`）
@@ -431,7 +423,7 @@ flowchart LR
                               │
               ┌───────────────┴───────────────┐
               ▼                                ▼
-       schedule_pf/rr/priority           generate_ul_grant_unlocked()
+       schedule_pf/rr/epf               generate_ul_grant_unlocked()
        ①重传优先 ②SR优先 ③PF度量           → MCS/PRB/TBS/NDI/RV
               │                                │
               └───────────────┬────────────────┘
@@ -443,20 +435,20 @@ flowchart LR
               └── ACK: 释放进程 / NACK: 置 pending_retx ─┘
 ```
 
-### 7.1 四种调度算法
+### 7.1 三种调度算法
 
 ```mermaid
 flowchart TD
     A[eNB 每 TTI 调度] --> B{选择算法}
     B -->|PF| C["比例公平<br/>metric = R_current / R_avg^α<br/>重传优先"]
     B -->|RR| D[轮询<br/>UE 轮流获得授权]
-    B -->|PRIORITY| E["优先级<br/>按 UE 缓冲区大小排序"]
     B -->|EPF| G["增强型比例公平 (华为)<br/>metric = w_qos·R_inst/R_avg^α·(1+β·cqi_norm)<br/>重传优先 + 饿死保底"]
     C --> F[生成 UL Grant]
     D --> F
-    E --> F
     G --> F
 ```
+
+> **已移除**：原"基于缓冲区大小的优先级调度"按 UE 缓冲区降序，因不感知信道质量（弱信道 UE 会被长期挤占饿死）且无业务区分度，已删除；其吞吐优先目标可由 EPF 参数（低 `alpha` 趋向吞吐、高 `alpha` 趋向公平）替代。
 
 ### 7.1b EPF 增强型比例公平算法（华为 EPF）
 
@@ -568,7 +560,7 @@ sequenceDiagram
 | HARQ 重传决策 | TS 36.321 §5.4.2.1 | **eNB**: [enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h) `handle_ul_crc()` + [enb_ul_harq_manager](include/ul_mac/enb_ul_harq_manager.h) `receive_tb()` ｜ UE 桩: [ue_ul_harq_manager](include/ul_mac/ue_ul_harq_manager.h) | `srsenb::mac::ul_harq` / `srsue::mac::ul_harq` | 高 |
 | RV 序列 | TS 36.212 §5.2.2 | [rv_of_irv()](include/ul_mac/common_types.h#L366) | `rv_of_irv` | 高 |
 | LCP 令牌桶 | TS 36.321 §5.4.3.1 | [lcg_buffer](include/ul_mac/lcg_buffer.h)（LCP 是 UE 侧行为：组装 PDU 时两阶段令牌桶消耗缓冲区；eNB 侧只决定授权大小） | `bsr_proc::lcg_buffer_state` | 高 |
-| **上行调度器（核心）** | 业界通用 + TS 36.321 | **[enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h)**（PF/RR/Priority + grant 生成 + HARQ 管理） | `srsenb::mac::sched` | 中 |
+| **上行调度器（核心）** | 业界通用 + TS 36.321 | **[enb_ul_scheduler](include/ul_mac/enb_ul_scheduler.h)**（PF/RR/EPF + grant 生成 + HARQ 管理） | `srsenb::mac::sched` | 中 |
 | MCS/TBS | TS 36.213 §7.1.7 | `enb_ul_scheduler.cpp` | — | 高 |
 | PHICH | TS 36.213 §8.0 | 确定性 SNR 阈值 + IR 软合并模型（eNB 侧 CRC 判定，[enb_ul_harq_manager](include/ul_mac/enb_ul_harq_manager.h)） | — | 中 |
 | MAC PDU 组包/解包 | TS 36.321 §6.1.2 | [mac_pdu](include/ul_mac/mac_pdu.h)（eNB 侧组包/解包校验） | `srsenb::mac::mac_pdu` | 中 |
@@ -589,8 +581,7 @@ sequenceDiagram
 | 增强功能 | 位置 | 价值 |
 |---------|------|------|
 | 自适应 SR 周期 | [ue_sr_manager.h:91](include/ul_mac/ue_sr_manager.h#L91) | 高流量低延迟，低流量省资源 |
-| 预测性 BSR | [ue_bsr_manager.h:117](include/ul_mac/ue_bsr_manager.h#L117) | 线性回归预测，调度器提前规划 |
-| 差分 BSR | [ue_bsr_manager.h:139](include/ul_mac/ue_bsr_manager.h#L139) | Padding BSR 跳过未变化项，省信令 |
+| Padding BSR 抑制(非标准) | [ue_bsr_manager.h:139](include/ul_mac/ue_bsr_manager.h#L139) | Padding BSR 跳过未变化项，省信令 |
 | HARQ 早期终止 | [ue_ul_harq_manager.h:121](include/ul_mac/ue_ul_harq_manager.h#L121) | 恶劣信道下提前丢弃，省资源 |
 | HARQ RTT 建模 | [ue_ul_harq_manager.h:109](include/ul_mac/ue_ul_harq_manager.h#L109) | 真实模拟 PHICH 反馈时序 |
 | MAC PDU 编解码 | [mac_pdu.h:64](include/ul_mac/mac_pdu.h#L64) | 实现 UL-SCH 组包/解包，便于 eNB 侧校验 |

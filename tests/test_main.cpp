@@ -531,31 +531,7 @@ TEST(test_bsr_trigger_regular) {
     EXPECT_TRUE(bsr_mgr.get_trigger_type() == bsr_trigger_type::REGULAR);
 }
 
-// 测试14: 预测性 BSR 线性回归 (递增趋势 -> 预测值 > 当前值)
-TEST(test_bsr_predict_linear) {
-    lcg_buffer_manager buf_mgr;
-    bsr_manager bsr_mgr(0x0001, buf_mgr);
-    bsr_mgr.init(bsr_config(), nullptr, nullptr);
-
-    buf_mgr.setup_lcid(1, 0, 1);
-
-    // 递增趋势: 100, 200, 300, 400, 500
-    for (uint32_t i = 1; i <= 5; i++) {
-        buf_mgr.update_buffer_state(1, i * 100);
-        bsr_mgr.step(i);
-    }
-    // 趋势走平: 500 (不再增长), 使线性回归预测值高于当前值
-    buf_mgr.update_buffer_state(1, 500);
-    bsr_mgr.step(6);
-
-    uint32_t current = buf_mgr.get_total_buffer_state();  // 500
-    uint32_t predicted = bsr_mgr.predict_buffer_demand();
-
-    // 递增趋势 -> 预测值应大于当前值
-    EXPECT_TRUE(predicted > current);
-}
-
-// 测试15: 差分 BSR (无变化时 Padding BSR 被跳过)
+// 测试15: Padding BSR抑制 (非标准优化, 无变化时 Padding BSR 被跳过)
 TEST(test_bsr_differential) {
     lcg_buffer_manager buf_mgr;
     bsr_manager bsr_mgr(0x0001, buf_mgr);
@@ -571,10 +547,10 @@ TEST(test_bsr_differential) {
     bool result1 = bsr_mgr.generate_padding_bsr(100, bsr1);
     EXPECT_TRUE(result1);  // 第一次生成成功
 
-    // 缓冲区无变化, 再次生成 Padding BSR: 差分检查应跳过
+    // 缓冲区无变化, 再次生成 Padding BSR: 抑制检查应跳过
     bsr_ce bsr2;
     bool result2 = bsr_mgr.generate_padding_bsr(100, bsr2);
-    EXPECT_FALSE(result2);  // 差分 BSR: 无变化, 跳过
+    EXPECT_FALSE(result2);  // Padding BSR抑制: 无变化, 跳过
 }
 
 // ============================================================================

@@ -272,7 +272,6 @@ struct ue_identity {
 enum class sched_algorithm {
     ROUND_ROBIN,    ///< 轮询调度 (RR)
     PROPORTIONAL_FAIR, ///< 比例公平调度 (PF) - 参考 srsRAN_4G sched_time_pf.h
-    PRIORITY_BASED, ///< 优先级调度
     EPF             ///< 增强型比例公平调度 (华为 EPF: PF + QoS 权重 + 信道感知)
 };
 

@@ -6,7 +6,6 @@
 // =============================================================================
 
 #include "ul_mac/ue_bsr_manager.h"
-#include <cmath>
 #include <algorithm>
 
 namespace ul_mac {
@@ -28,10 +27,8 @@ bsr_manager::bsr_manager(uint16_t rnti, lcg_buffer_manager& buffer_mgr)
     , retx_timer_running_(false)
     , sr_proc_(nullptr)
     , tx_callback_(nullptr)
-    , history_idx_(0)
     , differential_enabled_(true)
 {
-    buffer_history_.fill(0);
     last_reported_bsr_.fill(0);
 }
 
@@ -165,11 +162,6 @@ void bsr_manager::step(uint32_t tti) {
     // 4. 更新缓冲区状态 (将new_buffer复制到old_buffer)
     // 对应 srsRAN proc_bsr.cc step() 中的 update_old_buffer()
     buffer_mgr_.update_old_buffer();
-
-    // 【优化】记录流量历史 (用于预测性BSR)
-    uint32_t current_buffer = buffer_mgr_.get_total_buffer_state();
-    buffer_history_[history_idx_ % buffer_history_.size()] = current_buffer;
-    history_idx_++;
 }
 
 bsr_format bsr_manager::select_bsr_format(uint32_t pdu_space,
@@ -235,9 +227,10 @@ bool bsr_manager::generate_bsr(bsr_ce& bsr, uint32_t pdu_space) {
         }
     }
 
-    // 【优化】差分BSR: 仅Padding BSR场景下生效
-    // 比较当前各LCG的BSR索引与上次报告值, 若全部未变化则跳过本次发送
-    // 原理: Padding BSR利用剩余填充空间携带缓冲区状态, 若状态未变则无需重复上报
+    // 【优化/非标准】Padding BSR抑制 (Padding BSR Suppression)
+    // 非3GPP标准机制(标准无"差分BSR"), 仅本项目开销优化
+    // 仅Padding BSR场景下生效: 比较当前各LCG的BSR索引与上次报告值,
+    // 若全部未变化则跳过本次发送, 利用剩余填充空间携带状态但无需重复上报
     // 注意: Regular/Periodic BSR不受此优化影响 (3GPP标准要求必须发送)
     if (differential_enabled_ && triggered_type_ == bsr_trigger_type::PADDING) {
         bool any_change = false;
@@ -250,7 +243,7 @@ bool bsr_manager::generate_bsr(bsr_ce& bsr, uint32_t pdu_space) {
         }
         if (!any_change) {
             LOG_DEBUG("BSR", rnti_, 0,
-                "Differential BSR: no LCG buffer index changed, skipping padding BSR");
+                "Padding BSR suppression: no LCG buffer index changed, skipping padding BSR");
             return false;
         }
     }
@@ -328,8 +321,8 @@ bool bsr_manager::generate_bsr(bsr_ce& bsr, uint32_t pdu_space) {
     }
     metrics_collector::instance().record_bsr_tx(bsr.format);
 
-    // 【优化】更新上次报告的BSR索引 (用于差分BSR比较)
-    // 记录本次实际报告的各LCG缓冲区索引, 供下次Padding BSR差分判断使用
+    // 【优化/非标准】更新上次报告的BSR索引 (用于Padding BSR抑制比较)
+    // 记录本次实际报告的各LCG缓冲区索引, 供下次Padding BSR抑制判断使用
     for (uint32_t i = 0; i < NOF_LCGS; i++) {
         last_reported_bsr_[i] = bytes_to_bsr_index(lcg_sizes[i]);
     }
@@ -427,63 +420,6 @@ void bsr_manager::update_bsr_tti_end(const bsr_ce& bsr) {
         retx_timer_running_ = true;
         retx_timer_counter_ = bsr_cfg_.retx_timer;
     }
-}
-
-uint32_t bsr_manager::predict_buffer_demand() const {
-    // 【优化】预测性BSR算法 (深化版)
-    //
-    // 基于历史缓冲区大小预测未来需求
-    // 深化点: 从简单加权平均升级为线性回归预测, 真正捕捉缓冲区的增长/下降趋势
-    //
-    // 线性回归模型: y = a*x + b
-    //   x = 时间索引 (0, 1, ..., count-1), 按时间顺序排列
-    //   y = 缓冲区大小
-    //   预测下一时刻: y_pred = a * count + b
-    //   - slope(a) > 0: 缓冲区正在增长, 预测值高于当前值, 提前申请更多资源
-    //   - slope(a) < 0: 缓冲区正在下降, 预测值低于当前值, 避免过度申请资源
-
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // 历史样本不足时无法拟合, 直接返回当前缓冲区状态
-    if (history_idx_ < 2) {
-        return buffer_mgr_.get_total_buffer_state();
-    }
-
-    uint32_t count = std::min(history_idx_, static_cast<uint32_t>(buffer_history_.size()));
-
-    // 最小二乘法求解线性回归系数
-    //   slope = (n*Σxy - Σx*Σy) / (n*Σx² - (Σx)²)
-    //   intercept = (Σy - slope*Σx) / n
-    double sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        // 按时间顺序取历史样本: 最旧的样本x=0, 最新的样本x=count-1
-        uint32_t idx = (history_idx_ - count + i) % buffer_history_.size();
-        double x = static_cast<double>(i);
-        double y = static_cast<double>(buffer_history_[idx]);
-        sum_x += x;
-        sum_y += y;
-        sum_xy += x * y;
-        sum_x2 += x * x;
-    }
-
-    double n = static_cast<double>(count);
-    double denominator = n * sum_x2 - sum_x * sum_x;
-
-    // 分母为0表示所有x相同 (理论上不应发生, 因为x是连续索引), 退化为返回最新值
-    if (std::abs(denominator) < 1e-10) {
-        return buffer_mgr_.get_total_buffer_state();
-    }
-
-    double slope = (n * sum_xy - sum_x * sum_y) / denominator;
-    double intercept = (sum_y - slope * sum_x) / n;
-
-    // 预测下一个采样点 (x = count, 即历史序列之后的第一个点)
-    double predicted = slope * count + intercept;
-
-    // 缓冲区大小不可为负, 限制下界
-    if (predicted < 0) predicted = 0;
-
-    return static_cast<uint32_t>(predicted);
 }
 
 } // namespace ul_mac

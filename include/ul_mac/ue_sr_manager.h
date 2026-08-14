@@ -9,9 +9,13 @@
 //   3. 若PUCCH未配置, 启动随机接入(RA)过程
 //   4. SR有最大传输次数限制(dsr-TransMax), 超限则释放PUCCH/SRS并启动RA
 //
-// 【增强功能】:
+// 【增强功能 (仿真增强, 注意协议对偶)】:
 //   1. 自适应SR周期: 根据UE流量模式动态调整SR发送频率
-//   2. SR优先级管理: 不同LCID可以配置不同的SR资源
+//      【协议澄清】3GPP标准里SR周期(SR periodicity)由eNB通过RRC
+//      (SchedulingRequestConfig / sr-ConfigIndex)半静态配置, UE无权单方面修改。
+//      本项目的"UE自适应调整"是仿真/教学增强, 用于演示流量-时延权衡;
+//      真实部署应由eNB根据测量触发RRC重配置来调整SR周期。
+//   2. SR优先级管理: 不同LCID可以配置不同的SR资源 (非标准, 仿真增强)
 //   3. SR禁止定时器优化: 避免SR频繁发送导致PUCCH拥塞
 //   4. SR失败快速恢复: 快速回退到RA过程
 //

@@ -17,7 +17,7 @@ sr_manager::sr_manager(uint16_t rnti)
     , state_(sr_state::IDLE)
     , sr_counter_(0)
     , last_sr_tx_tti_(0xFFFFFFFF)  // 初始化为极大值, 表示尚未发送过SR
-    , sr_prohibit_counter_(0)
+    , sr_prohibit_counter_(0)  // 【说明】sr-ProhibitTimer 标准存在, 但本项目未实现其递减/判定逻辑 (字段空置)
     , tx_callback_(nullptr)
     , fail_callback_(nullptr)
     , avg_traffic_rate_(0.0)
@@ -122,6 +122,9 @@ void sr_manager::step(uint32_t tti) {
         if (!initialized_) return;
         if (state_ != sr_state::PENDING) return;
 
+        // 【协议说明 / 简化实现】标准 sr-ProhibitTimer 用于限制 SR 发送间隔、避免 PUCCH
+        // 拥塞; 本项目未实现该定时器判定 (sr_prohibit_counter_ 恒为 0),
+        // 实际发送间隔仅由 SR 周期 (can_send_sr) 控制。
         if (sr_cfg_.enabled) {
             // PUCCH已配置, 在PUCCH上发送SR
             if (sr_counter_ < static_cast<int>(sr_cfg_.dsr_transmax)) {
@@ -212,7 +215,12 @@ void sr_manager::notify_ul_grant_received() {
 void sr_manager::adjust_sr_period(double traffic_rate) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // 【增强】自适应SR周期调整算法 (深化版)
+    // 【增强/仿真优化】自适应SR周期调整算法 (深化版)
+    //
+    // 【协议澄清】3GPP标准里SR周期由eNB通过RRC (SchedulingRequestConfig /
+    // sr-ConfigIndex) 半静态配置, UE无权单方面修改。本函数为仿真/教学增强,
+    // 由UE根据流量模式自决调整SR周期, 用于演示"流量大->SR更频繁->接入时延更低"
+    // 的权衡; 真实部署应改由eNB侧根据测量触发RRC重配置。
     //
     // 原理: 根据UE的流量模式动态调整SR发送周期
     //   - 高流量UE: 缩短SR周期, 快速获取上行授权

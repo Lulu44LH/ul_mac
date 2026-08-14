@@ -15,11 +15,13 @@
 //   3. BSR触发Regular类型时自动触发SR过程
 //   4. 定时器: periodicBSR-Timer, retxBSR-Timer
 //
-// 【优化功能】:
-//   1. 预测性BSR: 基于流量模式预测未来缓冲区需求
-//   2. BSR格式优化: 智能选择BSR格式以减少信令开销
-//   3. 差分BSR: 仅报告变化的LCG, 减少BSR大小
-//   4. 自适应定时器: 根据流量模式动态调整BSR定时器
+// 【优化功能 (非3GPP标准, 仅本项目开销优化)】:
+//   1. BSR格式优化: 智能选择BSR格式以减少信令开销 (基于标准Short/Long/Truncated)
+//   2. Padding BSR抑制(Padding BSR Suppression): 仅当各LCG缓冲索引相对上次变化时
+//      才发送Padding BSR, 否则跳过, 减少空口信令开销
+//      【注意】3GPP标准中没有"差分BSR"这一机制; 此处仅为Padding场景的发送抑制优化,
+//      Regular/Periodic BSR仍按标准完整上报, 不影响eNB视图正确性
+//   3. 自适应定时器: 根据流量模式动态调整BSR定时器
 //
 // 关键参考:
 //   - srsRAN_4G/srsue/hdr/stack/mac/proc_bsr.h    BSR类定义和接口
@@ -114,10 +116,6 @@ public:
     // 优化功能接口
     // ========================================================================
 
-    /// 【优化】预测性BSR: 基于流量模式预测未来缓冲区需求
-    /// @return 预测的下一周期总缓冲区大小 (bytes)
-    uint32_t predict_buffer_demand() const;
-
     /// 【优化】BSR统计信息
     struct bsr_stats {
         uint32_t total_bsr_sent;
@@ -136,15 +134,16 @@ public:
 
     bsr_stats get_stats() const { return stats_; }
 
-    /// 【优化】设置差分BSR开关
+    /// 【优化/非标准】设置Padding BSR抑制开关
     /// 启用后, Padding BSR在所有LCG缓冲区索引未变化时将被跳过, 减少信令开销
-    /// @param enable true=启用差分BSR, false=禁用
+    /// 注意: 非3GPP标准机制(标准无"差分BSR"), Regular/Periodic BSR不受影响
+    /// @param enable true=启用Padding BSR抑制, false=禁用
     void set_differential_enabled(bool enable) {
         std::lock_guard<std::mutex> lock(mutex_);
         differential_enabled_ = enable;
     }
 
-    /// 【优化】查询差分BSR是否启用
+    /// 【优化/非标准】查询Padding BSR抑制是否启用
     bool is_differential_enabled() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return differential_enabled_;
@@ -200,16 +199,12 @@ private:
     mutable std::mutex mutex_;
     bsr_stats stats_;
 
-    // 【优化】流量历史 (用于预测性BSR)
-    std::array<uint32_t, 10> buffer_history_;  ///< 最近10个TTI的缓冲区大小
-    uint32_t history_idx_;
-
-    // 【优化】差分BSR相关
+    // 【优化/非标准】Padding BSR抑制相关 (非3GPP标准, 仅本项目开销优化)
     // 仅在Padding BSR场景下生效: 比较当前各LCG的BSR索引与上次报告值,
     // 若全部未变化则跳过本次Padding BSR发送, 减少空口信令开销
     // Regular/Periodic BSR不受影响 (标准要求必须发送)
     std::array<uint8_t, NOF_LCGS> last_reported_bsr_;  ///< 上次报告的各LCG BSR索引
-    bool differential_enabled_;                        ///< 差分BSR开关, 默认启用
+    bool differential_enabled_;                        ///< Padding BSR抑制开关, 默认启用
 };
 
 } // namespace ul_mac

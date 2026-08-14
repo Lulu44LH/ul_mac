@@ -68,17 +68,14 @@ class bsr_manager {
     bool     periodic_timer_running_;
     bool     retx_timer_running_;
     sr_manager* sr_proc_;                  // 与 SR 联动：Regular BSR 触发 SR
-    std::array<uint32_t, NOF_LCGS> last_reported_bsr_; // 差分 BSR 用
-    std::array<uint32_t, 8>        buffer_history_;     // 预测性 BSR 历史
-    uint32_t history_idx_;
+    std::array<uint32_t, NOF_LCGS> last_reported_bsr_; // Padding BSR 抑制用 (非标准优化)
     bool     differential_enabled_;
 };
 ```
 
 要点：
-- UE 侧**同时持有真实缓冲区 + 触发状态机 + 定时器 + 差分/预测优化**。
-- `last_reported_bsr_` 记录"上一次实际编码进 MAC CE 的索引"，用于 Padding BSR 的差分去重。
-- `buffer_history_` 是本项目**特有增强**（真实协议无），用于线性回归预测缓冲区需求。
+- UE 侧**同时持有真实缓冲区 + 触发状态机 + 定时器 + Padding BSR 抑制优化（非标准）**。
+- `last_reported_bsr_` 记录"上一次实际编码进 MAC CE 的索引"，用于 Padding BSR 的抑制去重（注：非 3GPP 标准机制）。
 
 **eNB 侧（`enb_bsr_manager`）**
 

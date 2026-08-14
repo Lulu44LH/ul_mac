@@ -148,9 +148,11 @@ ul_harq_process::tx_action ul_harq_process::new_grant_ul(
                 harq_feedback_ = grant.hi_value;
             }
 
-            // 【增强】早期终止: 基于连续NACK统计提前终止重传
-            // 当连续收到3次NACK且已重传至少2次时, 认为该传输块在当前信道
-            // 条件下难以成功解码, 提前丢弃以节省无线资源 (避免无效重传)
+            // 【增强/非标准】早期终止: 基于连续NACK统计提前终止重传
+            // 【协议澄清】3GPP 标准 HARQ 重传上限由 RRC maxHARQ-Tx 决定, 并无
+            // "连续NACK提前丢弃"机制 (无损投递保证由 RLC 重传兜底)。本逻辑是
+            // 本项目额外资源优化: 当连续收到3次NACK且已重传至少2次时, 认为该
+            // TB 在当前信道条件下难以成功解码, 提前丢弃以节省无线资源。
             // 开关 early_termination_enabled_ 默认启用, 可通过 set_early_termination_enabled() 关闭
             if (early_termination_enabled_ && current_tx_nb_ >= 2
                 && consecutive_nack_ >= 3) {
