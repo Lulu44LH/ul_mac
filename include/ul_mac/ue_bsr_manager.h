@@ -17,11 +17,7 @@
 //
 // 【优化功能 (非3GPP标准, 仅本项目开销优化)】:
 //   1. BSR格式优化: 智能选择BSR格式以减少信令开销 (基于标准Short/Long/Truncated)
-//   2. Padding BSR抑制(Padding BSR Suppression): 仅当各LCG缓冲索引相对上次变化时
-//      才发送Padding BSR, 否则跳过, 减少空口信令开销
-//      【注意】3GPP标准中没有"差分BSR"这一机制; 此处仅为Padding场景的发送抑制优化,
-//      Regular/Periodic BSR仍按标准完整上报, 不影响eNB视图正确性
-//   3. 自适应定时器: 根据流量模式动态调整BSR定时器
+//   2. 自适应定时器: 根据流量模式动态调整BSR定时器
 //
 // 关键参考:
 //   - srsRAN_4G/srsue/hdr/stack/mac/proc_bsr.h    BSR类定义和接口
@@ -147,21 +143,6 @@ public:
         return stats_;
     }
 
-    /// 【优化/非标准】设置Padding BSR抑制开关
-    /// 启用后, Padding BSR在所有LCG缓冲区索引未变化时将被跳过, 减少信令开销
-    /// 注意: 非3GPP标准机制(标准无"差分BSR"), Regular/Periodic BSR不受影响
-    /// @param enable true=启用Padding BSR抑制, false=禁用
-    void set_differential_enabled(bool enable) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        differential_enabled_ = enable;
-    }
-
-    /// 【优化/非标准】查询Padding BSR抑制是否启用
-    bool is_differential_enabled() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return differential_enabled_;
-    }
-
 private:
     /// 设置BSR触发类型
     /// 对应 srsRAN proc_bsr.cc 中的 set_trigger()
@@ -215,13 +196,6 @@ private:
     // 统计和优化
     mutable std::mutex mutex_;
     bsr_stats stats_;
-
-    // 【优化/非标准】Padding BSR抑制相关 (非3GPP标准, 仅本项目开销优化)
-    // 仅在Padding BSR场景下生效: 比较当前各LCG的BSR索引与上次报告值,
-    // 若全部未变化则跳过本次Padding BSR发送, 减少空口信令开销
-    // Regular/Periodic BSR不受影响 (标准要求必须发送)
-    std::array<uint8_t, NOF_LCGS> last_reported_bsr_;  ///< 上次报告的各LCG BSR索引
-    bool differential_enabled_;                        ///< Padding BSR抑制开关, 默认启用
 };
 
 } // namespace ul_mac

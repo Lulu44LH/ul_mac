@@ -105,7 +105,7 @@ sr_config:
 ul_harq_config:
   max_harq_tx        = 4        // 新传+重传最多 4 次
   max_harq_msg3_tx   = 4        // Msg3 最多 4 次
-  harq_rtt_ttis      = 8        // RTT = 8 TTI (LTE FDD)
+  // 注: HARQ 不再内部建模 RTT, PHICH 反馈经 timed_channel 统一 +4 TTI 到达 UE
 ```
 
 ---
@@ -258,15 +258,7 @@ bool enb_bsr_manager::receive_bsr(uint16_t rnti, const bsr_ce& bsr) {
 
 ### 4.5 UE 桩增强（非 eNB 逻辑，仅了解）
 
-> 以下增强位于 UE 侧 `ue_bsr_manager`，属于"对端更聪明地编码 BSR"的演示，**未接入 eNB 调度器决策**，仅作协议扩展认知，不必深究。
-
-#### 4.5.1 Padding BSR 抑制（非 3GPP 标准，仅本项目开销优化）
-
-[ue_bsr_manager.h:139-151](include/ul_mac/ue_bsr_manager.h#L139-L151) `set_differential_enabled()`（注：函数名保留 `differential` 仅为兼容，语义为 Padding BSR 抑制）：
-
-- **仅在 Padding BSR 场景生效**（Regular/Periodic 标准要求必须发送）
-- 比较当前各 LCG 的 BSR 索引与上次报告值（[ue_bsr_manager.h:211](include/ul_mac/ue_bsr_manager.h#L211) `last_reported_bsr_`）
-- 若全部未变化则跳过本次 Padding BSR，减少空口信令开销
+> UE 侧 `ue_bsr_manager` 的 BSR 触发、格式选择、定时器管理严格遵循 3GPP TS 36.321 §5.4.5，**不引入非标准抑制机制**，所有 BSR（Regular/Periodic/Padding）按标准完整上报。
 
 ---
 
@@ -309,8 +301,8 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    A[收到 UL Grant] --> B{有 PHICH 反馈?<br/>phich_available}
-    B -->|是| C{ACK or NACK?<br/>hi_value}
+    A[收到 UL Grant] --> B{此前已收 PHICH 反馈?<br/>(经 PHICH 信道, +4 TTI)}
+    B -->|NACK| C{重传?}
     C -->|ACK| D[释放进程<br/>INACTIVE]
     C -->|NACK| E{达到 max_harq_tx?<br/>current_tx_nb >= max}
     E -->|是| F[丢弃 TB<br/>INACTIVE]
@@ -356,17 +348,17 @@ return rv_table[irv % 4];   // irv 每次传输后递增
 | 触发方式 | eNB 发新 DCI（含 NDI） | PHICH NACK |
 | MCS/PRB | 可改变 | 使用原参数 |
 | TBS | **不变**（保证 HARQ 软合并） | 不变 |
-| 项目字段 | `ndi_present=true` | `ndi_present=false`, `phich_available=true` |
+| 项目字段 | `ndi_present=true` | `ndi_present=false` (且此前已收 PHICH NACK) |
 
-### 5.7 RTT 延迟建模
+### 5.7 反馈延迟建模
 
-[ue_ul_harq_manager.h:109-119](include/ul_mac/ue_ul_harq_manager.h#L109-L119)：
+HARQ 进程**不再内部建模 RTT**。PHICH 反馈经 `timed_channel` 统一 +4 TTI 传播延时
+到达 UE，由 `main.cpp` 在对应 TTI 经 `handle_harq_feedback`（`apply_phich_feedback`）
+落地，与处理 UL Grant 解耦（main 中先收 PHICH、再处理 Grant）。
 
-- `tx_tti_` 记录本次传输的 TTI
-- `rtt_ttis_` = 8（LTE FDD 标准）
-- `is_feedback_ready(current_tti)`：`current_tti - tx_tti_ >= rtt_ttis_` 时反馈才可用
-- `feedback_pending_`：标记反馈在途中，避免提前处理
-- 设 `rtt_ttis_=0` 可退化为即时反馈（用于测试）
+- `tx_tti_` / `rtt_ttis_` / `feedback_pending_` / `is_feedback_ready` 已彻底移除
+- 反馈到达后由 `ul_harq_process::apply_phich_feedback` 判定 ACK/NACK 及丢弃（重传上限/早期终止）
+- 设 `timed_channel` 的 `CHANNEL_PROPAGATION_TTI=4` 即统一延时，无需在 HARQ 侧重复建模
 
 ### 5.8 项目增强：早期终止
 

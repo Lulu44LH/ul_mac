@@ -31,6 +31,12 @@ namespace ul_mac {
 /// 提供统一的UE侧上行MAC操作接口
 class ue_context {
 public:
+    /// 接收阶段 (receive_ul_grant) 打包好、待经 PUSCH 发送的 PDU
+    struct pending_pdu {
+        ul_grant grant;                 // 对应的 UL grant (含 tti_tx 等调度信息)
+        std::vector<uint8_t> pdu;       // 已打包好的 UL-SCH MAC PDU (BSR CE 字节流)
+    };
+
     /// 构造函数
     /// @param rnti UE的C-RNTI
     explicit ue_context(uint16_t rnti)
@@ -113,14 +119,11 @@ public:
     void run_tti(uint32_t tti) {
         current_tti_ = tti;
 
-        // 0. 派生 UL grant 状态 (判定权交回 HARQ):
-        //    【协议语义】UL grant 的有效性绑定在 HARQ 进程上 —— 只要有进程处于
-        //    WAITING_FB(已发等反馈) 或 RETX_PENDING(收到NACK待重传), 该 grant 仍在途,
-        //    UE 视为仍持有可用授权, 不应触发 SR (§5.4.4)。故 has_ul_grant_ 直接由
-        //    harq_mgr_.has_pending_transmission() 派生, 而非用"缓冲区是否清空"近似
-        //    (缓冲区清空无法反映重传期间的 grant 占用, 会误清)。
-        has_ul_grant_ = harq_mgr_.has_pending_transmission();
-        // 同步给 BSR: 供其触发 SR 时判定"无 UL grant"前提 (§5.4.4)
+        // 0. 同步 UL grant 状态给 BSR: has_ul_grant_ 由 run_tti 之前的 check_ul_grant()
+        //    (仅"检查"本 TTI PDCCH 信道上是否有到达的 UL Grant, 置标志位) 决定, 不再用
+        //    HARQ 进程状态近似。处理/打包该 grant 在 run_tti 之后的 process_ul_grant()
+        //    中进行。此处仅把当前标志位透传给 BSR, 供其触发 SR 时判定"无 UL grant"前提
+        //    (§5.4.4: 有可用 grant 时不触发 SR)。顺序上必须先于 BSR/SR 步进。
         bsr_mgr_.set_ul_grant_available(has_ul_grant_);
 
         // 1. BSR 步骤: 检查触发条件 (Regular/Periodic), 处理定时器。
@@ -138,12 +141,25 @@ public:
         buffer_mgr_.step_token_buckets(TTI_DURATION_MS);
     }
 
-    /// 处理来自eNB的上行授权
+    /// 检查本 TTI 是否收到 PDCCH 上的 UL Grant (run_tti 之前调用)
+    /// 仅做"置标志位", 不做任何处理 (不解 HARQ、不打包、不扣缓冲)。
+    /// 这样 run_tti 内部做 BSR/SR 步进时, 可直接用 has_ul_grant_ 判定
+    /// "有可用 grant 则不触发 SR" (§5.4.4), 而真正的 grant 处理留给
+    /// run_tti 之后的 process_ul_grant()。
+    /// @return 是否本 TTI 持有可用 UL grant (即刚置上的标志)
+    bool check_ul_grant(const ul_grant& grant) {
+        has_ul_grant_ = (grant.tbs > 0);   // 仅当 grant 携带有效 TB (tbs>0) 才置上本 TTI 的授权标志
+        return has_ul_grant_;
+    }
+
+    /// 处理来自eNB的上行授权 (run_tti 之后调用)
     /// 对应 srsRAN mac.h 中的 new_grant_ul()
-    ul_harq_process::tx_action handle_ul_grant(const ul_grant& grant) {
+    /// 【协议时序】标志位 has_ul_grant_ 已在 run_tti 之前的 check_ul_grant() 置好,
+    /// 故 run_tti 内的 BSR/SR 步进已据此判定过是否需要触发 SR。本方法才真正"处理"
+    /// 该 grant: 判定重传/新传、打包 BSR CE 进 MAC PDU、扣减缓冲区, 并把 PDU 暂存
+    /// 到待发队列, 由调用方经 PUSCH 信道发出。
+    ul_harq_process::tx_action process_ul_grant(const ul_grant& grant) {
         // 1. 通知SR管理器收到上行授权 (SR成功): 清除 pending SR
-        //    注: has_ul_grant_ 的最终取值由 run_tti 中基于 HARQ 进程状态
-        //    (has_pending_transmission) 统一派生, 此处不手动维护, 避免与 HARQ 状态脱节。
         sr_mgr_.notify_ul_grant_received();
 
         // 2. 检查是否需要在授权中发送BSR
@@ -220,25 +236,30 @@ public:
             buffer_mgr_.consume_data(action.tbs);
         }
 
-        // 6b. TB 被丢弃 (达到最大重传/早期终止): 把数据放回缓冲区
-        //     【RLC 重递交近似】真实系统中 HARQ 丢弃后由 RLC ARQ 把数据重新递交给
-        //     MAC (无损投递兜底)。本项目无 RLC, 新传时已乐观扣减缓冲 (见步骤6),
-        //     若不回滚, 丢弃的字节就静默丢失。此处放回最高优先级 LC (简化,
-        //     见 lcg_buffer_manager::restore_data), 并重新入延迟跟踪队列 ——
-        //     等价于"RLC 重递交一批新数据", 会重新触发 Regular BSR 走完整流程。
-        if (action.is_discarded && action.tbs > 0) {
-            buffer_mgr_.restore_data(action.tbs);
-            pending_data_tracker tracker;
-            tracker.lcid = 0;  // 简化: 未记录原 LC 归属, lcid 仅存档不参与逻辑
-            tracker.arrival_tti = current_tti_;
-            tracker.bytes = action.tbs;
-            pending_data_.push_back(tracker);
-            LOG_WARN("UE", rnti_, current_tti_,
-                "TB discarded (tbs=" + std::to_string(action.tbs) +
-                "B), data restored to buffer (RLC re-delivery approximation)");
-        }
+        // 6b. 【丢弃回滚已移至 handle_harq_feedback】TB 被丢弃 (达到最大重传/早期终止)
+        //     的判定现在在 PHICH 反馈落地时发生 (见 handle_harq_feedback), 而非在
+        //     process_ul_grant 处理 grant 的当下 —— 因为 HARQ RTT 延时 (统一由
+        //     timed_channel 建模) 意味着反馈总在 grant 处理之后才到达。
+
+        // 2. 暂存待发 PDU: 本方法只"打包"不"发送", 把 grant 与打包好的 PDU 入队,
+        //    交由调用方在 run_tti 之后通过 drain_pending_tx() 经 PUSCH 信道发出。
+        pending_tx_.push_back({grant, last_pdu_});
 
         return action;
+    }
+
+    /// 用尽本 TTI 的 UL grant: 发送 PDU 后调用, 清零 has_ul_grant_, 防止下一 TTI
+    /// 误判仍持有 grant 而错误抑制 SR (见 receive_ul_grant / run_tti 注释)。
+    void clear_ul_grant() { has_ul_grant_ = false; }
+
+    /// 接收阶段是否还有经 PUSCH 待发送的 PDU (由 receive_ul_grant 入队)
+    bool has_pending_tx() const { return !pending_tx_.empty(); }
+
+    /// 取走一个待发 PDU (FIFO)。调用方在 run_tti 之后按原时序经 PUSCH 信道发送。
+    pending_pdu take_pending_tx() {
+        pending_pdu p = pending_tx_.front();
+        pending_tx_.erase(pending_tx_.begin());
+        return p;
     }
 
     /// 处理HARQ反馈 (模拟PHICH反馈)
@@ -246,24 +267,41 @@ public:
     /// 【RTT延迟说明】
     /// 实际系统中, UE发送PUSCH后需要等待约8 TTI (LTE HARQ RTT)才能在PHICH上
     /// 收到eNB的ACK/NACK反馈。本方法模拟"反馈到达UE"的时刻, 因此调用方应在
-    /// 发送后经过RTT个TTI再调用本方法 (main.cpp中已按此方式在后续TTI调用)。
-    /// ul_harq_process 内部通过 tx_tti_ + rtt_ttis_ 建模该延迟, 在RTT未到时
-    /// 即便 grant.phich_available=true 也会延迟处理反馈。
+    /// HARQ 反馈落地 (模拟 PHICH)。反馈经 timed_channel 统一 +4 TTI 延时到达,
+    /// 故总在对应 PUSCH 发送之后。NACK 且达到重传上限/早期终止时, HARQ 进程判定
+    /// 丢弃 TB, 此处把已乐观扣减的缓冲回滚 (RLC 重递交近似)。
     void handle_harq_feedback(uint32_t pid, bool ack) {
-        harq_mgr_.handle_harq_feedback(pid,
+        auto fb = harq_mgr_.handle_harq_feedback(pid,
             ack ? harq_feedback::ACK : harq_feedback::NACK);
-        if (!ack) {
+        if (ack) {
+            LOG_DEBUG("UE", rnti_, current_tti_,
+                "HARQ ACK for PID=" + std::to_string(pid));
+        } else {
             LOG_DEBUG("UE", rnti_, current_tti_,
                 "HARQ NACK for PID=" + std::to_string(pid) + ", will retx");
+        }
+
+        // TB 被丢弃: 把数据放回缓冲区 (RLC 重递交近似)。新传时已乐观扣减缓冲
+        // (见 process_ul_grant 步骤6), 不回滚则丢弃的字节静默丢失。放回最高优先级
+        // LC (简化, 见 lcg_buffer_manager::restore_data) 并重新入延迟跟踪队列,
+        // 等价于"RLC 重递交一批新数据", 会重新触发 Regular BSR 走完整流程。
+        if (fb.is_discarded && fb.tbs > 0) {
+            buffer_mgr_.restore_data(fb.tbs);
+            pending_data_tracker tracker;
+            tracker.lcid = 0;  // 简化: 未记录原 LC 归属, lcid 仅存档不参与逻辑
+            tracker.arrival_tti = current_tti_;
+            tracker.bytes = fb.tbs;
+            pending_data_.push_back(tracker);
+            LOG_WARN("UE", rnti_, current_tti_,
+                "TB discarded (tbs=" + std::to_string(fb.tbs) +
+                "B), data restored to buffer (RLC re-delivery approximation)");
         }
     }
 
     uint16_t get_rnti() const { return rnti_; }
     lcg_buffer_manager& get_buffer_manager() { return buffer_mgr_; }
 
-    /// 【方案B】获取最近一次打包好的 UL-SCH MAC PDU (BSR CE 字节流)
-    /// 由 handle_ul_grant 在打包后填充, 调用方 (main) 取出后写入 ul_grant.pdu,
-    /// 模拟 "BSR 随 PUSCH 上报" 的空口语义, 供 eNB 侧 mac_pdu_unpacker 解包。
+    /// 最近一次打包好的 UL-SCH MAC PDU (已由 receive_ul_grant 暂存进 pending_tx_)
     const std::vector<uint8_t>& get_last_pdu() const { return last_pdu_; }
     sr_manager& get_sr_manager() { return sr_mgr_; }
     bsr_manager& get_bsr_manager() { return bsr_mgr_; }
@@ -332,6 +370,9 @@ private:
 
     // 【方案B】最近一次打包的 UL-SCH MAC PDU (BSR CE 字节流), 随 PUSCH 上报
     std::vector<uint8_t> last_pdu_;
+
+    // 接收阶段 (receive_ul_grant) 打包好、等待 run_tti 之后经 PUSCH 发送的 PDU 队列
+    std::vector<pending_pdu> pending_tx_;
 
     /// 延迟追踪: 记录每批数据的到达TTI (lcid -> arrival_tti)
     /// 用 deque: 头部弹出 (pop_front) 为 O(1), 避免 vector 头部 erase 的 O(n^2)

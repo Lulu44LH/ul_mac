@@ -23,29 +23,68 @@ ul_harq_process::ul_harq_process(uint32_t pid)
     , cur_ndi_(false)
     , cur_tbs_(0)
     , cur_rv_(-1)
-    , tx_tti_(0xFFFFFFFF)
-    , rtt_ttis_(8)
-    , feedback_pending_(false)
+    , max_harq_tx_(4)
+    , max_harq_msg3_tx_(4)
+    , is_temp_rnti_(false)
     , consecutive_nack_(0)
     // 早期终止默认关闭: 非标准机制且无 RLC 兜底, 提前丢弃即数据丢失 (见头文件说明)
     , early_termination_enabled_(false)
 {
 }
 
-void ul_harq_process::apply_phich_feedback(bool ack) {
+ul_harq_process::tx_action ul_harq_process::apply_phich_feedback(bool ack) {
     std::lock_guard<std::mutex> lock(mutex_);
-    // 守卫: 仅当当前 TB 在途且尚未收到反馈时应用。
-    //  - 进程空闲 (无 grant 或已 ACK 释放): 迟到的重复反馈直接忽略;
-    //  - 已收到过反馈: 同一 TB 的重复 NACK 不再改状态 (重传由 eNB 授权驱动)。
-    if (!is_grant_configured_ || harq_feedback_ || feedback_received_) return;
-    harq_feedback_ = ack;
-    feedback_received_ = true;
-    // ACK: harq_feedback_=true -> get_state()/fill_process_info 呈现 INACTIVE,
-    //      进程视为释放 (计数等字段由下一次新传 generate_new_tx 重置);
-    //      NACK: feedback_received_=true 且 harq_feedback_=false -> RETX_PENDING。
-    LOG_DEBUG("HARQ", 0, tx_tti_,
-        "PID=" + std::to_string(pid_) + ": PHICH " +
-        std::string(ack ? "ACK -> process released" : "NACK -> retx pending"));
+    tx_action result;  // is_discarded 默认 false
+
+    // ACK: 仅当进程在途且尚未 ACK 释放时处理, 否则忽略 (空闲/已释放)
+    if (ack) {
+        if (!is_grant_configured_ || harq_feedback_) return result;
+        consecutive_nack_ = 0;
+        harq_feedback_ = true;
+        feedback_received_ = true;
+        LOG_DEBUG("HARQ", 0, 0,
+            "PID=" + std::to_string(pid_) + ": PHICH ACK -> process released");
+        return result;
+    }
+
+    // NACK 分支:
+    //  - 连续 NACK 统计始终累加 (早期终止判定), 不受下方守卫影响;
+    //  - 守卫仅阻止对已释放/空闲进程的重复状态写, 以及重复触发丢弃。
+    ++consecutive_nack_;
+    if (!is_grant_configured_ || harq_feedback_) {
+        // 进程空闲或已 ACK 释放: 迟到的 NACK 不改变状态, 仅计数。
+        return result;
+    }
+
+    // 首次标记反馈已收到 (重复 NACK 不重复写 harq_feedback_)
+    if (!feedback_received_) {
+        harq_feedback_ = false;
+        feedback_received_ = true;
+    }
+
+    // 丢弃判定 (RTT 延时由 timed_channel 统一建模, 此处不再处理):
+    //   1) 达到最大重传次数 (max_harq_tx_/max_harq_msg3_tx_);
+    //   2) 早期终止 (默认关闭): 连续3次NACK且已重传≥2次。
+    uint32_t max_retx = is_temp_rnti_ ? max_harq_msg3_tx_ : max_harq_tx_;
+    bool max_reached = (current_tx_nb_ >= max_retx);
+    bool early_term  = early_termination_enabled_ &&
+                       (current_tx_nb_ >= 2) && (consecutive_nack_ >= 3);
+    if (max_reached || early_term) {
+        // 达到最大重传 / 早期终止: 丢弃当前 TB, 释放进程。
+        result.is_discarded = true;
+        result.tbs          = cur_tbs_;
+        result.is_msg3      = is_temp_rnti_;
+        reset_unlocked();
+        LOG_WARN("HARQ", 0, 0,
+            "PID=" + std::to_string(pid_) + ": TB discarded (tbs=" +
+            std::to_string(cur_tbs_) + "B), " +
+            std::string(max_reached ? "max_retx reached" : "early termination"));
+        return result;
+    }
+
+    LOG_DEBUG("HARQ", 0, 0,
+        "PID=" + std::to_string(pid_) + ": PHICH NACK -> retx pending");
+    return result;
 }
 
 void ul_harq_process::reset() {
@@ -62,16 +101,8 @@ void ul_harq_process::reset_unlocked() {
     cur_tbs_ = 0;
     cur_rv_ = -1;
     cur_ndi_ = false;
-    // 重置RTT相关状态: 标记为未传输, 清除在途反馈
-    tx_tti_ = 0xFFFFFFFF;
-    feedback_pending_ = false;
     // 重置早期终止统计: 清零连续NACK计数 (开关状态保持不变)
     consecutive_nack_ = 0;
-}
-
-void ul_harq_process::reset_ndi() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    cur_ndi_ = false;
 }
 
 uint32_t ul_harq_process::get_rv() const {
@@ -114,34 +145,11 @@ void ul_harq_process::fill_process_info(harq_process_info& info) const {
     // 【last_feedback 语义】
     //   feedback_received_=true + harq_feedback_=true -> ACK (已收到)
     //   feedback_received_=true + harq_feedback_=false -> NACK (已收到)
-    //   feedback_received_=false + harq_feedback_=false -> NACK (尚未收到,
-    //     兼容 test_harq_rtt_delay 的断言: "反馈未处理时 last_feedback 仍为 NACK")
+    //   feedback_received_=false + harq_feedback_=false -> NACK (尚未收到)
     //   注意: harq_feedback_ 默认 false 且不区分"未收到"与"NACK",
     //     但 feedback_received_ 帮助区分两种情况; 外部对 last_feedback 的
     //     观察: WAITING_FB -> NACK, RETX_PENDING -> NACK, INACTIVE -> ACK
     info.last_feedback = harq_feedback_ ? harq_feedback::ACK : harq_feedback::NACK;
-}
-
-bool ul_harq_process::is_feedback_ready(uint32_t current_tti) const {
-    // RTT建模: 从发送到收到PHICH反馈需要经过若干TTI (LTE标准约8ms)
-    // tx_tti_ == 0xFFFFFFFF 表示尚未传输, 反馈不可能到达
-    if (tx_tti_ == 0xFFFFFFFF) return false;
-    // TTI单调递增, uint32_t减法天然处理回绕
-    uint32_t elapsed = current_tti - tx_tti_;
-    // rtt_ttis_ = 0 时退化为即时反馈 (向后兼容)
-    return elapsed >= rtt_ttis_;
-}
-
-void ul_harq_process::update_feedback_stats(bool ack) {
-    // 【增强】更新HARQ反馈统计, 用于早期终止判断
-    // ACK: 重置连续NACK计数 (传输成功, 信道条件改善)
-    // NACK: 递增连续NACK计数 (传输失败, 可能信道条件恶化)
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (ack) {
-        consecutive_nack_ = 0;
-    } else {
-        consecutive_nack_++;
-    }
 }
 
 ul_harq_process::tx_action ul_harq_process::new_grant_ul(
@@ -155,70 +163,11 @@ ul_harq_process::tx_action ul_harq_process::new_grant_ul(
 
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // 从配置同步RTT时长 (允许运行时通过 set_rtt_ttis() 覆盖, 此处保证配置生效)
-    rtt_ttis_ = harq_cfg.harq_rtt_ttis;
-
-    // 步骤1: 处理HARQ反馈
-    if (grant.phich_available) {
-        // RTT延迟建模: PHICH反馈需要经过若干TTI才能到达UE
-        // 在RTT未到时, 反馈仍在途中, 不立即处理, 仅标记反馈在途
-        if (!is_feedback_ready(grant.tti_tx)) {
-            // RTT未到, 反馈仍在途中, 暂不处理
-            feedback_pending_ = true;
-            LOG_DEBUG("HARQ", 0, grant.tti_tx,
-                "PID=" + std::to_string(pid_) +
-                ": PHICH available but RTT not elapsed (tx_tti=" +
-                std::to_string(tx_tti_) + ", rtt=" + std::to_string(rtt_ttis_) +
-                "), feedback deferred");
-        } else {
-            // RTT已到, 反馈已到达, 正常处理
-            feedback_pending_ = false;
-            if (grant.ndi_present && grant.ndi == cur_ndi_ && grant.tbs != 0) {
-                harq_feedback_ = false;
-            } else {
-                harq_feedback_ = grant.hi_value;
-            }
-            feedback_received_ = true;  // 标记: 已收到反馈 (区分"NACK"与"尚未收到")
-
-            // 【增强/非标准】早期终止: 基于连续NACK统计提前终止重传
-            // 【协议澄清】3GPP 标准 HARQ 重传上限由 RRC maxHARQ-Tx 决定, 并无
-            // "连续NACK提前丢弃"机制 (无损投递保证由 RLC 重传兜底)。本逻辑是
-            // 本项目额外资源优化: 当连续收到3次NACK且已重传至少2次时, 认为该
-            // TB 在当前信道条件下难以成功解码, 提前丢弃以节省无线资源。
-            // 开关 early_termination_enabled_ 默认关闭 (无 RLC 兜底时提前丢 TB
-            // 会静默丢数据), 需演示资源优化时通过 set_early_termination_enabled(true) 开启
-            if (early_termination_enabled_ && current_tx_nb_ >= 2
-                && consecutive_nack_ >= 3) {
-                LOG_WARN("HARQ", 0, grant.tti_tx,
-                    "PID=" + std::to_string(pid_) +
-                    ": Early termination triggered (consecutive_nack=" +
-                    std::to_string(consecutive_nack_) + ")");
-                tx_action action;
-                action.is_discarded = true;
-                action.tx_nb = current_tx_nb_;
-                action.tbs = cur_tbs_;  // 携带 TB 大小, 供数据回滚
-                // 注意: 此处已持有 mutex_, 必须用不加锁版本
-                reset_unlocked();
-                return action;
-            }
-
-            // 步骤2: 检查最大重传次数
-            uint32_t max_retx = is_temp_rnti ? harq_cfg.max_harq_msg3_tx : harq_cfg.max_harq_tx;
-            if (current_tx_nb_ >= max_retx && !grant.hi_value) {
-                LOG_ERROR("HARQ", 0, grant.tti_tx,
-                    "PID=" + std::to_string(pid_) +
-                    ": Max ReTX reached (" + std::to_string(max_retx) + "), discarding TB");
-                tx_action action;
-                action.is_discarded = true;
-                action.tx_nb = current_tx_nb_;
-                action.tbs = cur_tbs_;  // 携带 TB 大小, 供数据回滚
-                // 注意: 此处已持有 mutex_, 必须用不加锁版本
-                // (早期版本调用 reset() 导致同锁重入自死锁, 见 LEARNING_PATH.md 附录 D)
-                reset_unlocked();
-                return action;
-            }
-        }
-    }
+    // 快照 HARQ 配置 (供后续 PHICH 反馈到达时做丢弃判定; 反馈经 timed_channel
+    // 统一 +4 TTI 延时, 本进程不再内部建模 RTT)。
+    max_harq_tx_   = harq_cfg.max_harq_tx;
+    max_harq_msg3_tx_ = harq_cfg.max_harq_msg3_tx;
+    is_temp_rnti_  = is_temp_rnti;
 
     // 步骤3: 判断新传输 vs 重传
     tx_action action;
@@ -265,9 +214,6 @@ ul_harq_process::tx_action ul_harq_process::generate_new_tx(
     is_grant_configured_ = true;
     current_tx_nb_ = 0;
     current_irv_ = 0;
-    // 记录本次传输的TTI, 用于RTT延迟计算 (从此时起等待PHICH反馈)
-    tx_tti_ = grant.tti_tx;
-    feedback_pending_ = false;
 
     tx_action action = generate_tx();
     action.is_new_tx = true;
@@ -298,10 +244,6 @@ ul_harq_process::tx_action ul_harq_process::generate_retx(const ul_grant& grant)
             ", RV=" + std::to_string(get_rv()) +
             ", TBS=" + std::to_string(cur_tbs_));
     }
-
-    // 记录本次重传的TTI, 用于RTT延迟计算 (重传后重新等待PHICH反馈)
-    tx_tti_ = grant.tti_tx;
-    feedback_pending_ = false;
 
     tx_action action = generate_tx();
     action.is_retx = true;
@@ -376,7 +318,6 @@ ul_harq_process::tx_action ul_harq_manager::new_grant_ul(
         std::lock_guard<std::mutex> lock(mutex_);
         if (action.is_new_tx) {
             stats_.total_new_tx++;
-            total_pkts_++;
             metrics_collector::instance().record_harq_new_tx();
         } else if (action.is_retx) {
             stats_.total_retx++;
@@ -399,26 +340,32 @@ ul_harq_process::tx_action ul_harq_manager::new_grant_ul(
     return action;
 }
 
-void ul_harq_manager::handle_harq_feedback(uint32_t pid, harq_feedback feedback) {
-    if (pid >= MAX_HARQ_PROCESSES) return;
+ul_harq_process::tx_action ul_harq_manager::handle_harq_feedback(
+    uint32_t pid, harq_feedback feedback) {
+    if (pid >= MAX_HARQ_PROCESSES) return ul_harq_process::tx_action();
     std::lock_guard<std::mutex> lock(mutex_);
 
     // 【PHICH 反馈落地】通过 process 的 apply_phich_feedback() 应用反馈:
     //   ACK -> harq_feedback_=true, 进程在 get_state()/fill_process_info 呈现 INACTIVE,
     //        下一次 has_pending_transmission() 查询时视为 grant 已释放 -> 不再抑制 SR;
     //   NACK -> harq_feedback_=false, feedback_received_=true, 呈现 RETX_PENDING,
-    //        仍视为 grant 在途 -> SR 继续抑制。
+    //        仍视为 grant 在途 -> SR 继续抑制。NACK 达到重传上限/早期终止时
+    //        由 process 判定丢弃, 返回的 tx_action.is_discarded=true 供 UE 回滚缓冲。
     //   这解决了"ACK 后进程永不释放 -> has_pending_transmission() 永真 -> SR 被永久
     //   抑制"的问题 (场景2 1000TTI 仅发5次 SR 的根因)。
+    ul_harq_process::tx_action result;
     if (feedback == harq_feedback::ACK || feedback == harq_feedback::NACK) {
-        processes_[pid].apply_phich_feedback(feedback == harq_feedback::ACK);
-        processes_[pid].update_feedback_stats(feedback == harq_feedback::ACK);
+        result = processes_[pid].apply_phich_feedback(feedback == harq_feedback::ACK);
+        if (feedback == harq_feedback::ACK)      stats_.total_ack++;
+        else                                     stats_.total_nack++;
+        if (result.is_discarded)                 stats_.total_fail++;
     }
 
     uint32_t total_fb = stats_.total_ack + stats_.total_nack;
     if (total_fb > 0) {
         stats_.bler = static_cast<double>(stats_.total_nack) / total_fb;
     }
+    return result;
 }
 
 void ul_harq_manager::reset() {
@@ -427,13 +374,6 @@ void ul_harq_manager::reset() {
         processes_[i].reset();
     }
     LOG_INFO("HARQ", rnti_, 0, "All HARQ processes reset");
-}
-
-void ul_harq_manager::reset_ndi() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (uint32_t i = 0; i < MAX_HARQ_PROCESSES; i++) {
-        processes_[i].reset_ndi();
-    }
 }
 
 harq_process_info ul_harq_manager::get_process_info_unlocked(uint32_t pid) const {
@@ -460,20 +400,6 @@ ul_harq_manager::get_all_process_info() const {
         infos[i] = get_process_info_unlocked(i);
     }
     return infos;
-}
-
-uint32_t ul_harq_manager::get_idle_process_id() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (uint32_t i = 0; i < MAX_HARQ_PROCESSES; i++) {
-        if (!processes_[i].has_grant()) return i;
-    }
-    uint32_t min_tx = UINT32_MAX;
-    uint32_t min_pid = 0;
-    for (uint32_t i = 0; i < MAX_HARQ_PROCESSES; i++) {
-        uint32_t tx_nb = processes_[i].get_nof_retx();
-        if (tx_nb < min_tx) { min_tx = tx_nb; min_pid = i; }
-    }
-    return min_pid;
 }
 
 bool ul_harq_manager::has_pending_transmission() const {

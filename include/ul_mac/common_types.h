@@ -166,9 +166,8 @@ enum class harq_feedback {
 struct ul_harq_config {
     uint32_t max_harq_tx;       ///< 最大HARQ传输次数 (新传+重传)
     uint32_t max_harq_msg3_tx;  ///< Msg3最大传输次数 (随机接入过程)
-    uint32_t harq_rtt_ttis;     ///< HARQ RTT时长(TTI), LTE标准约为8, 设为0退化为即时反馈
 
-    ul_harq_config() : max_harq_tx(4), max_harq_msg3_tx(4), harq_rtt_ttis(8) {}
+    ul_harq_config() : max_harq_tx(4), max_harq_msg3_tx(4) {}
 };
 
 /// 上行授权 (UL Grant) - eNB调度器分配给UE的上行资源
@@ -198,8 +197,6 @@ struct ul_grant {
                                // 本项目用 ndi_present=false 表示"非自适应重传 (无显式 NDI)",
                                // 此时 eNB 退化为依据进程状态 (INACTIVE->新TB) 判定。
     bool     is_rar;        ///< 是否为RAR(Random Access Response)中的授权
-    bool     phich_available;  ///< PHICH是否可用 (上行HARQ反馈信道)
-    bool     hi_value;      ///< PHICH反馈值 (true=ACK, false=NACK)
     uint32_t tti_tx;        ///< 发送TTI
     std::vector<uint8_t> pdu; ///< 【方案B】UE 侧打包好的 UL-SCH MAC PDU 字节流
                               ///<   (BSR CE + 数据 SDU + Padding), 随 PUSCH 空口传输,
@@ -210,7 +207,7 @@ struct ul_grant {
     ul_grant()
         : rnti(0), pid(0), tbs(0), n_prb(0), prb_start(0), mcs(0), rv(-1)
         , ndi(false), ndi_present(false), is_rar(false)
-        , phich_available(false), hi_value(false), tti_tx(0)
+        , tti_tx(0)
     {}
 };
 

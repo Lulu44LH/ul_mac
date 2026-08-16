@@ -27,9 +27,7 @@ bsr_manager::bsr_manager(uint16_t rnti, lcg_buffer_manager& buffer_mgr)
     , retx_timer_running_(false)
     , sr_proc_(nullptr)
     , tx_callback_(nullptr)
-    , differential_enabled_(true)
 {
-    last_reported_bsr_.fill(0);
 }
 
 void bsr_manager::init(const bsr_config& config,
@@ -247,29 +245,6 @@ bool bsr_manager::generate_bsr(bsr_ce& bsr, uint32_t pdu_space) {
         }
     }
 
-    // 【优化/非标准】Padding BSR抑制 (Padding BSR Suppression)
-    // 非3GPP标准机制(标准无"差分BSR"), 仅本项目开销优化
-    // 仅Padding BSR场景下生效: 比较当前各LCG的BSR索引与上次报告值,
-    // 若全部未变化则跳过本次发送, 利用剩余填充空间携带状态但无需重复上报
-    // 注意: Regular/Periodic BSR不受此优化影响 (3GPP标准要求必须发送)
-    // strict 模式下禁用: 3GPP 标准要求 Padding BSR 始终发送, 差分抑制是非标准优化
-    bool suppress_padding = differential_enabled_ && !g_strict_3gpp_mode;
-    if (suppress_padding && triggered_type_ == bsr_trigger_type::PADDING) {
-        bool any_change = false;
-        for (uint32_t i = 0; i < NOF_LCGS; i++) {
-            uint8_t cur_idx = bytes_to_bsr_index(lcg_sizes[i]);
-            if (cur_idx != last_reported_bsr_[i]) {
-                any_change = true;
-                break;
-            }
-        }
-        if (!any_change) {
-            LOG_DEBUG("BSR", rnti_, 0,
-                "Padding BSR suppression: no LCG buffer index changed, skipping padding BSR");
-            return false;
-        }
-    }
-
     // 选择BSR格式
     bsr.format = select_bsr_format(pdu_space, nof_lcg_with_data);
 
@@ -342,12 +317,6 @@ bool bsr_manager::generate_bsr(bsr_ce& bsr, uint32_t pdu_space) {
         case bsr_format::TRUNCATED_BSR: stats_.truncated_count++; break;
     }
     metrics_collector::instance().record_bsr_tx(bsr.format);
-
-    // 【优化/非标准】更新上次报告的BSR索引 (用于Padding BSR抑制比较)
-    // 记录本次实际报告的各LCG缓冲区索引, 供下次Padding BSR抑制判断使用
-    for (uint32_t i = 0; i < NOF_LCGS; i++) {
-        last_reported_bsr_[i] = bytes_to_bsr_index(lcg_sizes[i]);
-    }
 
     return true;
 }

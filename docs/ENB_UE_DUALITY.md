@@ -68,14 +68,11 @@ class bsr_manager {
     bool     periodic_timer_running_;
     bool     retx_timer_running_;
     sr_manager* sr_proc_;                  // 与 SR 联动：Regular BSR 触发 SR
-    std::array<uint32_t, NOF_LCGS> last_reported_bsr_; // Padding BSR 抑制用 (非标准优化)
-    bool     differential_enabled_;
 };
 ```
 
 要点：
-- UE 侧**同时持有真实缓冲区 + 触发状态机 + 定时器 + Padding BSR 抑制优化（非标准）**。
-- `last_reported_bsr_` 记录"上一次实际编码进 MAC CE 的索引"，用于 Padding BSR 的抑制去重（注：非 3GPP 标准机制）。
+- UE 侧**同时持有真实缓冲区 + 触发状态机 + 定时器**，所有 BSR 均按 3GPP 标准完整上报。
 
 **eNB 侧（`enb_bsr_manager`）**
 
@@ -114,7 +111,7 @@ struct bsr_ce     { bsr_format format; std::vector<bsr_report> reports; };
 | 触发判断 | `check_regular_bsr_trigger()`：条件1 空 LCG 来新数据；条件2 高优先级 LCG 来数据；`retxBSR-Timer` 超时 | 无（eNB 不触发） |
 | 定时器 | `periodic_timer_counter_`/`retx_timer_counter_` 倒计数 + `handle_timer_expiry()` | 无 |
 | 格式选择 | `select_bsr_format()`：依据 `pdu_space` 与 `nof_lcg_with_data` 选 Short/Truncated/Long | 无（格式由 `bsr.format` 携带） |
-| 组包/解码 | `generate_bsr()`：把 `lcg_sizes` 编成 `bsr.reports`（含差分优化、重启周期定时器、`last_reported_bsr_` 更新） | `receive_bsr()`：`if LONG_BSR: view.fill(0);` 再填报告项（**镜像编码语义**） |
+| 组包/解码 | `generate_bsr()`：把 `lcg_sizes` 编成 `bsr.reports`（重启周期定时器） | `receive_bsr()`：`if LONG_BSR: view.fill(0);` 再填报告项（**镜像编码语义**） |
 | 与 SR 联动 | `set_trigger(REGULAR)` 内调用 `sr_proc_->start()` | 无 |
 
 **最关键的语义镜像**——`enb_bsr_manager::receive_bsr()` 的 Long BSR 处理：
@@ -304,16 +301,13 @@ class ul_harq_process {
     bool     cur_ndi_;         // 当前 NDI
     uint32_t cur_tbs_;         // 锁定 TBS(重传不变)
     int32_t  cur_rv_;          // 自适应重传时 eNB 指定的 RV
-    uint32_t tx_tti_;          // 发送 TTI, 用于 RTT 建模
-    uint32_t rtt_ttis_;        // = 8 (LTE 标准 PHICH 延迟)
-    bool     feedback_pending_;// RTT 未到, 反馈在途
     uint32_t consecutive_nack_;// 增强: 连续 NACK 计数(早期终止用)
     bool     early_termination_enabled_;
 };
 
 class ul_harq_manager {
     std::unique_ptr<ul_harq_process[]> processes_; // MAX_HARQ_PROCESSES 个
-    ul_harq_config harq_cfg_;  // max_harq_tx, max_harq_msg3_tx, harq_rtt_ttis
+    ul_harq_config harq_cfg_;  // max_harq_tx, max_harq_msg3_tx
 };
 ```
 
@@ -406,10 +400,11 @@ int32_t threshold = decode_threshold_x100(p.cur_mcs);
 bool crc_ok = (eff >= threshold);
 ```
 
-UE 侧没有对应函数——UE 不解码自己发出的包，它只根据 eNB 下发的 PHICH（通过
-`new_grant_ul` 里的 `grant.hi_value`）来更新 `harq_feedback_`。**PHICH 是两侧 HARQ
-状态机的耦合点**：eNB 的 `last_crc_ok` → `get_phich()` → 调度器下发 PHICH →
-UE 的 `grant.hi_value` → UE 更新 `harq_feedback_`。
+UE 侧没有对应函数——UE 不解码自己发出的包，它只根据 eNB 经**独立 PHICH 信道**下发
+的反馈（由 `apply_phich_feedback(ack)` 落地）来更新 `harq_feedback_`。**PHICH 是两侧
+HARQ 状态机的耦合点**：eNB 的 `last_crc_ok` → `get_phich()` → 调度器经 `phich_ch`
+（+4 TTI 延时）下发 PHICH → UE 的 `handle_harq_feedback(pid, ack)` → UE 更新
+`harq_feedback_`。反馈不再随 `ul_grant` 携带（`phich_available`/`hi_value` 字段已移除）。
 
 **③ 重传管理**
 
@@ -432,11 +427,12 @@ bool enb_ul_harq_manager::get_phich(uint16_t rnti, uint32_t pid) const {
     return uit->second.procs[pid].last_crc_ok; // true = ACK
 }
 
-// UE: 消费 PHICH (ue_ul_harq_manager.cpp:145-149, 在 new_grant_ul 内)
-if (grant.ndi_present && grant.ndi == cur_ndi_ && grant.tbs != 0)
-    harq_feedback_ = false;
-else
-    harq_feedback_ = grant.hi_value; // hi_value 来自 eNB 的 PHICH
+// UE: 消费 PHICH (ue_ul_harq_manager.cpp, apply_phich_feedback)
+// 反馈经独立 PHICH 信道到达, 不再从 grant 读取 hi_value
+void ul_harq_process::apply_phich_feedback(bool ack) {
+    harq_feedback_ = ack;  // ack 来自 eNB 的 PHICH (经 timed_channel +4 TTI)
+    feedback_received_ = true;
+}
 ```
 
 UE 侧额外有 `handle_harq_feedback(pid, feedback)` 接口（供外部直接喂 ACK/NACK 统计），

@@ -15,9 +15,8 @@
 //
 // 【增强功能】:
 //   1. 早期终止: 基于BLER统计提前终止重传
-//   2. HARQ进程负载均衡: 避免单个进程过度使用
-//   3. 重传统计和BLER追踪
-//   4. Msg3特殊处理 (随机接入过程的Msg3传输)
+//   2. 重传统计和BLER追踪
+//   3. Msg3特殊处理 (随机接入过程的Msg3传输)
 //
 // 关键参考:
 //   - srsRAN_4G/srsue/hdr/stack/mac/ul_harq.h    HARQ实体和进程定义
@@ -47,18 +46,35 @@ public:
                        , harq_feedback_(false), is_grant_configured_(false)
                        , feedback_received_(false)
                        , cur_ndi_(false), cur_tbs_(0), cur_rv_(-1)
-                       , tx_tti_(0xFFFFFFFF), rtt_ttis_(8), feedback_pending_(false)
                        , consecutive_nack_(0), early_termination_enabled_(false) {}
 
     explicit ul_harq_process(uint32_t pid);
+
+    /// 单次授权产生的传输动作 (新传/重传/丢弃的统一返回体)
+    struct tx_action {
+        bool     is_new_tx;       ///< 是否为新传输
+        bool     is_retx;         ///< 是否为重传
+        uint32_t rv;              ///< 冗余版本
+        uint32_t tbs;             ///< 传输块大小
+        uint32_t tx_nb;           ///< 当前传输次数
+        bool     is_discarded;    ///< 是否被丢弃 (达到最大重传 / 早期终止)
+        bool     is_msg3;         ///< 是否为Msg3传输
+
+        tx_action() : is_new_tx(false), is_retx(false), rv(0), tbs(0)
+                    , tx_nb(0), is_discarded(false), is_msg3(false) {}
+    };
 
     /// 应用经独立 PHICH 信道到达的 HARQ 反馈 (区别于随 DCI grant 携带的反馈)
     /// 【协议语义】TS 36.321 §5.4.2: ACK -> 进程释放 (等待新 TB);
     /// NACK -> 进程置为待重传 (非自适应重传由 eNB 的重传授权驱动)。
     /// 守卫: 仅当当前 TB 在途且尚未收到反馈时应用, 防止迟到的旧反馈
     /// 误释放/误伤害已发出的新 TB (PHICH 与 PDCCH 到达顺序不保证)。
+    /// 内部不再建模 RTT (延时由 timed_channel 统一移交), 但在 NACK 时完成
+    /// "重传上限 / 早期终止" 的丢弃判定。
     /// @param ack true=ACK, false=NACK
-    void apply_phich_feedback(bool ack);
+    /// @return 本次反馈产生的传输动作 (NACK 且达到丢弃条件时 is_discarded=true,
+    ///         tbs 为被丢弃 TB 大小, 供 UE 上下文回滚缓冲区)
+    tx_action apply_phich_feedback(bool ack);
 
     /// 重置进程状态
     void reset();
@@ -66,29 +82,13 @@ public:
     /// 设置进程ID (用于初始化)
     void init_pid(uint32_t pid) { pid_ = pid; }
 
-    /// 重置NDI (用于切换/重配)
-    void reset_ndi();
-
     /// 处理新的上行授权
     /// 对应 srsRAN ul_harq.cc 中的 new_grant_ul() 方法
     /// 根据NDI、PHICH和授权信息决定是新传还是重传
     /// @param grant 上行授权
-    /// @param harq_cfg HARQ配置
+    /// @param harq_cfg HARQ配置 (透传, 供反馈到达时做丢弃判定)
     /// @param is_temp_rnti 是否使用TC-RNTI (Msg3传输)
     /// @return 传输动作信息
-    struct tx_action {
-        bool     is_new_tx;       ///< 是否为新传输
-        bool     is_retx;         ///< 是否为重传
-        uint32_t rv;              ///< 冗余版本
-        uint32_t tbs;             ///< 传输块大小
-        uint32_t tx_nb;           ///< 当前传输次数
-        bool     is_discarded;    ///< 是否被丢弃 (达到最大重传)
-        bool     is_msg3;         ///< 是否为Msg3传输
-
-        tx_action() : is_new_tx(false), is_retx(false), rv(0), tbs(0)
-                    , tx_nb(0), is_discarded(false), is_msg3(false) {}
-    };
-
     tx_action new_grant_ul(const ul_grant& grant, const ul_harq_config& harq_cfg,
                            bool is_temp_rnti);
 
@@ -96,36 +96,11 @@ public:
     /// 对应 srsRAN ul_harq.cc 中的 get_rv()
     uint32_t get_rv() const;
 
-    /// 是否已配置授权
-    bool has_grant() const { return is_grant_configured_; }
-
-    /// 获取当前NDI
-    bool get_ndi() const { return cur_ndi_; }
-
-    /// 获取重传次数
-    uint32_t get_nof_retx() const { return current_tx_nb_; }
-
-    /// 获取当前TBS
-    uint32_t get_current_tbs() const { return cur_tbs_; }
-
     /// 获取进程状态
     harq_state get_state() const;
 
     /// 获取进程ID
     uint32_t get_pid() const { return pid_; }
-
-    /// 检查HARQ反馈是否已到达 (RTT是否已过)
-    /// 实际系统中, PHICH反馈从发送到UE收到需要经过若干TTI (LTE约8ms)
-    /// @param current_tti 当前TTI
-    /// @return true=反馈已到达, 可以处理; false=反馈仍在途中
-    bool is_feedback_ready(uint32_t current_tti) const;
-
-    /// 设置RTT时长 (TTI数)
-    /// @param rtt RTT时长, LTE标准约为8; 设为0退化为即时反馈
-    void set_rtt_ttis(uint32_t rtt) { rtt_ttis_ = rtt; }
-
-    /// 是否有反馈在途中等待 (RTT未到)
-    bool is_feedback_pending() const { return feedback_pending_; }
 
     // ========================================================================
     // 增强功能接口 - 早期终止
@@ -133,11 +108,6 @@ public:
     // 由 RLC ARQ 兜底; 本项目 RLC 缺位, 提前丢弃即数据丢失, 故默认禁用),
     // 如需演示资源优化效果请显式调用 set_early_termination_enabled(true)。
     // ========================================================================
-
-    /// 【增强】更新HARQ反馈统计 (用于早期终止判断)
-    /// ACK重置连续NACK计数, NACK递增连续NACK计数
-    /// @param ack true=ACK, false=NACK
-    void update_feedback_stats(bool ack);
 
     /// 【增强】设置早期终止开关
     /// @param enable true=启用早期终止, false=禁用
@@ -186,9 +156,11 @@ private:
     bool                  cur_ndi_;          ///< 当前NDI值
     uint32_t              cur_tbs_;          ///< 当前TBS
     int8_t                cur_rv_;           ///< 当前RV (-1表示由IRV计算)
-    uint32_t              tx_tti_;           ///< 本次传输的TTI (用于RTT计算, 0xFFFFFFFF=未传输)
-    uint32_t              rtt_ttis_;         ///< RTT时长(TTI数), LTE通常为8, 0=即时反馈
-    bool                  feedback_pending_; ///< 是否有反馈在途中等待 (RTT未到)
+
+    // HARQ 配置快照: 收到 grant 时由 manager 透传, 反馈到达时已就绪 (丢弃判定用)
+    uint32_t              max_harq_tx_;       ///< 最大HARQ传输次数 (新传+重传)
+    uint32_t              max_harq_msg3_tx_;  ///< Msg3最大传输次数
+    bool                  is_temp_rnti_;      ///< 是否使用TC-RNTI (Msg3)
 
     // 【增强】早期终止相关
     // 基于BLER统计提前终止重传: 当连续收到多次NACK且已重传若干次时,
@@ -215,6 +187,7 @@ public:
 
     /// 处理新的上行授权
     /// 对应 srsRAN ul_harq.cc ul_harq_entity::new_grant_ul()
+    /// 管理器内部持有 HARQ 配置快照, 透传给具体进程 (供反馈到达时做丢弃判定)
     /// @param grant 上行授权
     /// @param is_temp_rnti 是否使用TC-RNTI (Msg3)
     /// @return 传输动作
@@ -223,13 +196,11 @@ public:
     /// 处理HARQ反馈 (PHICH/eNB反馈)
     /// @param pid HARQ进程ID
     /// @param feedback 反馈类型 (ACK/NACK)
-    void handle_harq_feedback(uint32_t pid, harq_feedback feedback);
+    /// @return 本次反馈产生的传输动作 (含丢弃判定, 供 UE 回滚缓冲)
+    ul_harq_process::tx_action handle_harq_feedback(uint32_t pid, harq_feedback feedback);
 
     /// 重置所有HARQ进程
     void reset();
-
-    /// 重置所有NDI
-    void reset_ndi();
 
     /// 设置HARQ配置
     void set_config(const ul_harq_config& config);
@@ -243,14 +214,11 @@ public:
     /// 获取平均重传次数
     double get_average_retx() const { return average_retx_.load(); }
 
-    /// 获取总传输包数
-    uint64_t get_total_pkts() const { return total_pkts_.load(); }
-
     // ========================================================================
     // 增强功能接口
     // ========================================================================
 
-    /// 【增强】获取HARQ统计信息
+    /// 查询是否仍有"在途的上行授权" (即存在仍占用 grant 的 HARQ 进程)
     /// 【线程安全】stats_ 在 mutex_ 下被写线程更新, 读取须持锁拷贝
     struct harq_stats {
         uint32_t total_new_tx;       ///< 新传总次数
@@ -270,10 +238,6 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return stats_;
     }
-
-    /// 【增强】获取空闲HARQ进程ID
-    /// 用于负载均衡, 优先选择空闲最久的进程
-    uint32_t get_idle_process_id() const;
 
     /// 查询是否仍有"在途的上行授权" (即存在仍占用 grant 的 HARQ 进程)
     /// 【协议语义】UL grant 的有效性绑定在 HARQ 进程上: 只要某进程处于
@@ -299,9 +263,8 @@ private:
     // HARQ进程数组 (对应 srsRAN ul_harq.h 中的 std::vector<ul_harq_process> proc)
     std::unique_ptr<ul_harq_process[]> processes_;
 
-    // 统计信息 (对应 srsRAN ul_harq.h 中的 average_retx, nof_pkts)
+    // 统计信息 (对应 srsRAN ul_harq.h 中的 average_retx)
     std::atomic<float>    average_retx_{0.0};
-    std::atomic<uint64_t> total_pkts_{0};
 
     mutable std::mutex mutex_;
     harq_stats stats_;

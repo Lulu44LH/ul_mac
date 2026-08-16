@@ -130,7 +130,7 @@ ul_mac_manager/
 | 类名 | 文件 | 职责 | 对应 srsRAN 原型 |
 |------|------|------|-----------------|
 | `sr_manager` | ue_sr_manager.h/cpp | SR状态机、PUCCH资源管理、自适应SR周期 | `srsue::mac::sr_proc` |
-| `bsr_manager` | ue_bsr_manager.h/cpp | BSR触发、格式选择、定时器管理、Padding BSR抑制(非标准优化) | `srsue::mac::bsr_proc` |
+| `bsr_manager` | ue_bsr_manager.h/cpp | BSR触发、格式选择、定时器管理 | `srsue::mac::bsr_proc` |
 | `ul_harq_process` | ue_ul_harq_manager.h/cpp | 单HARQ进程状态机（NDI/RV管理） | `srsue::mac::ul_harq_process` |
 | `ul_harq_manager` | ue_ul_harq_manager.h/cpp | HARQ实体（8进程管理、统计） | `srsue::mac::ul_harq_entity` |
 | `ul_scheduler` | enb_ul_scheduler.h/cpp | eNB调度器（PF/RR/EPF 三种） | `srsenb::mac::sched` |
@@ -194,10 +194,6 @@ UL Grant可用空间 → 计算可报告LCG数
   ├─ 多个LCG且空间够  → Long BSR (3字节: 4个LCG各6-bit BS Index)
   └─ 空间不够报全部   → Truncated BSR (按优先级截断)
 ```
-
-**增强功能 — Padding BSR 抑制（非 3GPP 标准，仅本项目开销优化）**：
-- Padding BSR场景下，若所有LCG缓冲区索引未变化则跳过发送，减少空口信令开销
-- 注意：3GPP 标准无"差分 BSR"机制；Regular/Periodic BSR 仍按标准完整上报
 
 **BSR缓冲区大小映射**：
 - 3GPP 标准表（TS 36.321 Table 6.1.3.1-1）为 64 级指数映射（Index 0~63 → 0~150000 bytes，比值约 1.12，Index 63 表示 ">150000"）
@@ -391,7 +387,7 @@ ctest --output-on-failure
 | MCS/TBS | 2 | SNR→MCS区间映射、TBS单调性 |
 | HARQ | 5 | 新传/重传/最大重传丢弃/RTT延迟/早期终止 |
 | SR | 2 | 状态机转换、自适应周期 |
-| BSR | 2 | Regular触发、Padding BSR抑制(非标准) |
+| BSR | 2 | Regular触发、格式选择 |
 | 延迟统计 | 2 | P50/P90/P99计算、样本记录 |
 | 死锁修复 | 1 | TB丢弃后pending_retx清除 |
 | 线程安全 | 1 | get_all_process_info并发访问 |

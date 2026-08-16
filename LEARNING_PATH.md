@@ -663,7 +663,9 @@ if (grant_size >= total_data) {
 
 ```
 收到 Grant
- ├─ 1. grant.phich_available? → 记录反馈 harq_feedback_ = hi_value
+ ├─ 1. 处理新传/重传 (依据 NDI / feedback_received_)
+ │      └─ 注: 反馈不再随 grant 携带, 由独立 PHICH 信道到达后
+ │         经 apply_phich_feedback 落地 (见下方 "反馈落地" 分支)
  │      └─ 2. current_tx_nb_ >= max_retx 且反馈是NACK?
  │             → 丢弃传输块 (is_discarded), reset(), 结束   ← "Max ReTX reached"日志
  ├─ 3. grant.ndi_present == true (有DCI):
@@ -1315,7 +1317,7 @@ NR 补充：还有 2-step RA（MsgA=preamble+数据，MsgB=响应），降低时
 | ⑪ | **HARQ 丢弃分支自死锁**（Windows 场景 2 卡死） | `new_grant_ul()` 持锁状态下命中"Max ReTX"分支时调用 `reset()`，同一把 `std::mutex` 二次加锁 = UB（实际表现为永久挂起）。Linux 未复现是因为 `uniform_real_distribution` 实现跨平台不同、随机序列恰好未命中该分支——**平台差异暴露潜伏 bug，而非平台问题** | 新增私有 `reset_unlocked()`，持锁分支改调它（项目既有 `_unlocked` 模式） | 单测强制触发 discard 分支不再挂起；完整回归中场景 3 命中同分支正常返回 |
 | ⑫ | LCP令牌桶空壳：`lc_config` 声明了 `pbr`/`bsd` 但 `consume_data()` 完全忽略 | 协议要求两阶段LCP：先按PBR令牌桶分配，再按优先级分配剩余；原代码只做纯优先级排序 | `lc_buffer_state` 增加 `token_bucket_size`/`token_count`；`consume_data()` 重写为两阶段算法；`step_token_buckets()` 每TTI补充令牌 | 单测验证PBR限制下高优先级信道不会饿死低优先级 |
 | ⑬ | MCS/TBS 用线性公式 `mcs=snr*28/30`、`tbs=n_prb*(mcs+1)*72/8` | 不符合 TS 36.213 标准查找表，高/低SNR区间偏差大 | `calculate_mcs()` 改为29阈值区间映射表；`calculate_tbs()` 改为6锚点TS 36.213效率表+线性插值 | SNR=2dB→MCS=7 与标准一致；TBS随MCS单调递增 |
-| ⑭ | HARQ 无 RTT 延迟建模，反馈即时处理 | 实际 PHICH 反馈需 8 TTI 延迟，即时处理导致重传时序不真实 | `ul_harq_process` 新增 `tx_tti_`/`rtt_ttis_`/`feedback_pending_`；RTT 内不处理反馈 | 单测验证 RTT 内 ACK 不生效，RTT 后生效 |
+| ⑭ | HARQ 无 RTT 延迟建模，反馈即时处理 | 实际 PHICH 反馈需传播延迟，即时处理导致重传时序不真实 | 初版在 `ul_harq_process` 内新增 `tx_tti_`/`rtt_ttis_`/`feedback_pending_` 建模 RTT；**后续发现与 `timed_channel` 的 +4 TTI 统一延时冗余**，已彻底移除内部 RTT 建模，反馈统一走 `timed_channel` + `apply_phich_feedback` 落地 | 反馈延迟职责交还 `timed_channel`，HARQ 侧不再重复建模 |
 | ⑮ | 无自动测试，只能人工验证 | 代码变更无回归保障 | 新增19个单元测试覆盖LCP/MCS-TBS/HARQ/SR/BSR/延迟/死锁/线程安全；CMakeLists 添加 test target | `ctest` 19/19 全通过 |
 | ⑯ | SR自适应4档if-else | 离散阈值导致周期跳变 | SR改为对数连续映射`K/log2(1+rate)`+20%迟滞 | SR周期变化平滑，高流量低延迟、低流量省资源 |
 | ⑰ | 早期终止/Padding BSR 抑制(非标准) 头文件声明但未实现 | 注释提到功能但代码为空 | HARQ：连续NACK≥3+重传≥2→提前丢弃；BSR：Padding BSR全部LCG无变化→跳过 | 单测验证早期终止触发；Padding BSR数量减少 |
@@ -1542,14 +1544,15 @@ void ul_harq_process::reset_unlocked() {
 **修复②：TB丢弃时主动清除调度器重传标志**（[main.cpp#L267-L274](file:///home/lulu44/Desktop/Lulu44/srsRAN/ul_mac_manager/src/main.cpp#L267-L274)）
 
 ```cpp
-auto action = ue.handle_ul_grant(grant);
-ue.handle_harq_feedback(grant.pid, grant.hi_value);
+// 反馈经独立 PHICH 信道到达 (不再随 grant 携带 hi_value), 先收反馈再处理 grant
+while (auto ph = phich_ch.at(rnti).dequeue(tti))
+    ue.handle_harq_feedback(ph.value().pid, ph.value().ack);
+
+auto action = ue.process_ul_grant(grant);
 
 if (action.is_discarded) {
-    // TB已丢弃(达到最大重传), 主动通知调度器"这个PID不需要重传了"
+    // TB已丢弃(达到最大重传/早期终止), 主动通知调度器"这个PID不需要重传了"
     scheduler.handle_ul_crc(rnti, grant.pid, true);   // crc_ok=true → 清pending_retx_pid
-} else {
-    scheduler.handle_ul_crc(rnti, grant.pid, grant.hi_value);
 }
 ```
 

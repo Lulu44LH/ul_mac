@@ -70,6 +70,7 @@ void print_separator(const std::string& title) {
 // 公共 worker 模板与注册辅助 (重构: 原先各场景内联的 10 份 TTI 循环已统一)
 // ============================================================================
 
+/// TTI时间同步（阻塞同步，和run中的时间源保持同步）
 /// 通用 TTI worker 循环模板 (原 5 个场景内联重复的循环骨架)
 /// 统一处理: wait_for_tti -> done 检查 -> body(tti) -> mark_tti_done。
 /// 【异常安全】body 抛出的异常在此捕获并记录, 但仍保证 mark_tti_done 被调用:
@@ -215,33 +216,55 @@ void scenario1_basic_ul_scheduling() {
     // ---- UE 线程: 数据到达 + 触发SR + 收Grant发PUSCH + 收PHICH ----
     std::thread ue_thread([&]() {
         run_tti_worker(clock, MAX_TTI, [&](uint32_t tti) {
-            // 1) 数据到达 + run_tti (触发 SR / 构造 BSR)
+            // 1) 数据到达
             if (tti % 10 == 0) ue.data_arrived(2, 500);
             if (tti % 20 == 5) ue.data_arrived(3, 300);
+
+            // 2) 检查 UL Grant (PDCCH): 只取本 RNTI 专属信道, 且已度过传播时延
+            //    【仅置标志位】此处只判断"本 TTI 是否有 UL Grant", 把 has_ul_grant_ 置 true,
+            //    不做 HARQ 解包/打包/扣缓冲等处理; 同时把 grant 副本暂存, 供 run_tti 之后
+            //    真正处理使用。run_tti 内的 BSR/SR 步进据此判定 "有 grant 则不触发 SR"
+            //    (§5.4.4)。真正的 grant 处理在 run_tti 之后。
+            std::vector<ul_grant> grants_this_tti;
+            while (auto g = grant_ch.at(rnti).dequeue(tti)) {
+                ue.check_ul_grant(g.value());      // 仅设标志位
+                grants_this_tti.push_back(g.value());
+            }
+
+            // 3) run_tti (触发 SR / 构造 BSR / 令牌桶步进): BSR 判定是否触发 SR 时使用
+            //    本 TTI 真实的 UL grant 标志位 (有 grant 则不触发 SR)
             ue.run_tti(tti);
 
-            // 2) SR (PUCCH): 仅真正发送的那个 TTI 入队, +4 TTI 后 eNB 可见
+            // 4) SR (PUCCH): 仅真正发送的那个 TTI 入队, +4 TTI 后 eNB 可见
             if (ue.get_sr_manager().take_sr_transmitted()) {
                 // srsRAN 式: SR 触发同时把 UE 本地待传字节数随 SR 信道告知 eNB,
                 // 使调度器在 BSR CE 经 PUSCH 解包前即可按真实量分配 (跳过"小Grant探测")
                 sr_ch.enqueue({rnti, ue.get_buffer_manager().get_all_lcg_buffer_sizes()}, tti);
             }
 
-            // 3) 收 UL Grant (PDCCH): 只取本 RNTI 专属信道, 且已度过传播时延
-            while (auto g = grant_ch.at(rnti).dequeue(tti)) {
-                ul_grant grant = g.value();
-                ue.handle_ul_grant(grant);          // 收Grant + 发PUSCH(打包BSR CE)
-                pdu_msg m;
-                m.rnti = rnti;
-                m.grant = grant;
-                m.pdu = ue.get_last_pdu();          // PUSCH 空口承载的 MAC PDU
-                pdu_ch.enqueue(m, tti);             // 上报 eNB (+4 TTI 可见)
-            }
-
-            // 4) 收 PHICH (HARQ 反馈): 本 RNTI 专属信道
+            // 5) 收 PHICH (HARQ 反馈): 本 RNTI 专属信道
+            //    【先收反馈, 再处理 Grant】反馈经 timed_channel 统一 +4 TTI 到达,
+            //    且 eNB 的 PHICH 在收到 PUSCH 之后才下发, 故同一 TTI 内反馈对应
+            //    的是此前已发送的 TB。先落地反馈, 后续处理 grant 时 HARQ 进程才能
+            //    正确据此判定 "新传 vs 重传" (NACK 触发重传, ACK 释放进程)。
             while (auto ph = phich_ch.at(rnti).dequeue(tti)) {
                 ue.handle_harq_feedback(ph.value().pid, ph.value().ack);
             }
+
+            // 6) 处理 UL Grant + 发送 PUSCH (run_tti 之后, PHICH 落地之后):
+            //    重传判定 / BSR CE 打包 / 扣缓冲, 把 PDU 经空口上报 eNB
+            for (auto& grant : grants_this_tti) {
+                ue.process_ul_grant(grant);
+            }
+            while (ue.has_pending_tx()) {
+                auto item = ue.take_pending_tx();
+                pdu_msg m;
+                m.rnti = rnti;
+                m.grant = item.grant;
+                m.pdu = item.pdu;                   // PUSCH 空口承载的 MAC PDU
+                pdu_ch.enqueue(m, tti);             // 上报 eNB (+4 TTI 可见)
+            }
+            ue.clear_ul_grant();                    // PDU 已发, UL grant 已用，清空标志位
         });
     });
 
@@ -343,13 +366,26 @@ void scenario2_multi_ue_pf() {
             ue_context& ue = *ues[i];
             uint16_t rnti = rntis[i];
             run_tti_worker(clock, MAX_TTI, [&](uint32_t tti) {
-                // 1) 数据到达 + run_tti (触发 SR / 构造 BSR)
+                // 1) 数据到达
                 if (tti % 5 == static_cast<uint32_t>(i % 5)) {
                     ue.data_arrived(2, 500);
                 }
+
+                // 2) 检查 UL Grant (PDCCH): 只取本 RNTI 专属信道 ——
+                //    PDCCH 按 RNTI 加扰, UE 只能解出自己的 grant;
+                //    仅当该 grant 已度过传播时延才可见。
+                //    【仅置标志位】只判定"本 TTI 是否有 UL Grant"并置 has_ul_grant_,
+                //    grant 副本暂存, 真正的 HARQ 解包/打包/发送在 run_tti 之后。
+                std::vector<ul_grant> grants_this_tti;
+                while (auto g = grant_ch.at(rnti).dequeue(tti)) {
+                    ue.check_ul_grant(g.value());
+                    grants_this_tti.push_back(g.value());
+                }
+
+                // 3) run_tti (触发 SR / 构造 BSR / 令牌桶步进): 用本 TTI UL grant 标志位判定
                 ue.run_tti(tti);
 
-                // 2) SR: 仅在 SR 真正发送的那个 TTI 入队 PUCCH 信道
+                // 4) SR: 仅在 SR 真正发送的那个 TTI 入队 PUCCH 信道
                 //    (+4 TTI 后 eNB 可见)。不可按 state==PENDING 判断,
                 //    否则 pending 期间每 TTI 重复上报 (信令泛洪)。
                 if (ue.get_sr_manager().take_sr_transmitted()) {
@@ -359,24 +395,24 @@ void scenario2_multi_ue_pf() {
                         ue.get_buffer_manager().get_all_lcg_buffer_sizes()}, tti);
                 }
 
-                // 3) 收 UL Grant (PDCCH): 只取本 RNTI 专属信道 ——
-                //    PDCCH 按 RNTI 加扰, UE 只能解出自己的 grant;
-                //    仅当该 grant 已度过传播时延才可见
-                while (auto g = grant_ch.at(rnti).dequeue(tti)) {
-                    ul_grant grant = g.value();
-                    ue.handle_ul_grant(grant);
-                    // 打包 PUSCH MAC PDU 并经 PUSCH 信道上报 (send_tti=tti)
-                    pdu_msg m;
-                    m.rnti = rnti;
-                    m.grant = grant;
-                    m.pdu = ue.get_last_pdu();
-                    pdu_ch.enqueue(m, tti);
-                }
-
-                // 4) 收 PHICH (HARQ 反馈): 同样只取本 RNTI 专属信道
+                // 5) 收 PHICH (HARQ 反馈): 先落地反馈, 再处理 grant 才能正确判定新传/重传
                 while (auto ph = phich_ch.at(rnti).dequeue(tti)) {
                     ue.handle_harq_feedback(ph.value().pid, ph.value().ack);
                 }
+
+                // 6) 处理 UL Grant + 发送 PUSCH (run_tti 之后, PHICH 落地之后): 重传判定/打包/扣缓冲后上报
+                for (auto& grant : grants_this_tti) {
+                    ue.process_ul_grant(grant);
+                }
+                while (ue.has_pending_tx()) {
+                    auto item = ue.take_pending_tx();
+                    pdu_msg m;
+                    m.rnti = rnti;
+                    m.grant = item.grant;
+                    m.pdu = item.pdu;
+                    pdu_ch.enqueue(m, tti);
+                }
+                ue.clear_ul_grant(); // PDU 已发, UL grant 用尽, 清零防误判
             });
         });
     }
@@ -486,6 +522,14 @@ void scenario3_harq_retx() {
     std::thread ue_thread([&]() {
         run_tti_worker(clock, MAX_TTI, [&](uint32_t tti) {
             if (tti % 5 == 0) ue.data_arrived(2, 1000);
+
+            // 检查 UL Grant: 本 RNTI 专属信道 —— 仅置标志位 + 暂存副本
+            std::vector<ul_grant> grants_this_tti;
+            while (auto g = grant_ch.at(rnti).dequeue(tti)) {
+                ue.check_ul_grant(g.value());
+                grants_this_tti.push_back(g.value());
+            }
+
             ue.run_tti(tti);
 
             // SR 仅在实际发送时入队 (防 PENDING 期间每 TTI 重复上报)
@@ -494,22 +538,27 @@ void scenario3_harq_retx() {
                     ue.get_buffer_manager().get_all_lcg_buffer_sizes()}, tti);
             }
 
-            // 收 UL Grant: 本 RNTI 专属信道
-            while (auto g = grant_ch.at(rnti).dequeue(tti)) {
-                ul_grant grant = g.value();
-                auto action = ue.handle_ul_grant(grant);
-                if (action.is_retx) retx_count++;
-                pdu_msg m;
-                m.rnti = rnti;
-                m.grant = grant;
-                m.pdu = ue.get_last_pdu();
-                pdu_ch.enqueue(m, tti);
-            }
-
-            // 收 PHICH: 本 RNTI 专属信道
+            // 收 PHICH: 本 RNTI 专属信道 (先落地反馈)
             while (auto ph = phich_ch.at(rnti).dequeue(tti)) {
                 ue.handle_harq_feedback(ph.value().pid, ph.value().ack);
             }
+
+            // 处理 UL Grant + 发送 PUSCH (run_tti 之后, PHICH 落地之后): 重传判定/打包/扣缓冲
+            for (auto& grant : grants_this_tti) {
+                auto action = ue.process_ul_grant(grant);
+                if (action.is_retx) retx_count++; // 重传统计
+            }
+
+            // 发送 PUSCH (原时序位置): 把接收阶段打包好的 PDU 经空口上报 eNB
+            while (ue.has_pending_tx()) {
+                auto item = ue.take_pending_tx();
+                pdu_msg m;
+                m.rnti = rnti;
+                m.grant = item.grant;
+                m.pdu = item.pdu;
+                pdu_ch.enqueue(m, tti);
+            }
+            ue.clear_ul_grant(); // PDU 已发, UL grant 用尽, 清零防误判
         });
     });
 
@@ -621,6 +670,14 @@ void scenario4_enhanced_features() {
 
             // UE 桩: 自适应 SR 周期调整 (高流量缩短SR周期, 低流量延长以省功耗)
             ue.get_sr_manager().adjust_sr_period(traffic_rate);
+
+            // 检查 UL Grant: 本 RNTI 专属信道 —— 仅置标志位 + 暂存副本
+            std::vector<ul_grant> grants_this_tti;
+            while (auto g = grant_ch.at(rnti).dequeue(tti)) {
+                ue.check_ul_grant(g.value());
+                grants_this_tti.push_back(g.value());
+            }
+
             ue.run_tti(tti);
 
             // SR 仅在实际发送时入队 (防 PENDING 期间每 TTI 重复上报)
@@ -629,21 +686,24 @@ void scenario4_enhanced_features() {
                     ue.get_buffer_manager().get_all_lcg_buffer_sizes()}, tti);
             }
 
-            // 收 UL Grant: 本 RNTI 专属信道
-            while (auto g = grant_ch.at(rnti).dequeue(tti)) {
-                ul_grant grant = g.value();
-                ue.handle_ul_grant(grant);
-                pdu_msg m;
-                m.rnti = rnti;
-                m.grant = grant;
-                m.pdu = ue.get_last_pdu();
-                pdu_ch.enqueue(m, tti);
-            }
-
-            // 收 PHICH: 本 RNTI 专属信道
+            // 收 PHICH: 本 RNTI 专属信道 (先落地反馈)
             while (auto ph = phich_ch.at(rnti).dequeue(tti)) {
                 ue.handle_harq_feedback(ph.value().pid, ph.value().ack);
             }
+
+            // 处理 UL Grant + 发送 PUSCH (run_tti 之后, PHICH 落地之后): 重传判定/打包/扣缓冲后上报
+            for (auto& grant : grants_this_tti) {
+                ue.process_ul_grant(grant);
+            }
+            while (ue.has_pending_tx()) {
+                auto item = ue.take_pending_tx();
+                pdu_msg m;
+                m.rnti = rnti;
+                m.grant = item.grant;
+                m.pdu = item.pdu;
+                pdu_ch.enqueue(m, tti);
+            }
+            ue.clear_ul_grant(); // PDU 已发, UL grant 用尽, 清零防误判
 
             if (tti % 100 == 99) {
                 auto sr_stats = ue.get_sr_manager().get_stats();
@@ -804,6 +864,15 @@ void scenario5_epf() {
                                     : 500u;                                // BE
                     ue.data_arrived(2, bytes);
                 }
+                // 检查 UL Grant: 只取本 RNTI 专属信道 (PDCCH 按 RNTI 加扰)
+                // 【仅置标志位】只判定"本 TTI 是否有 UL Grant"并置 has_ul_grant_,
+                // grant 副本暂存, 真正的处理/发送在 run_tti 之后。
+                std::vector<ul_grant> grants_this_tti;
+                while (auto g = grant_ch.at(rnti).dequeue(tti)) {
+                    ue.check_ul_grant(g.value());
+                    grants_this_tti.push_back(g.value());
+                }
+
                 ue.run_tti(tti);
 
                 // SR 仅在实际发送时入队 (防 PENDING 期间每 TTI 重复上报)
@@ -812,21 +881,24 @@ void scenario5_epf() {
                         ue.get_buffer_manager().get_all_lcg_buffer_sizes()}, tti);
                 }
 
-                // 收 UL Grant: 只取本 RNTI 专属信道 (PDCCH 按 RNTI 加扰)
-                while (auto g = grant_ch.at(rnti).dequeue(tti)) {
-                    ul_grant grant = g.value();
-                    ue.handle_ul_grant(grant);
-                    pdu_msg m;
-                    m.rnti = rnti;
-                    m.grant = grant;
-                    m.pdu = ue.get_last_pdu();
-                    pdu_ch.enqueue(m, tti);
-                }
-
-                // 收 PHICH: 只取本 RNTI 专属信道
+                // 收 PHICH: 只取本 RNTI 专属信道 (先落地反馈)
                 while (auto ph = phich_ch.at(rnti).dequeue(tti)) {
                     ue.handle_harq_feedback(ph.value().pid, ph.value().ack);
                 }
+
+                // 处理 UL Grant + 发送 PUSCH (run_tti 之后, PHICH 落地之后): 重传判定/打包/扣缓冲后上报
+                for (auto& grant : grants_this_tti) {
+                    ue.process_ul_grant(grant);
+                }
+                while (ue.has_pending_tx()) {
+                    auto item = ue.take_pending_tx();
+                    pdu_msg m;
+                    m.rnti = rnti;
+                    m.grant = item.grant;
+                    m.pdu = item.pdu;
+                    pdu_ch.enqueue(m, tti);
+                }
+                ue.clear_ul_grant(); // PDU 已发, UL grant 用尽, 清零防误判
             });
         });
     }
@@ -910,7 +982,7 @@ int main(int argc, char* argv[]) {
 #endif
 
     // strict 3GPP 模式接线: 命令行 --strict-3gpp (或环境变量 UL_MAC_STRICT=1)
-    // 开启后禁用所有非标准增强 (自适应SR周期 / Padding BSR差分抑制 等),
+    // 开启后禁用所有非标准增强 (自适应SR周期 等),
     // 用于与"增强模式"做教学对比。协议本身要求的机制不受影响。
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--strict-3gpp") g_strict_3gpp_mode = true;
@@ -920,7 +992,7 @@ int main(int argc, char* argv[]) {
         if (env && std::string(env) == "1") g_strict_3gpp_mode = true;
     }
     if (g_strict_3gpp_mode) {
-        std::cout << ">>> strict 3GPP 模式已开启: 非标准增强 (自适应SR / Padding BSR抑制) 已禁用\n";
+        std::cout << ">>> strict 3GPP 模式已开启: 非标准增强 (自适应SR) 已禁用\n";
     }
 
     std::cout << "==============================================================\n";

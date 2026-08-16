@@ -279,7 +279,6 @@ TEST(test_harq_new_tx) {
     ul_harq_manager mgr(0x0001);
     ul_harq_config cfg;
     cfg.max_harq_tx = 4;
-    cfg.harq_rtt_ttis = 8;
     mgr.init(cfg);
 
     ul_grant g;
@@ -303,7 +302,6 @@ TEST(test_harq_retx) {
     ul_harq_manager mgr(0x0001);
     ul_harq_config cfg;
     cfg.max_harq_tx = 4;
-    cfg.harq_rtt_ttis = 0;  // 即时反馈, 简化测试
     mgr.init(cfg);
 
     // 新传: RV=0, tx_nb=1
@@ -315,42 +313,46 @@ TEST(test_harq_retx) {
     EXPECT_EQ(a1.rv, 0u);
     EXPECT_EQ(a1.tx_nb, 1u);
 
-    // 重传1: PHICH NACK, NDI 不变 (ndi=true 与 cur_ndi_=true 相同 -> 重传)
+    // PHICH NACK (反馈经 timed_channel 到达, 此处模拟落地)
+    mgr.handle_harq_feedback(0, harq_feedback::NACK);
+
+    // 重传1: NDI 不变 (ndi=true 与 cur_ndi_=true 相同 -> 重传)
     ul_grant g2;
     g2.pid = 0; g2.tbs = 1000; g2.ndi = true; g2.ndi_present = true;
     g2.rv = -1;  // 由 UE 内部 IRV 计算
-    g2.phich_available = true; g2.hi_value = false;  // NACK
     g2.tti_tx = 1;
     auto a2 = mgr.new_grant_ul(g2, false);
     EXPECT_TRUE(a2.is_retx);       // NDI 不变 -> 重传 (非新传)
     EXPECT_EQ(a2.rv, 2u);          // RV 序列第2项
     EXPECT_EQ(a2.tx_nb, 2u);
 
+    mgr.handle_harq_feedback(0, harq_feedback::NACK);
+
     // 重传2: RV=3
     ul_grant g3;
     g3.pid = 0; g3.tbs = 1000; g3.ndi = true; g3.ndi_present = true;
-    g3.rv = -1; g3.phich_available = true; g3.hi_value = false;
-    g3.tti_tx = 2;
+    g3.rv = -1; g3.tti_tx = 2;
     auto a3 = mgr.new_grant_ul(g3, false);
     EXPECT_TRUE(a3.is_retx);
     EXPECT_EQ(a3.rv, 3u);          // RV 序列第3项
 
+    mgr.handle_harq_feedback(0, harq_feedback::NACK);
+
     // 重传3: RV=1
     ul_grant g4;
     g4.pid = 0; g4.tbs = 1000; g4.ndi = true; g4.ndi_present = true;
-    g4.rv = -1; g4.phich_available = true; g4.hi_value = false;
-    g4.tti_tx = 3;
+    g4.rv = -1; g4.tti_tx = 3;
     auto a4 = mgr.new_grant_ul(g4, false);
     EXPECT_TRUE(a4.is_retx);
     EXPECT_EQ(a4.rv, 1u);          // RV 序列第4项
 }
 
 // 测试8: 达到最大重传次数后 TB 被丢弃
+// 丢弃判定发生在 PHICH 反馈落地时 (handle_harq_feedback), 而非处理 grant 的当下
 TEST(test_harq_max_retx_discard) {
     ul_harq_manager mgr(0x0001);
     ul_harq_config cfg;
     cfg.max_harq_tx = 2;  // 最大 2 次传输 (1 新传 + 1 重传)
-    cfg.harq_rtt_ttis = 0;
     mgr.init(cfg);
 
     // 新传: tx_nb=1
@@ -361,71 +363,27 @@ TEST(test_harq_max_retx_discard) {
     EXPECT_EQ(a1.tx_nb, 1u);
 
     // 重传: tx_nb=2 (current_tx_nb=1 < max=2, 不丢弃)
+    mgr.handle_harq_feedback(0, harq_feedback::NACK);
     ul_grant g2;
     g2.pid = 0; g2.tbs = 1000; g2.ndi = true; g2.ndi_present = true;
-    g2.rv = -1; g2.phich_available = true; g2.hi_value = false;
-    g2.tti_tx = 1;
+    g2.rv = -1; g2.tti_tx = 1;
     auto a2 = mgr.new_grant_ul(g2, false);
     EXPECT_TRUE(a2.is_retx);
     EXPECT_EQ(a2.tx_nb, 2u);
 
-    // 再次 NACK: current_tx_nb=2 >= max=2 -> 丢弃
-    ul_grant g3;
-    g3.pid = 0; g3.tbs = 1000; g3.ndi = true; g3.ndi_present = true;
-    g3.rv = -1; g3.phich_available = true; g3.hi_value = false;
-    g3.tti_tx = 2;
-    auto a3 = mgr.new_grant_ul(g3, false);
-    EXPECT_TRUE(a3.is_discarded);  // 达到最大重传, TB 被丢弃
-}
-
-// 测试9: RTT 延迟内不处理反馈
-// 配置 harq_rtt_ttis=8, 在 RTT 内发送 PHICH ACK, 反馈不应被处理
-// (last_feedback 仍为 NACK); RTT 后再发 ACK, last_feedback 变为 ACK
-TEST(test_harq_rtt_delay) {
-    ul_harq_manager mgr(0x0001);
-    ul_harq_config cfg;
-    cfg.max_harq_tx = 10;  // 高阈值, 避免干扰
-    cfg.harq_rtt_ttis = 8;
-    mgr.init(cfg);
-
-    // 新传 (tti=0, tx_tti_=0)
-    ul_grant g1;
-    g1.pid = 0; g1.tbs = 1000; g1.ndi = true; g1.ndi_present = true;
-    g1.rv = 0; g1.tti_tx = 0;
-    mgr.new_grant_ul(g1, false);
-
-    // RTT 内 (tti=5, 5-0=5 < 8) 发送 PHICH ACK, 非自适应 (ndi_present=false)
-    ul_grant g2;
-    g2.pid = 0; g2.ndi_present = false;
-    g2.phich_available = true; g2.hi_value = true;  // ACK
-    g2.tti_tx = 5;
-    mgr.new_grant_ul(g2, false);
-    // 反馈未处理, harq_feedback_ 保持 false (新传后的默认值)
-
-    auto info1 = mgr.get_process_info(0);
-    EXPECT_TRUE(info1.last_feedback == harq_feedback::NACK);  // ACK 未被处理
-
-    // RTT 后 (tti=13, 13-5=8 >= 8) 再发 PHICH ACK
-    ul_grant g3;
-    g3.pid = 0; g3.ndi_present = false;
-    g3.phich_available = true; g3.hi_value = true;  // ACK
-    g3.tti_tx = 13;
-    mgr.new_grant_ul(g3, false);
-    // 反馈已处理, harq_feedback_ = true (ACK)
-
-    auto info2 = mgr.get_process_info(0);
-    EXPECT_TRUE(info2.last_feedback == harq_feedback::ACK);  // ACK 已被处理
+    // 再次 NACK: current_tx_nb=2 >= max=2 -> 反馈落地时丢弃
+    auto fb = mgr.handle_harq_feedback(0, harq_feedback::NACK);
+    EXPECT_TRUE(fb.is_discarded);  // 达到最大重传, TB 被丢弃
 }
 
 // 测试10: 连续 NACK 触发早期终止
 // 配置 max_harq_tx=10 (避免 max retx 干扰), 连续 3 次 NACK + tx_nb>=2 -> 丢弃
 // 【注意】早期终止默认已关闭 (无RLC兜底时提前丢TB会静默丢数据),
-// 本测试显式开启以验证该机制本身
+// 本测试显式开启以验证该机制本身。丢弃判定发生在反馈落地时。
 TEST(test_harq_early_termination) {
     ul_harq_manager mgr(0x0001);
     ul_harq_config cfg;
     cfg.max_harq_tx = 10;  // 高阈值, 隔离早期终止逻辑
-    cfg.harq_rtt_ttis = 0;
     mgr.init(cfg);
     mgr.set_early_termination_enabled(true); // 显式开启 (默认关闭)
 
@@ -435,27 +393,21 @@ TEST(test_harq_early_termination) {
     g1.rv = 0; g1.tti_tx = 0;
     mgr.new_grant_ul(g1, false);
 
-    // 重传: tx_nb=2 (此时 consecutive_nack=0, 不触发早期终止)
+    // 重传: tx_nb=2 (此时尚未收到 NACK)
     ul_grant g2;
     g2.pid = 0; g2.tbs = 1000; g2.ndi = true; g2.ndi_present = true;
-    g2.rv = -1; g2.phich_available = true; g2.hi_value = false;
-    g2.tti_tx = 1;
+    g2.rv = -1; g2.tti_tx = 1;
     auto a2 = mgr.new_grant_ul(g2, false);
     EXPECT_TRUE(a2.is_retx);
     EXPECT_EQ(a2.tx_nb, 2u);
 
-    // 累积连续 NACK (通过 handle_harq_feedback 更新 consecutive_nack)
+    // 累积连续 NACK: 第1、2次仅计数 (consecutive_nack_=2, 未达阈值)
     mgr.handle_harq_feedback(0, harq_feedback::NACK);
     mgr.handle_harq_feedback(0, harq_feedback::NACK);
-    mgr.handle_harq_feedback(0, harq_feedback::NACK);  // consecutive_nack=3
-
-    // 再次 PHICH NACK: current_tx_nb=2 >= 2 && consecutive_nack=3 >= 3 -> 早期终止
-    ul_grant g3;
-    g3.pid = 0; g3.tbs = 1000; g3.ndi = true; g3.ndi_present = true;
-    g3.rv = -1; g3.phich_available = true; g3.hi_value = false;
-    g3.tti_tx = 2;
-    auto a3 = mgr.new_grant_ul(g3, false);
-    EXPECT_TRUE(a3.is_discarded);  // 早期终止触发, TB 被丢弃
+    // 第3次连续 NACK: current_tx_nb=2 >= 2 && consecutive_nack_=3 >= 3 -> 早期终止
+    // (丢弃判定发生在反馈落地时, 故在第 3 次 NACK 反馈处触发)
+    auto fb = mgr.handle_harq_feedback(0, harq_feedback::NACK);
+    EXPECT_TRUE(fb.is_discarded);  // 早期终止触发, TB 被丢弃
 }
 
 // ============================================================================
@@ -534,28 +486,6 @@ TEST(test_bsr_trigger_regular) {
     bsr_mgr.step(0);  // step 内检查触发条件
 
     EXPECT_TRUE(bsr_mgr.get_trigger_type() == bsr_trigger_type::REGULAR);
-}
-
-// 测试15: Padding BSR抑制 (非标准优化, 无变化时 Padding BSR 被跳过)
-TEST(test_bsr_differential) {
-    lcg_buffer_manager buf_mgr;
-    bsr_manager bsr_mgr(0x0001, buf_mgr);
-    bsr_mgr.init(bsr_config(), nullptr, nullptr);
-    bsr_mgr.set_differential_enabled(true);
-
-    buf_mgr.setup_lcid(1, 0, 1);
-    buf_mgr.update_buffer_state(1, 1000);
-    buf_mgr.update_old_buffer();  // old = 1000
-
-    // 第一次 Padding BSR: 缓冲区有变化 (从 0 到非 0), 应生成成功
-    bsr_ce bsr1;
-    bool result1 = bsr_mgr.generate_padding_bsr(100, bsr1);
-    EXPECT_TRUE(result1);  // 第一次生成成功
-
-    // 缓冲区无变化, 再次生成 Padding BSR: 抑制检查应跳过
-    bsr_ce bsr2;
-    bool result2 = bsr_mgr.generate_padding_bsr(100, bsr2);
-    EXPECT_FALSE(result2);  // Padding BSR抑制: 无变化, 跳过
 }
 
 // ============================================================================
@@ -642,6 +572,7 @@ TEST(test_get_all_process_info) {
     threads.emplace_back([&]() {
         ul_grant g;
         g.pid = 0; g.tbs = 100; g.ndi = true; g.ndi_present = true; g.rv = 0;
+        ul_harq_config cfg;
         for (uint32_t tti = 0; tti < 500; tti++) {
             g.tti_tx = tti;
             mgr.new_grant_ul(g, false);
@@ -1269,23 +1200,27 @@ TEST(test_ue_stale_pdu_regression) {
     ul_grant g0;
     g0.pid = 0; g0.tbs = 100; g0.ndi = true; g0.ndi_present = true;
     g0.rv = 0; g0.tti_tx = 0;
-    ue.handle_ul_grant(g0);
+    ue.check_ul_grant(g0);          // run_tti 前: 仅置 UL grant 标志位
+    ue.process_ul_grant(g0);        // run_tti 后: 真正处理/打包
     EXPECT_TRUE(ue.get_last_pdu().empty());
 
     // 数据到达 -> 触发 Regular BSR -> 新传携带 BSR 的 PDU (非空)
     ue.data_arrived(2, 500);
-    ue.run_tti(1);
     ul_grant g1;
     g1.pid = 1; g1.tbs = 200; g1.ndi = true; g1.ndi_present = true;
     g1.rv = 0; g1.tti_tx = 1;
-    ue.handle_ul_grant(g1);
+    ue.check_ul_grant(g1);          // run_tti 前: 置标志位, 供 BSR/SR 步进判定
+    ue.run_tti(1);
+    ue.process_ul_grant(g1);        // run_tti 后: 处理/打包
     EXPECT_FALSE(ue.get_last_pdu().empty());  // 本次确实携带 BSR
 
     // 再次新传 (无新触发的 BSR): 不得复用上一 TB 的含 BSR PDU
     ul_grant g2;
     g2.pid = 2; g2.tbs = 200; g2.ndi = true; g2.ndi_present = true;
     g2.rv = 0; g2.tti_tx = 2;
-    ue.handle_ul_grant(g2);
+    ue.check_ul_grant(g2);          // run_tti 前: 置标志位
+    ue.run_tti(2);
+    ue.process_ul_grant(g2);        // run_tti 后: 处理/打包
     EXPECT_TRUE(ue.get_last_pdu().empty());   // 陈旧 PDU 缺陷回归点
 }
 
@@ -1297,7 +1232,6 @@ TEST(test_ue_harq_ack_releases_process) {
     ul_harq_manager mgr(0x0001);
     ul_harq_config cfg;
     cfg.max_harq_tx = 4;
-    cfg.harq_rtt_ttis = 8;
     mgr.init(cfg);
 
     // 新传: 进入 WAITING_FB

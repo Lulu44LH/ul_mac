@@ -53,8 +53,9 @@
   `current_tti >= available_tti` 才能 `dequeue`，建模"信息建立后 4 TTI 才对端可见"。
 
 **关键耦合点**：
-- `grant.hi_value = rx.crc_ok`：eNB 接收端把 CRC 结果经 PHICH 信道回传 UE（方案 C 下
-  经由 `phich_ch.enqueue(pm, tti)` 在 `send_tti + 4` 后才被 UE 线程 `dequeue` 见到）。
+- eNB 接收端把 CRC 结果经独立 PHICH 信道回传 UE：构造 `phich_msg{pid, ack=rx.crc_ok}`
+  经 `phich_ch.enqueue(pm, tti)` 在 `send_tti + 4` 后才被 UE 线程 `dequeue` 见到，再调用
+  `ue.handle_harq_feedback(pid, ack)` 落地（不再经 `grant.hi_value` 携带）。
 - `scheduler.handle_ul_crc(rnti, pid, rx.discarded ? true : rx.crc_ok)`：eNB 线程内
   把接收结果回馈调度器，用于清除/保留重传标志。
 - `pdu_msg` 同时携带 `ul_grant`（UE 从 PDCCH 收到的 grant 副本），供 eNB 侧 `receive_tb`
@@ -125,8 +126,8 @@ int main(int, char**) {                  // main.cpp:462
 > **注意**：方案 C 已建模**信道传播时延**——SR/Grant/PDU/PHICH 四者各带 `CHANNEL_PROPAGATION_TTI = 4`
 > 的可见时延（见 `include/ul_mac/tti_channel.h`），所以主流程中每一步交互都不再是"同一 TTI 即时闭环"，
 > 而是经过 4 TTI 的空口传播才被对端观察到。这与真实 LTE 的时序（DCI 0 → n+4 PUSCH → n+8 PHICH）方向一致，
-> 仅数值取 4 作演示常量。`ul_harq_manager` 内部的 `harq_rtt_ttis_` 字段保留但本主流程时延由
-> `timed_channel` 统一建模，不再依赖它。
+> 仅数值取 4 作演示常量。HARQ 内部不再建模 RTT（`harq_rtt_ttis_` 等字段已移除），本主流程时延统一由
+> `timed_channel` 建模，PHICH 反馈经独立信道 +4 TTI 到达 UE 后再 `handle_harq_feedback` 落地。
 
 ---
 
