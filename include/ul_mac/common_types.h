@@ -64,6 +64,18 @@ constexpr uint32_t DEFAULT_PERIODIC_BSR_TIMER = 80;
 constexpr uint32_t DEFAULT_RETX_BSR_TIMER = 320;
 
 // ============================================================================
+// 仿真模式开关
+// ============================================================================
+// 【严格 3GPP 模式】默认 false (保留演示增强)。
+// 置 true 后关闭以下非标准增强, 提供"纯协议时序"教学对照:
+//   1. SR 不再携带 UE 本地待传字节数 (退化为 1-bit 提示, eNB 等 BSR CE 才知待传量)
+//   2. UE 自适应 SR 周期关闭 (SR 周期固定为 RRC 配置值, §5.4.4)
+//   3. Padding BSR 抑制关闭 (每次有填充空间且索引变化即发送, 标准行为)
+// 说明: 这些增强本身在各自实现处均有注释声明; 本开关只是集中提供切换入口,
+// 供对比"标准时序 vs 演示优化"的差异 (教学/评估用)。
+inline bool g_strict_3gpp_mode = false;
+
+// ============================================================================
 // BSR (Buffer Status Report) 相关类型
 // ============================================================================
 
@@ -123,10 +135,11 @@ struct sr_config {
 };
 
 /// SR状态
+/// 注: 原 TRANSMITTING 瞬态已删除 —— 旧实现在同一临界区内置位后立即回 PENDING,
+/// 外部永远观察不到, 属冗余状态。发送后保持 PENDING (按周期重发直到获 grant)。
 enum class sr_state {
     IDLE,           ///< 空闲状态, 无SR待发送
-    PENDING,        ///< SR待发送 (BSR触发)
-    TRANSMITTING,   ///< SR正在发送
+    PENDING,        ///< SR待发送/已发送待响应 (BSR触发后按周期重发)
     FAILED          ///< SR失败 (达到最大传输次数)
 };
 
@@ -188,6 +201,11 @@ struct ul_grant {
     bool     phich_available;  ///< PHICH是否可用 (上行HARQ反馈信道)
     bool     hi_value;      ///< PHICH反馈值 (true=ACK, false=NACK)
     uint32_t tti_tx;        ///< 发送TTI
+    std::vector<uint8_t> pdu; ///< 【方案B】UE 侧打包好的 UL-SCH MAC PDU 字节流
+                              ///<   (BSR CE + 数据 SDU + Padding), 随 PUSCH 空口传输,
+                              ///<   由 eNB 侧 mac_pdu_unpacker 解包取出 BSR。
+                              ///<   真实协议: BSR 作为 MAC CE 经 MAC PDU 打包经 PUSCH
+                              ///<   上报, 而非结构化对象内存直传。重传沿用同一 PDU。
 
     ul_grant()
         : rnti(0), pid(0), tbs(0), n_prb(0), prb_start(0), mcs(0), rv(-1)
@@ -338,51 +356,58 @@ inline std::string sr_state_to_string(sr_state state) {
     switch (state) {
         case sr_state::IDLE:         return "Idle";
         case sr_state::PENDING:      return "Pending";
-        case sr_state::TRANSMITTING: return "Transmitting";
         case sr_state::FAILED:       return "Failed";
         default: return "Unknown";
     }
 }
 
 /// 6-bit BSR缓冲区大小索引转字节数
-/// 对应3GPP TS 36.321 Table 6.1.3.1-1 (简化版)
-/// 参考: ocudu/lib/mac/mac_ul/ul_bsr.h 中的 buff_size_field_to_bytes
+/// 对应 3GPP TS 36.321 Table 6.1.3.1-1 (Buffer size levels for BSR)
+/// 参考: srsRAN_4G/lib/src/mac/ul_bsr.cc 中的 bsr_table
+///
+/// 【编码语义 (标准)】索引 i 代表字节区间 (table[i-1], table[i]] ——
+/// 返回的 table[i] 是该区间的**上界**:
+///   - UE 编码: bytes_to_bsr_index 取"满足 bytes <= table[i] 的最小 i"(向上取整);
+///   - eNB 解码: 收到索引 i 后按上界 table[i] 估计 (可能略高估, 保证授权
+///     覆盖真实需求, 与 srsRAN 的 bsr_table 查表口径一致)。
 inline uint32_t bsr_index_to_bytes(uint8_t index) {
-    // 【协议说明 / 简化实现】
-    // 真实 3GPP TS 36.321 Table 6.1.3.1-1 的 6-bit 缓冲区大小字段采用非均匀(近似对数)尺度:
-    //   索引 0~10 为线性(0,10,12,14,...30), 索引 10 之后为指数增长直到 ~150000 字节。
-    // 本项目用一组单调递增的近似表替代, 仅保证"索引越大缓冲区越大"的单调语义,
-    // 不保证与标准表逐档一致。用于教学演示 BSR 编解码流程足够, 不可用于互操作。
+    // TS 36.321 Table 6.1.3.1-1 各档区间的上界 (bytes), Rel-8 ~ Rel-18 一致
     static const uint32_t size_table[BSR_BUFFER_SIZE_LEVELS] = {
-        0, 10, 14, 18, 22, 26, 30, 34,          // 0-7: 极小缓冲区
-        40, 46, 52, 58, 64, 70, 76, 82,         // 8-15: 小缓冲区
-        90, 100, 112, 126, 142, 160, 180, 202,  // 16-23: 中小缓冲区
-        228, 256, 288, 324, 364, 410, 462, 520, // 24-31: 中等缓冲区
-        586, 660, 744, 838, 944, 1064, 1200, 1354, // 32-39: 中大缓冲区
-        1528, 1724, 1946, 2196, 2478, 2798, 3158, 3564, // 40-47: 大缓冲区
-        4022, 4538, 5120, 5776, 6518, 7356, 8304, 9374, // 48-55: 很大缓冲区
-        10582, 11948, 13492, 15238, 17212, 19440, 21956, 25000 // 56-63: 超大缓冲区
+        // 0-7: BS = 0, (0,10], (10,12], (12,14], (14,17], (17,19], (19,22], (22,26]
+        0, 10, 12, 14, 17, 19, 22, 26,
+        // 8-15
+        31, 36, 42, 49, 57, 67, 78, 91,
+        // 16-23
+        107, 125, 146, 171, 200, 234, 274, 321,
+        // 24-31
+        376, 440, 515, 603, 706, 826, 967, 1132,
+        // 32-39
+        1326, 1552, 1817, 2127, 2490, 2915, 3413, 3995,
+        // 40-47
+        4677, 5476, 6411, 7505, 8787, 10287, 12043, 14099,
+        // 48-55
+        16507, 19325, 22624, 26487, 31009, 36304, 42502, 49759,
+        // 56-63: 末档 (128180, 150000]
+        58255, 68201, 79846, 93479, 109439, 128180, 150000, 150000
     };
-    if (index >= BSR_BUFFER_SIZE_LEVELS) return 25000;
+    if (index >= BSR_BUFFER_SIZE_LEVELS) return 150000;
     return size_table[index];
 }
 
 /// 字节数转6-bit BSR缓冲区大小索引
-/// 参考: ocudu/lib/mac/mac_ul/ul_bsr.h (反向映射)
+/// 参考: srsRAN_4G lib/src/mac/ul_bsr.cc (bsr_from_bytes)
 ///
-/// TS 36.321 §6.1.3.1: BSR 的 6-bit 缓冲区大小字段是一个索引 i, 对应区间
-/// [table[i], table[i+1]). UE 应上报满足 "table[i] <= 真实缓冲区" 的最大索引 i,
-/// 即"向下取整". eNB 收到索引 i 后按 **下界** 解读: 认为缓冲区 >= table[i].
-/// 注意: 索引表达的是下界而非精确值, 标准语义下缓冲区必须 **>=** 表格值(而非 <=).
+/// 标准映射: 索引 i 代表区间 (table[i-1], table[i]], 故返回满足
+/// "bytes <= table[i]" 的最小 i (向上取整)。超过最大档 150000B 时封顶为 63。
+/// eNB 侧解读见 bsr_index_to_bytes 的说明 (按上界估计, 略保守高估)。
 inline uint8_t bytes_to_bsr_index(uint32_t bytes) {
     if (bytes == 0) return 0;
-    // 向下取整: 返回满足 table[i] <= bytes 的最大 i (缓冲区 >= 表格值).
-    for (uint32_t i = BSR_BUFFER_SIZE_LEVELS - 1; i > 0; --i) {
-        if (bsr_index_to_bytes(static_cast<uint8_t>(i)) <= bytes) {
+    for (uint32_t i = 1; i < BSR_BUFFER_SIZE_LEVELS; ++i) {
+        if (bytes <= bsr_index_to_bytes(static_cast<uint8_t>(i))) {
             return static_cast<uint8_t>(i);
         }
     }
-    return 0;
+    return static_cast<uint8_t>(BSR_BUFFER_SIZE_LEVELS - 1);
 }
 
 /// 构建 Long BSR 负载: 报告所有 buffer>0 的 LCG (每个用 6-bit 索引)

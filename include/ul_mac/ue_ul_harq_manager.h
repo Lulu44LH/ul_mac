@@ -45,11 +45,20 @@ class ul_harq_process {
 public:
     ul_harq_process() : pid_(0), current_tx_nb_(0), current_irv_(0)
                        , harq_feedback_(false), is_grant_configured_(false)
+                       , feedback_received_(false)
                        , cur_ndi_(false), cur_tbs_(0), cur_rv_(-1)
                        , tx_tti_(0xFFFFFFFF), rtt_ttis_(8), feedback_pending_(false)
-                       , consecutive_nack_(0), early_termination_enabled_(true) {}
+                       , consecutive_nack_(0), early_termination_enabled_(false) {}
 
     explicit ul_harq_process(uint32_t pid);
+
+    /// 应用经独立 PHICH 信道到达的 HARQ 反馈 (区别于随 DCI grant 携带的反馈)
+    /// 【协议语义】TS 36.321 §5.4.2: ACK -> 进程释放 (等待新 TB);
+    /// NACK -> 进程置为待重传 (非自适应重传由 eNB 的重传授权驱动)。
+    /// 守卫: 仅当当前 TB 在途且尚未收到反馈时应用, 防止迟到的旧反馈
+    /// 误释放/误伤害已发出的新 TB (PHICH 与 PDCCH 到达顺序不保证)。
+    /// @param ack true=ACK, false=NACK
+    void apply_phich_feedback(bool ack);
 
     /// 重置进程状态
     void reset();
@@ -120,6 +129,9 @@ public:
 
     // ========================================================================
     // 增强功能接口 - 早期终止
+    // 【默认关闭】该机制非 3GPP 标准 (标准上限由 RRC maxHARQ-Tx 决定, 无损投递
+    // 由 RLC ARQ 兜底; 本项目 RLC 缺位, 提前丢弃即数据丢失, 故默认禁用),
+    // 如需演示资源优化效果请显式调用 set_early_termination_enabled(true)。
     // ========================================================================
 
     /// 【增强】更新HARQ反馈统计 (用于早期终止判断)
@@ -168,8 +180,9 @@ private:
     uint32_t pid_;
     std::atomic<uint32_t> current_tx_nb_;    ///< 当前传输次数 (新传+重传)
     std::atomic<uint32_t> current_irv_;      ///< IRV计数器 (用于RV序列)
-    std::atomic<bool>     harq_feedback_;    ///< HARQ反馈 (ACK/NACK)
+    std::atomic<bool>     harq_feedback_;    ///< 最近一次反馈结果 (true=ACK)
     std::atomic<bool>     is_grant_configured_;
+    bool                  feedback_received_;///< 当前 TB 是否已收到反馈 (区分"未收到"与"NACK")
     bool                  cur_ndi_;          ///< 当前NDI值
     uint32_t              cur_tbs_;          ///< 当前TBS
     int8_t                cur_rv_;           ///< 当前RV (-1表示由IRV计算)
@@ -180,7 +193,6 @@ private:
     // 【增强】早期终止相关
     // 基于BLER统计提前终止重传: 当连续收到多次NACK且已重传若干次时,
     // 认为该传输块在当前信道条件下难以成功, 提前丢弃以节省无线资源
-    static constexpr uint32_t EARLY_TERM_WINDOW = 10; ///< 统计窗口 (保留用于扩展的BLER窗口统计)
     uint32_t              consecutive_nack_;   ///< 连续NACK计数 (ACK时清零)
     bool                  early_termination_enabled_; ///< 早期终止开关, 默认启用
 
@@ -239,6 +251,7 @@ public:
     // ========================================================================
 
     /// 【增强】获取HARQ统计信息
+    /// 【线程安全】stats_ 在 mutex_ 下被写线程更新, 读取须持锁拷贝
     struct harq_stats {
         uint32_t total_new_tx;       ///< 新传总次数
         uint32_t total_retx;         ///< 重传总次数
@@ -253,11 +266,22 @@ public:
                      , avg_retx_per_pkt(0.0), bler(0.0) {}
     };
 
-    harq_stats get_stats() const { return stats_; }
+    harq_stats get_stats() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stats_;
+    }
 
     /// 【增强】获取空闲HARQ进程ID
     /// 用于负载均衡, 优先选择空闲最久的进程
     uint32_t get_idle_process_id() const;
+
+    /// 查询是否仍有"在途的上行授权" (即存在仍占用 grant 的 HARQ 进程)
+    /// 【协议语义】UL grant 的有效性绑定在 HARQ 进程上: 只要某进程处于
+    /// WAITING_FB (已发, 等PHICH) 或 RETX_PENDING (收到NACK, 待重传),
+    /// 该 grant 仍"在途", UE 视为仍持有可用授权, 不应触发 SR (§5.4.4)。
+    /// 仅当所有进程均 INACTIVE (grant 已释放/ACK/丢弃) 时返回 false。
+    /// 对应 srsRAN ul_harq_entity 中基于进程状态的 grant 有效性判断。
+    bool has_pending_transmission() const;
 
     /// 【增强】设置所有HARQ进程的早期终止开关
     /// @param enable true=启用早期终止, false=禁用

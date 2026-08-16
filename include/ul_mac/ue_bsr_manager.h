@@ -112,6 +112,15 @@ public:
     /// 获取当前BSR触发类型
     bsr_trigger_type get_trigger_type() const { return triggered_type_; }
 
+    /// 设置"UE 当前是否有可用 UL grant"状态 (由 ue_context 在收到/用尽 grant 时同步)
+    /// 【协议作用】TS 36.321 §5.4.4: Regular BSR 触发 SR 的前提是"UE 无 UL grant"。
+    /// 若 UE 已有可承载待发数据的 UL grant, 则不应触发 SR (直接借该 grant 发数据+BSR 即可)。
+    /// 本项目通过该接口把上层 UL grant 状态透传给 BSR, 使其在触发 SR 前做前提判定。
+    void set_ul_grant_available(bool avail) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ul_grant_available_ = avail;
+    }
+
     // ========================================================================
     // 优化功能接口
     // ========================================================================
@@ -132,7 +141,11 @@ public:
                     , truncated_count(0), avg_bsr_accuracy(0.0) {}
     };
 
-    bsr_stats get_stats() const { return stats_; }
+    /// 【线程安全】与写路径 (step/generate_bsr) 共享 stats_, 须持锁拷贝
+    bsr_stats get_stats() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stats_;
+    }
 
     /// 【优化/非标准】设置Padding BSR抑制开关
     /// 启用后, Padding BSR在所有LCG缓冲区索引未变化时将被跳过, 减少信令开销
@@ -194,6 +207,10 @@ private:
     // 关联组件
     sr_manager* sr_proc_;
     bsr_tx_callback tx_callback_;
+
+    // 协议状态: UE 当前是否有可用 UL grant (由 ue_context 通过 set_ul_grant_available 同步)
+    // 用于 SR 触发前提判定 (§5.4.4: 有 UL grant 时不触发 SR)
+    bool ul_grant_available_ = false;
 
     // 统计和优化
     mutable std::mutex mutex_;

@@ -8,6 +8,7 @@
 #pragma once
 
 #include "ul_mac/common_types.h"
+#include <atomic>
 #include <mutex>
 #include <fstream>
 #include <chrono>
@@ -15,15 +16,13 @@
 
 namespace ul_mac {
 
-/// 日志级别
+/// 日志级别 (数值越小越详细; 过滤器为 level < current_level 则丢弃)
 enum class log_level {
+    TRACE,    ///< 最详细 (逐 TTI 跟踪, 数值最小, 任何级别下都不会"穿透")
     DEBUG,
     INFO,
     WARNING,
-    ERROR,
-    //
-    TRACE
-    //
+    ERROR     ///< 最粗略
 };
 
 /// MAC日志记录器
@@ -146,7 +145,7 @@ private:
         return oss.str();
     }
 
-    log_level current_level_;
+    std::atomic<log_level> current_level_;
     std::mutex mutex_;
     std::ofstream file_stream_;
     bool file_log_enabled_;

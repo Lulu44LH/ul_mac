@@ -134,7 +134,9 @@ enb_ul_harq_manager::rx_result enb_ul_harq_manager::receive_tb(
         ue.stats.total_ack++;
         total_stats_.total_ack++;
         release_process_unlocked(p); // ACK: 释放进程
-        metrics_collector::instance().record_harq_new_tx(); // 复用计数: 成功传输
+        // ACK 不再计入 record_harq_new_tx(): 该指标统计的是新传次数, 由发送端
+        // (UE 侧 HARQ / 调度器发出新 grant 时)记录。此前在此重复计数会导致
+        // 系统指标中"新传次数"虚高 (每次成功的接收被重复记一次新传)。
         LOG_INFO("ENB_HARQ", rnti, grant.tti_tx,
             "PID=" + std::to_string(grant.pid) +
             ": ACK (tx=" + std::to_string(res.tx_count) +

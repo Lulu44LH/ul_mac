@@ -5,6 +5,7 @@
 
 #include "ul_mac/mac_pdu.h"
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 
 namespace ul_mac {
@@ -105,6 +106,10 @@ mac_pdu_pack_result mac_pdu_packer::pack(uint8_t* buf, size_t grant_bytes,
     mac_pdu_pack_result res;
     if (buf == nullptr || grant_bytes == 0) return res;
     size_t pos = 0;
+    // 【E-bit 修正】记录最后一个已写子头的位置: 若 PDU 恰好在某个子头对应的
+    // 载荷后结束 (remain==0), 该子头的 E 位必须清 0 (TS 36.321 §6.2.1:
+    // E=1 表示"后随更多子头", 末个子头必须 E=0)。
+    ptrdiff_t last_subheader_pos = -1;
 
     // 1) BSR CE 优先 (控制信令优先级最高)
     //    先按格式计算 CE 长度并校验空间, 再编码写入, 避免小 grant 下越界写
@@ -128,7 +133,8 @@ mac_pdu_pack_result mac_pdu_packer::pack(uint8_t* buf, size_t grant_bytes,
                 bsr.format == bsr_format::LONG_BSR ? mac_lcid::LONG_BSR
                 : bsr.format == bsr_format::TRUNCATED_BSR ? mac_lcid::TRUNCATED_BSR
                                                          : mac_lcid::SHORT_BSR),
-                /*e=*/true);
+                /*e=*/true);   // 暂置1, 若此子头为末尾, 由下方统一修正
+            last_subheader_pos = static_cast<ptrdiff_t>(pos);
             pos += 1 + enc_len;
             res.bsr_bytes = 1 + enc_len;
         }
@@ -142,9 +148,10 @@ mac_pdu_pack_result mac_pdu_packer::pack(uint8_t* buf, size_t grant_bytes,
         size_t avail = grant_bytes - pos - 2;         // 扣 1B 子头 + 1B L
         if (avail == 0) break;
         size_t n = std::min(static_cast<size_t>(sdu.size), avail);
-        // 子头: LCID + E(暂置1, 末尾统一修正)
+        // 子头: LCID + E(暂置1, 若此子头为末尾, 由下方统一修正)
         buf[pos] = make_subheader(sdu.lcid, /*e=*/true);
         buf[pos + 1] = static_cast<uint8_t>(n & 0x7F); // F=0, 7bit L (演示级仅支持 <128B SDU)
+        last_subheader_pos = static_cast<ptrdiff_t>(pos);
         pos += 2 + n;
         res.sdu_bytes += n;
     }
@@ -163,6 +170,12 @@ mac_pdu_pack_result mac_pdu_packer::pack(uint8_t* buf, size_t grant_bytes,
         buf[pos] = make_subheader(static_cast<uint8_t>(mac_lcid::PADDING), /*e=*/false);
         pos += 1;
         res.padding_bytes = 1;
+    } else {
+        // remain == 0: PDU 恰好结束于最后一个 BSR/SDU 载荷 ——
+        // 把末个子头的 E 位清 0 (此前暂置 1), 完成协议要求的末尾修正
+        if (last_subheader_pos >= 0) {
+            buf[last_subheader_pos] &= static_cast<uint8_t>(~0x20);
+        }
     }
 
     res.written = pos;

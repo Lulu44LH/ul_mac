@@ -60,10 +60,10 @@ struct ue_sched_context {
     uint32_t total_ul_buffer;   ///< 总上行缓冲区
     int      phr;               ///< 功率余量 (dB)
     int32_t  ul_snr;            ///< 上行SNR (x100, 可为负; 低SNR区间需负值)
-    double   dl_avg_rate;       ///< 下行平均速率 (PF调度用)
+    double   dl_avg_rate;       ///< [已废弃] 下行平均速率 (本项目仅上行, 此字段未被引用)
     double   ul_avg_rate;       ///< 上行平均速率 (PF调度用, EPF 复用为 R_avg)
     uint32_t ul_nof_samples;    ///< 上行调度次数 (PF调度用)
-    uint32_t last_scheduled_tti; ///< 上次被调度的TTI
+    uint32_t last_scheduled_tti; ///< [已废弃] 上次被调度的TTI (未被任何调度逻辑读取)
     std::array<bool, MAX_HARQ_PROCESSES> pending_retx{};  ///< 各进程是否有待重传 (位图, 避免单值覆盖导致进程泄漏)
     bool     ndi[MAX_HARQ_PROCESSES]; ///< 各HARQ进程当前NDI (新传时翻转, 重传时保持)
     uint8_t  cqi;              ///< UE上报的CQI (0-15, 0=未上报, 回退SNR)
@@ -111,7 +111,11 @@ public:
 
     /// 处理UE的SR指示
     /// 对应 srsRAN sched.h 中的 ul_sr_info()
-    void handle_sr(uint16_t rnti);
+    /// @param pending_bytes 各 LCG 的待传字节数 (UE 本地已知, 经 srsRAN 式内部接口提前告知 eNB)。
+    ///   在本项目中等价于 srsRAN 的 handle_ul_bsr_indication(): SR 触发的同一时刻,
+    ///   UE 本地已算出待传量并直接喂给 eNB 调度器, 从而跳过"先发小 Grant 探测 BSR"的空口往返。
+    ///   真实协议里这一步要靠 PUSCH 上的 BSR CE 获得 (见 enb_handle_bsr_pdu), 此处为 srsRAN 简化。
+    void handle_sr(uint16_t rnti, const std::array<uint32_t, NOF_LCGS>& pending_bytes = {});
 
     /// 处理UE的BSR
     /// 对应 srsRAN sched.h 中的 ul_bsr()
@@ -151,14 +155,29 @@ public:
     /// 获取调度耗时统计 (基于历史采样的 P50/P99)
     sched_latency_stats get_sched_latency_stats() const;
 
-    /// 设置调度算法
-    void set_algorithm(sched_algorithm algo) { algorithm_ = algo; }
+    /// 设置调度算法 (加锁: 与 schedule_ul 并发安全)
+    void set_algorithm(sched_algorithm algo) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        algorithm_ = algo;
+    }
 
     /// 配置 EPF 参数 (公平性因子/信道感知因子/QoS 缩放/饿死保护)
-    void configure_epf(const epf_params& p) { epf_ = p; }
+    void configure_epf(const epf_params& p) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        epf_ = p;
+    }
 
     /// 获取当前 EPF 参数
-    epf_params get_epf_params() const { return epf_; }
+    epf_params get_epf_params() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return epf_;
+    }
+
+    /// 设置 PF 公平性系数 (默认 1.0 = 标准 PF; <1 偏效率, >1 偏公平)
+    void set_fairness_coeff(double c) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fairness_coeff_ = c;
+    }
 
     /// 设置 UE 业务类型 (差异化 QoS 权重), 需在 add_ue 之后调用
     void set_ue_qos(uint16_t rnti, qos_class cls);
@@ -218,6 +237,23 @@ private:
     /// 重置PRB池 (每TTI调度开始时调用)
     void prb_reset_unlocked();
 
+    /// 【重构】重传优先调度 (无锁版本, 供 schedule_pf/rr/epf 复用)
+    /// 遍历所有 UE 的 pending_retx 位图, 为待重传进程生成 grant 并写入 results。
+    /// 含无效 TB 守卫 (无原始 TB 记录的进程直接丢弃释放)。
+    /// @param results 输出: 重传调度结果追加到此 vector
+    /// @param tti 当前 TTI (日志用)
+    /// @param algo_name 算法名称 (日志前缀, 如 "PF"/"RR"/"EPF")
+    void schedule_retx_first_unlocked(std::vector<ul_sched_result>& results,
+                                       uint32_t tti, const char* algo_name);
+
+    /// 【重构】新传授权后提交 (无锁版本, 供 schedule_pf/rr/epf 复用)
+    /// 统一处理: HARQ 进程占用标记、SR 清除、缓冲区扣减、PF 平均速率 EMA 更新。
+    /// @param ctx UE 调度上下文 (已持锁)
+    /// @param pid 已分配的 HARQ 进程 ID
+    /// @param res 调度结果 (grant 已填充)
+    void commit_new_grant_unlocked(ue_sched_context& ctx, int32_t pid,
+                                    ul_sched_result& res);
+
     sched_algorithm algorithm_;
     uint32_t total_prb_;
 
@@ -228,6 +264,7 @@ private:
 
     double fairness_coeff_; ///< PF公平性系数
     epf_params epf_;        ///< EPF 参数 (公平性因子/信道感知/QoS缩放/饿死保护)
+    uint32_t rr_offset_ = 0; ///< RR轮询起点偏移 (每TTI递增, 避免总偏向小RNTI)
 
     // 调度耗时采样 (微秒), 用于 P50/P99 统计
     mutable std::mutex latency_mutex_;

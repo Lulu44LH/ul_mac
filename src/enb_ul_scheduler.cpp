@@ -39,12 +39,33 @@ void ul_scheduler::remove_ue(uint16_t rnti) {
     ue_db_.erase(rnti);
 }
 
-void ul_scheduler::handle_sr(uint16_t rnti) {
+void ul_scheduler::handle_sr(uint16_t rnti,
+                              const std::array<uint32_t, NOF_LCGS>& pending_bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = ue_db_.find(rnti);
     if (it == ue_db_.end()) return;
     it->second.sr_pending = true;
-    LOG_DEBUG("SCHED", rnti, 0, "SR received from UE");
+    // 【srsRAN 式简化】SR 触发时, UE 本地已算出待传字节数, 经内部接口直接告知 eNB 调度器
+    // (等价 srsRAN handle_ul_bsr_indication), 使 schedule_ul 在 BSR CE 经 PUSCH 解包前就能
+    // 按真实待传量分配资源, 无需"先发小 Grant 探测 BSR"的空口往返。
+    // 注意: 这与真实协议时序不同——真实系统中 eNB 须等 UE 拿到 PUSCH 授权后发 BSR CE 才知道
+    // 待传量 (见 enb_handle_bsr_pdu 的空口解包路径)。此处用 srsRAN 的"同进程内部捷径"建模。
+    // SR 带来的 pending_bytes 是 UE 本地最新待传量(可能已累积多轮数据), 取"与 eNB 当前视图的
+    // 较大值"作为预填: 既覆盖首次(视图为0)的情形, 又能在 UE 缓冲区持续增长时把最新需求带给
+    // eNB, 避免"只在为0时填"导致的调度量被旧值锁死、后续数据饿死的问题。
+    bool updated = false;
+    for (uint32_t i = 0; i < NOF_LCGS; i++) {
+        if (pending_bytes[i] > it->second.ul_buffer[i]) {
+            it->second.ul_buffer[i] = pending_bytes[i];
+            updated = true;
+        }
+    }
+    if (updated) {
+        it->second.total_ul_buffer = 0;
+        for (uint32_t i = 0; i < NOF_LCGS; i++)
+            it->second.total_ul_buffer += it->second.ul_buffer[i];
+    }
+    LOG_DEBUG("SCHED", rnti, 0, "SR received from UE (srsRAN-style pre-BSR fill)");
 }
 
 void ul_scheduler::handle_bsr(uint16_t rnti, uint8_t lcg_id, uint32_t bsr_value) {
@@ -205,6 +226,60 @@ void ul_scheduler::prb_reset_unlocked() {
 }
 
 // ---------------------------------------------------------------------------
+// 公共调度阶段 (重构: 原先在 schedule_pf/rr/epf 中三处重复)
+// ---------------------------------------------------------------------------
+
+void ul_scheduler::schedule_retx_first_unlocked(std::vector<ul_sched_result>& results,
+                                                 uint32_t tti, const char* algo_name) {
+    // 重传优先 (HARQ RTT 内的 TB 必须先发完, 对应 3GPP UL HARQ 语义)
+    for (auto& [rnti, ctx] : ue_db_) {
+        for (uint32_t pid = 0; pid < MAX_HARQ_PROCESSES; ++pid) {
+            if (!ctx.pending_retx[pid]) continue;
+            // 【健壮性守卫】原始新传TB记录缺失(异常): 无法锁定TBS/MCS重传。
+            // 若不清理, pending_retx 会每TTI空转重试永不释放 (死循环缺陷)。
+            // 此处丢弃该TB并释放进程, 交由上层(RLC ARQ)语义兜底。
+            if (!ctx.harq_tb[pid].valid) {
+                ctx.pending_retx[pid] = false;
+                ctx.harq_pid_busy[pid] = false;
+                metrics_collector::instance().record_harq_fail();
+                LOG_WARN("SCHED", rnti, tti,
+                    std::string(algo_name) + " RETX DROP: PID=" + std::to_string(pid) +
+                    " has no valid TB record, releasing process");
+                continue;
+            }
+            ul_sched_result res;
+            res.rnti = rnti;
+            res.grant = generate_ul_grant_unlocked(rnti, tti, pid, true);
+            res.is_retx = true;
+            if (res.grant.tbs > 0) {
+                // 已调度重传: 清除待重传标记, 进程保持忙直到收到ACK/NACK
+                ctx.pending_retx[pid] = false;
+                results.push_back(res);
+                metrics_collector::instance().record_ul_grant();
+                LOG_INFO("SCHED", rnti, tti,
+                    std::string(algo_name) + " RETX: PID=" + std::to_string(res.grant.pid) +
+                    ", TBS=" + std::to_string(res.grant.tbs) + "B");
+            }
+            // tbs==0: 本TTI无连续PRB可用 (暂时性), 保留 pending_retx 下TTI再试
+        }
+    }
+}
+
+void ul_scheduler::commit_new_grant_unlocked(ue_sched_context& ctx, int32_t pid,
+                                              ul_sched_result& res) {
+    // 新传占用该HARQ进程, 等CRC反馈释放
+    ctx.harq_pid_busy[static_cast<uint32_t>(pid)] = true;
+    // 实际获得授权后才清除SR标志
+    ctx.sr_pending = false;
+    // 授权发出后立即扣减缓冲区估计, 下次BSR到达时会重新校准
+    deduct_ul_buffer_unlocked(ctx, res.grant.tbs);
+    // PF平均速率EMA更新 (EPF 的 R_avg 也复用此字段)
+    double alpha = 1.0 / (ctx.ul_nof_samples + 1);
+    ctx.ul_avg_rate = (1.0 - alpha) * ctx.ul_avg_rate + alpha * res.grant.tbs;
+    ctx.ul_nof_samples++;
+}
+
+// ---------------------------------------------------------------------------
 // per-UE HARQ PID 分配
 // ---------------------------------------------------------------------------
 
@@ -300,8 +375,14 @@ void ul_scheduler::deduct_ul_buffer_unlocked(ue_sched_context& ctx, uint32_t byt
 std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_ul(uint32_t tti) {
     // 实时性度量: 测量本次调度决策的执行耗时 (微秒)
     auto t0 = std::chrono::steady_clock::now();
+    // algorithm_ 可能被 set_algorithm 并发写入, 锁内取值
+    sched_algorithm algo;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        algo = algorithm_;
+    }
     std::vector<ul_sched_result> results;
-    switch (algorithm_) {
+    switch (algo) {
         case sched_algorithm::PROPORTIONAL_FAIR: results = schedule_pf(tti); break;
         case sched_algorithm::ROUND_ROBIN:       results = schedule_rr(tti); break;
         case sched_algorithm::EPF:               results = schedule_epf(tti); break;
@@ -313,6 +394,14 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_ul(uint32_t tt
     {
         std::lock_guard<std::mutex> lock(latency_mutex_);
         sched_latency_samples_.push_back(us);
+        // 【健壮性】限制采样内存: 超长仿真下避免无限增长 (丢弃最旧一半,
+        // 摊还 O(1); 统计量仍反映近期调度耗时分布)
+        constexpr size_t MAX_LATENCY_SAMPLES = 200000;
+        if (sched_latency_samples_.size() > MAX_LATENCY_SAMPLES) {
+            sched_latency_samples_.erase(
+                sched_latency_samples_.begin(),
+                sched_latency_samples_.begin() + MAX_LATENCY_SAMPLES / 2);
+        }
     }
     return results;
 }
@@ -323,25 +412,8 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_pf(uint32_t tt
     std::lock_guard<std::mutex> lock(mutex_);
     prb_reset_unlocked();
 
-    // 阶段1: 重传优先 (遍历 pending_retx 位图, 处理所有待重传进程)
-    for (auto& [rnti, ctx] : ue_db_) {
-        for (uint32_t pid = 0; pid < MAX_HARQ_PROCESSES; ++pid) {
-            if (!ctx.pending_retx[pid]) continue;
-            ul_sched_result res;
-            res.rnti = rnti;
-            res.grant = generate_ul_grant_unlocked(rnti, tti, pid, true);
-            res.is_retx = true;
-            if (res.grant.tbs > 0) {
-                // 已调度重传: 清除待重传标记, 进程保持忙直到收到ACK/NACK
-                ctx.pending_retx[pid] = false;
-                results.push_back(res);
-                metrics_collector::instance().record_ul_grant();
-                LOG_INFO("SCHED", rnti, tti,
-                    "PF RETX: PID=" + std::to_string(res.grant.pid) +
-                    ", TBS=" + std::to_string(res.grant.tbs) + "B");
-            }
-        }
-    }
+    // 阶段1: 重传优先 (公共函数, 原三处重复逻辑已抽取)
+    schedule_retx_first_unlocked(results, tti, "PF");
 
     // 阶段2: 计算PF度量值
     struct ue_pf { uint16_t rnti; double metric; };
@@ -372,13 +444,7 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_pf(uint32_t tt
         res.grant = generate_ul_grant_unlocked(e.rnti, tti, static_cast<uint32_t>(pid), false);
         res.is_retx = false;
         if (res.grant.tbs > 0) {
-            // 新传占用该HARQ进程, 等CRC反馈释放
-            ctx.harq_pid_busy[pid] = true;
-            ctx.sr_pending = false; // 实际获得授权后才清除SR标志
-            deduct_ul_buffer_unlocked(ctx, res.grant.tbs);
-            double alpha = 1.0 / (ctx.ul_nof_samples + 1);
-            ctx.ul_avg_rate = (1.0 - alpha) * ctx.ul_avg_rate + alpha * res.grant.tbs;
-            ctx.ul_nof_samples++;
+            commit_new_grant_unlocked(ctx, pid, res);
             results.push_back(res);
             metrics_collector::instance().record_ul_grant();
             LOG_INFO("SCHED", e.rnti, tti,
@@ -397,37 +463,36 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_rr(uint32_t tt
     std::lock_guard<std::mutex> lock(mutex_);
     prb_reset_unlocked();
 
-    // 重传优先
-    for (auto& [rnti, ctx] : ue_db_) {
-        for (uint32_t pid = 0; pid < MAX_HARQ_PROCESSES; ++pid) {
-            if (!ctx.pending_retx[pid]) continue;
+    // 重传优先 (公共函数, 原三处重复逻辑已抽取)
+    schedule_retx_first_unlocked(results, tti, "RR");
+
+    // 轮询新传: 真正的 RR 需每 TTI 轮转起点。ue_db_ 为 std::map (按 RNTI
+    // 升序), 若每 TTI 都从头部遍历, 低 RNTI 恒先获得 PRB, 高 RNTI 在 PRB
+    // 紧张时会被持续饿死 —— 名不副实的"轮询"。此处以 rr_offset_ 作轮转
+    // 起点 (每 TTI +1), 保证各 UE 的遍历优先级随时间均等轮换。
+    std::vector<uint16_t> order;
+    order.reserve(ue_db_.size());
+    for (const auto& [rnti, ctx] : ue_db_) { order.push_back(rnti); }
+    if (!order.empty()) {
+        size_t n = order.size();
+        size_t start = static_cast<size_t>(rr_offset_ % n);
+        for (size_t k = 0; k < n; ++k) {
+            uint16_t rnti = order[(start + k) % n];
+            auto& ctx = ue_db_[rnti];
+            if (ctx.total_ul_buffer == 0 && !ctx.sr_pending) continue;
+            int32_t pid = alloc_free_pid_unlocked(ctx);
+            if (pid < 0) continue;
             ul_sched_result res;
             res.rnti = rnti;
-            res.grant = generate_ul_grant_unlocked(rnti, tti, pid, true);
-            res.is_retx = true;
+            res.grant = generate_ul_grant_unlocked(rnti, tti, static_cast<uint32_t>(pid), false);
+            res.is_retx = false;
             if (res.grant.tbs > 0) {
-                ctx.pending_retx[pid] = false;
+                commit_new_grant_unlocked(ctx, pid, res);
                 results.push_back(res);
                 metrics_collector::instance().record_ul_grant();
             }
         }
-    }
-    // 轮询新传
-    for (auto& [rnti, ctx] : ue_db_) {
-        if (ctx.total_ul_buffer == 0 && !ctx.sr_pending) continue;
-        int32_t pid = alloc_free_pid_unlocked(ctx);
-        if (pid < 0) continue;
-        ul_sched_result res;
-        res.rnti = rnti;
-        res.grant = generate_ul_grant_unlocked(rnti, tti, static_cast<uint32_t>(pid), false);
-        res.is_retx = false;
-        if (res.grant.tbs > 0) {
-            ctx.harq_pid_busy[pid] = true;
-            ctx.sr_pending = false;
-            deduct_ul_buffer_unlocked(ctx, res.grant.tbs);
-            results.push_back(res);
-            metrics_collector::instance().record_ul_grant();
-        }
+        rr_offset_++;
     }
     return results;
 }
@@ -535,24 +600,8 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
         ctx.tti_since_sched += 1;
     }
 
-    // 阶段1: 重传优先 (与 PF/RR 一致)
-    for (auto& [rnti, ctx] : ue_db_) {
-        for (uint32_t pid = 0; pid < MAX_HARQ_PROCESSES; ++pid) {
-            if (!ctx.pending_retx[pid]) continue;
-            ul_sched_result res;
-            res.rnti = rnti;
-            res.grant = generate_ul_grant_unlocked(rnti, tti, pid, true);
-            res.is_retx = true;
-            if (res.grant.tbs > 0) {
-                ctx.pending_retx[pid] = false;
-                results.push_back(res);
-                metrics_collector::instance().record_ul_grant();
-                LOG_INFO("SCHED", rnti, tti,
-                    "EPF RETX: PID=" + std::to_string(res.grant.pid) +
-                    ", TBS=" + std::to_string(res.grant.tbs) + "B");
-            }
-        }
-    }
+    // 阶段1: 重传优先 (公共函数, 原三处重复逻辑已抽取)
+    schedule_retx_first_unlocked(results, tti, "EPF");
 
     // 阶段2: 计算 EPF 度量并排序
     struct ue_epf { uint16_t rnti; double metric; };
@@ -607,18 +656,15 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
         ctx.harq_tb[pid].mcs = mcs;
         ctx.harq_tb[pid].n_prb = n;
         ctx.harq_tb[pid].valid = true;
-        ctx.harq_pid_busy[pid] = true;
-        ctx.sr_pending = false;
-        deduct_ul_buffer_unlocked(ctx, grant.tbs);
-        double alpha = 1.0 / (ctx.ul_nof_samples + 1);
-        ctx.ul_avg_rate = (1.0 - alpha) * ctx.ul_avg_rate + alpha * grant.tbs;
         ctx.inst_rate = static_cast<double>(grant.tbs);
         ctx.tti_since_sched = 0;
-        ctx.ul_nof_samples++;
         ul_sched_result res;
         res.rnti = e.rnti;
         res.grant = grant;
         res.is_retx = false;
+        // 保底授权提交: 占用进程/清SR/扣缓冲/更新平均速率 (公共函数)
+        // 注意 grant 已手动构造 (不走 generate_ul_grant_unlocked), 此处仅提交
+        commit_new_grant_unlocked(ctx, pid, res);
         results.push_back(res);
         metrics_collector::instance().record_ul_grant();
         LOG_INFO("SCHED", e.rnti, tti,
@@ -638,14 +684,9 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
         res.grant = generate_ul_grant_unlocked(e.rnti, tti, static_cast<uint32_t>(pid), false);
         res.is_retx = false;
         if (res.grant.tbs > 0) {
-            ctx.harq_pid_busy[pid] = true;
-            ctx.sr_pending = false;
-            deduct_ul_buffer_unlocked(ctx, res.grant.tbs);
-            double alpha = 1.0 / (ctx.ul_nof_samples + 1);
-            ctx.ul_avg_rate = (1.0 - alpha) * ctx.ul_avg_rate + alpha * res.grant.tbs;
+            commit_new_grant_unlocked(ctx, pid, res);
             ctx.inst_rate = static_cast<double>(res.grant.tbs);
             ctx.tti_since_sched = 0;
-            ctx.ul_nof_samples++;
             results.push_back(res);
             metrics_collector::instance().record_ul_grant();
             LOG_INFO("SCHED", e.rnti, tti,

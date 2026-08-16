@@ -18,6 +18,8 @@
 #include "ul_mac/ue_ul_harq_manager.h"
 #include "ul_mac/mac_logger.h"
 #include "ul_mac/metrics_collector.h"
+#include "ul_mac/mac_pdu.h"
+#include <deque>
 #include <memory>
 
 namespace ul_mac {
@@ -104,12 +106,33 @@ public:
 
     /// 每TTI执行的UE侧MAC步骤
     /// 对应 srsRAN mac.h 中的 run_tti()
+    ///
+    /// 协议链路 (TS 36.321 §5.4.4 / §5.4.5):
+    ///   数据到达 → BSR 触发 Regular → (若 UE 无 UL grant) SR 置 PENDING → SR 在 PUCCH 发送
+    /// 本函数把这条链路显式拆为三步, 避免隐式依赖:
     void run_tti(uint32_t tti) {
         current_tti_ = tti;
-        // 1. BSR步骤: 检查触发条件, 处理定时器
+
+        // 0. 派生 UL grant 状态 (判定权交回 HARQ):
+        //    【协议语义】UL grant 的有效性绑定在 HARQ 进程上 —— 只要有进程处于
+        //    WAITING_FB(已发等反馈) 或 RETX_PENDING(收到NACK待重传), 该 grant 仍在途,
+        //    UE 视为仍持有可用授权, 不应触发 SR (§5.4.4)。故 has_ul_grant_ 直接由
+        //    harq_mgr_.has_pending_transmission() 派生, 而非用"缓冲区是否清空"近似
+        //    (缓冲区清空无法反映重传期间的 grant 占用, 会误清)。
+        has_ul_grant_ = harq_mgr_.has_pending_transmission();
+        // 同步给 BSR: 供其触发 SR 时判定"无 UL grant"前提 (§5.4.4)
+        bsr_mgr_.set_ul_grant_available(has_ul_grant_);
+
+        // 1. BSR 步骤: 检查触发条件 (Regular/Periodic), 处理定时器。
+        //    【显式桥接】若 BSR 判定触发 Regular 且当前无可用 UL grant, bsr_manager::set_trigger()
+        //    内部会调用 sr_proc_->start() 将 SR 置为 PENDING —— 这一步就是协议要求的
+        //    "Regular BSR 触发 SR"。SR 的触发判断在此处完成, 而非在下方 SR step 中。
         bsr_mgr_.step(tti);
-        // 2. SR步骤: 检查是否需要发送SR
+
+        // 2. SR 步骤: 此时 state_ 可能已被 BSR 桥接置为 PENDING, 本步才在 PUCCH 上发送;
+        //    若未被触发 (仍 IDLE), 则 step 直接返回 (对应协议"无 pending SR 则不发")。
         sr_mgr_.step(tti);
+
         // 3. 令牌桶步进: 按PBR为各逻辑信道补充令牌 (每TTI补充1ms)
         //    对应3GPP TS 36.321 Section 5.4.3.1 令牌桶维护
         buffer_mgr_.step_token_buckets(TTI_DURATION_MS);
@@ -118,13 +141,16 @@ public:
     /// 处理来自eNB的上行授权
     /// 对应 srsRAN mac.h 中的 new_grant_ul()
     ul_harq_process::tx_action handle_ul_grant(const ul_grant& grant) {
-        // 1. 通知SR管理器收到上行授权 (SR成功)
+        // 1. 通知SR管理器收到上行授权 (SR成功): 清除 pending SR
+        //    注: has_ul_grant_ 的最终取值由 run_tti 中基于 HARQ 进程状态
+        //    (has_pending_transmission) 统一派生, 此处不手动维护, 避免与 HARQ 状态脱节。
         sr_mgr_.notify_ul_grant_received();
-        has_ul_grant_ = true;
 
         // 2. 检查是否需要在授权中发送BSR
         bsr_ce bsr;
-        uint32_t total_data = buffer_mgr_.get_total_buffer_state();
+        // 【取消判定上界】用 max(old,new) 而非仅 old 快照: 新数据刚到达(未快照)时
+        // old 偏小, 仅按 old 判定会误认为"授权装得下全部数据"而取消 BSR 触发 (§5.4.5)
+        uint32_t total_data = buffer_mgr_.get_total_buffer_state_upper_bound();
         bool bsr_sent = bsr_mgr_.need_to_send_bsr_on_ul_grant(grant.tbs, total_data, bsr);
 
         // 2b. 若未发BSR且授权装完数据后仍有剩余空间, 尝试发送Padding BSR
@@ -140,7 +166,34 @@ public:
         // 4. 更新缓冲区状态 (TTI结束后)
         bsr_mgr_.update_bsr_tti_end(bsr);
 
-        // 5. 新传时: 统计传输字节, 并从缓冲区取走已发送的数据 (简化版LCP)
+        // 5. 【方案B】将 BSR 打包为 UL-SCH MAC PDU 字节流 (随 PUSCH 上报)
+        //    真实协议 (TS 36.321 §5.4.5): BSR 作为 MAC CE 经 MAC PDU 打包
+        //    (加子头 + 复用 + Padding) 成字节流, 在 PUSCH 上传输, 由 eNB 解包取出。
+        //    本项目演示级: 仅打包 BSR CE (不承载真实 RLC SDU 字节, 数据量以 TBS 体现),
+        //    用 mac_pdu_packer::pack_bsr_only 生成 PDU。重传沿用上一次 PDU
+        //    (同一 TB 不应重新触发 BSR / 重新打包)。
+        // 【陈旧 PDU 防护】新传 TB 若不携带 BSR, 必须清空 last_pdu_ ——
+        //    否则上一 TB 的旧 BSR CE 会被当作本次 PUSCH 内容发出去, eNB 解出
+        //    过期的缓冲区视图 (可能覆盖已增长的真实缓冲, 造成调度饥饿)。
+        //    打包失败 (grant 装不下子头+CE) 时同样清空, 避免发送全零伪 PDU。
+        if (action.is_new_tx) {
+            last_pdu_.clear();
+            if (!bsr.reports.empty()) {
+                last_pdu_.assign(action.tbs, 0);
+                auto pr = mac_pdu_packer::pack_bsr_only(last_pdu_.data(),
+                                                        last_pdu_.size(), bsr);
+                if (pr.bsr_bytes > 0) {
+                    LOG_DEBUG("UE", rnti_, current_tti_,
+                        "Packed BSR into MAC PDU (" +
+                        std::to_string(last_pdu_.size()) + " bytes)");
+                } else {
+                    last_pdu_.clear();  // 空间不足装不下 BSR CE, 不上发
+                }
+            }
+        }
+        // 重传: 不再重新打包, last_pdu_ 保留上一次内容供 PUSCH 重传
+
+        // 6. 新传时: 统计传输字节, 并从缓冲区取走已发送的数据 (简化版LCP)
         //    【协议说明 / 简化实现】
         //    真实协议 (TS 36.321 §5.4.3) 的 LCP 需按优先级逐 LC 分配、遵守令牌桶(PBR/BSD)。
         //    本项目用 lcg_buffer_manager::consume_data() 做两阶段近似 (先高优先级 LC 后低优先级),
@@ -150,20 +203,39 @@ public:
             total_tx_bytes_ += action.tbs;
             uint32_t sent_bytes = action.tbs;
             // 从pending_data_中按FIFO匹配已发送字节, 计算端到端延迟并记录
-            // 延迟 = 当前发送TTI - 数据到达TTI
+            // 延迟 = 当前发送TTI - 数据到达TTI (下溢保护: 异常时序按0计)
             while (sent_bytes > 0 && !pending_data_.empty()) {
                 auto& front = pending_data_.front();
-                uint32_t latency = grant.tti_tx - front.arrival_tti;
+                uint32_t latency = (grant.tti_tx >= front.arrival_tti)
+                                 ? (grant.tti_tx - front.arrival_tti) : 0;
                 metrics_collector::instance().record_latency(latency);
                 if (front.bytes <= sent_bytes) {
                     sent_bytes -= front.bytes;
-                    pending_data_.erase(pending_data_.begin());
+                    pending_data_.pop_front();   // deque: O(1) 头部弹出
                 } else {
                     front.bytes -= sent_bytes;
                     sent_bytes = 0;
                 }
             }
             buffer_mgr_.consume_data(action.tbs);
+        }
+
+        // 6b. TB 被丢弃 (达到最大重传/早期终止): 把数据放回缓冲区
+        //     【RLC 重递交近似】真实系统中 HARQ 丢弃后由 RLC ARQ 把数据重新递交给
+        //     MAC (无损投递兜底)。本项目无 RLC, 新传时已乐观扣减缓冲 (见步骤6),
+        //     若不回滚, 丢弃的字节就静默丢失。此处放回最高优先级 LC (简化,
+        //     见 lcg_buffer_manager::restore_data), 并重新入延迟跟踪队列 ——
+        //     等价于"RLC 重递交一批新数据", 会重新触发 Regular BSR 走完整流程。
+        if (action.is_discarded && action.tbs > 0) {
+            buffer_mgr_.restore_data(action.tbs);
+            pending_data_tracker tracker;
+            tracker.lcid = 0;  // 简化: 未记录原 LC 归属, lcid 仅存档不参与逻辑
+            tracker.arrival_tti = current_tti_;
+            tracker.bytes = action.tbs;
+            pending_data_.push_back(tracker);
+            LOG_WARN("UE", rnti_, current_tti_,
+                "TB discarded (tbs=" + std::to_string(action.tbs) +
+                "B), data restored to buffer (RLC re-delivery approximation)");
         }
 
         return action;
@@ -188,6 +260,11 @@ public:
 
     uint16_t get_rnti() const { return rnti_; }
     lcg_buffer_manager& get_buffer_manager() { return buffer_mgr_; }
+
+    /// 【方案B】获取最近一次打包好的 UL-SCH MAC PDU (BSR CE 字节流)
+    /// 由 handle_ul_grant 在打包后填充, 调用方 (main) 取出后写入 ul_grant.pdu,
+    /// 模拟 "BSR 随 PUSCH 上报" 的空口语义, 供 eNB 侧 mac_pdu_unpacker 解包。
+    const std::vector<uint8_t>& get_last_pdu() const { return last_pdu_; }
     sr_manager& get_sr_manager() { return sr_mgr_; }
     bsr_manager& get_bsr_manager() { return bsr_mgr_; }
     ul_harq_manager& get_harq_manager() { return harq_mgr_; }
@@ -253,13 +330,17 @@ private:
     bool has_ul_grant_;
     uint32_t total_tx_bytes_;
 
+    // 【方案B】最近一次打包的 UL-SCH MAC PDU (BSR CE 字节流), 随 PUSCH 上报
+    std::vector<uint8_t> last_pdu_;
+
     /// 延迟追踪: 记录每批数据的到达TTI (lcid -> arrival_tti)
+    /// 用 deque: 头部弹出 (pop_front) 为 O(1), 避免 vector 头部 erase 的 O(n^2)
     struct pending_data_tracker {
         uint32_t lcid;
         uint32_t arrival_tti;
         uint32_t bytes;
     };
-    std::vector<pending_data_tracker> pending_data_;
+    std::deque<pending_data_tracker> pending_data_;
 };
 
 } // namespace ul_mac

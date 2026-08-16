@@ -351,11 +351,11 @@ auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
 ```
    ┌────────┐  start() 由BSR触发   ┌─────────┐
    │  IDLE  │ ──────────────────→ │ PENDING │ ←─────┐
-   └────────┘                     └────┬────┘       │ 发送后回到PENDING
-       ▲                               │ step(): 周期到 & 未超限   │ 等待Grant
-       │ notify_ul_grant_received()    ▼                │
+   └────────┘                     └────┬────┘       │ 发送SR后仍回PENDING
+       ▲                               │ step(): 周期到 & 未超限   │ 按周期重发, 等待Grant
+       │ notify_ul_grant_received()    ▼                │ (置sr_transmitted_flag_通知)
        │ (SR成功)                ┌──────────────┐       │
-       ├───────────────────────  │ TRANSMITTING │ ──────┘
+       ├────────────────────────  │  发送 SR      │ ──────┘
        │                         └──────────────┘
        │ 失败后重置                     │ sr_counter >= dsr_transmax
        │                               ▼
@@ -363,6 +363,8 @@ auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
        └──────────────────────── │ FAILED │ → 触发 fail_callback (模拟RA回退)
                                  └────────┘
 ```
+
+> 注：`TRANSMITTING` 瞬态已删除。旧实现发送 SR 时会先置 `TRANSMITTING` 再立即回 `PENDING`，外部不可观测，故简化为发送后直接保持 `PENDING`。
 
 ### 📖 知识讲解 2：C++ 知识点
 
@@ -458,7 +460,7 @@ EMA 用一行递推公式实现"带遗忘的平均值"，不需要存历史数�
 
 - [ ] 把场景 1 中 `sr_config` 的 `dsr_transmax` 从默认 8 改成 2（提示：在 main.cpp 中调用 `ue.set_sr_config()`），观察 `SR FAILED` 日志是否更容易出现
 - [ ] 在 `step()` 每个状态转移处补一条 DEBUG 日志，把日志级别设为 DEBUG（`mac_logger::instance().set_level(log_level::DEBUG)`），画出一次完整 SR 过程的实际时序
-- [ ] 思考题：`step()` 第 129~138 行，状态先变 TRANSMITTING 再马上变回 PENDING，为什么？（答案：TRANSMITTING 只表示"这个 TTI 正在发"，发完继续等响应，所以立即回 PENDING 等下一个周期重发或等 Grant）
+- [ ] 思考题：`step()` 中发送 SR 后为何仍保持 `PENDING` 而非独立 `TRANSMITTING` 状态？（答案：`TRANSMITTING` 瞬态已删除——发送完成后 UE 仍需按周期重发 SR 直到收到 Grant，且旧实现中 `TRANSMITTING` 在同临界区内置位后立即回 `PENDING`，外部不可观测，故简化为发送后直接保持 `PENDING`，用 `sr_transmitted_flag_` 一次性通知外部"本 TTI 实际发送过"）
 
 ### 🏁 里程碑
 
@@ -794,8 +796,8 @@ average_retx_.store(static_cast<float>(stats_.avg_retx_per_pkt));
 
 | 字段 | 来源 | 用途 |
 |---|---|---|
-| `sr_pending` | `handle_sr()` | UE 举过手，即使 BSR 还没到也要给资源 |
-| `ul_buffer[4]` / `total_ul_buffer` | `handle_bsr()`（BSR 索引→字节数） | 决定分配多少资源 |
+| `sr_pending` | `handle_sr()` | UE 举过手；本项目 srsRAN 式建模下 `handle_sr` 同时预填 `ul_buffer`（见下） |
+| `ul_buffer[4]` / `total_ul_buffer` | `handle_sr()`（srsRAN 式预填）+ `handle_bsr()`（空口 BSR CE 解包校准） | 决定分配多少资源。SR 触发时经 `pending_bytes` 预填，PUSCH 解包后再用更精确量化值覆盖 |
 | `ul_snr` / `cqi` | 信道测量（SNR 固定 200=x100=2dB；CQI 0-15） | 决定 MCS（CQI 优先，SNR 回退） |
 | `ul_avg_rate` / `ul_nof_samples` | 每次调度后 EMA 更新 | PF 算法的"历史平均速率" |
 | `pending_retx[8]` | `handle_ul_crc()` CRC 失败时置位（位图） | 重传优先调度；多进程并行不互相覆盖（P0 修复） |
@@ -946,48 +948,108 @@ ue_context(uint16_t rnti)
 3. harq_mgr_.new_grant_ul(grant, ...);          // HARQ判断新传/重传
 4. bsr_mgr_.update_bsr_tti_end(bsr);            // 启动retxBSR-Timer
 5. 新传时: total_tx_bytes_ += tbs; buffer_mgr_.consume_data(tbs);  // 统计+排空缓冲区
+5b.【方案B】需发BSR且为新传时: last_pdu_ = mac_pdu_packer::pack_bsr_only(bsr)
+   // 把 BSR CE 打包进 UL-SCH MAC PDU 字节流, 供随 PUSCH 经 pdu_channel 上交给 eNB 解包
 ```
 
 这就是协议规定的 UE 收到 UL Grant 后的处理顺序，把三大模块串在了一起。两个细节：
 - **步骤 2b** 让三种 BSR 触发类型在仿真中都能观察到（授权覆盖全部数据时 Regular/Periodic 被取消，剩余空间改发 Padding BSR——这本身就是协议行为）
 - **步骤 5 的 `consume_data()`** 实现了 3GPP TS 36.321 §5.4.3.1 的两阶段 LCP（逻辑信道优先级）：第一阶段按优先级排序，每个信道受 PBR 令牌桶限制取数据（`token_count` 按 `pbr * elapsed_ms` 补充，不超过 `pbr * bsd` 桶容量）；第二阶段将剩余空间按优先级分配给仍有数据的信道（不受 PBR 限制）。`pbr=0` 时退化为纯优先级排序。这样缓冲区真正排空——SR/BSR 的触发才能周期性地重现；重传发的是同一个 TB，不重复消耗
+- **步骤 5b（方案 B 新增）**：UE 侧不再把 BSR 以结构化 `bsr_ce` 直传 eNB，而是用
+  `mac_pdu_packer::pack_bsr_only()` 把 BSR CE 封装进 UL-SCH MAC PDU 字节流（`ue_context::last_pdu_`），
+  随 PUSCH 经 `pdu_channel` 上报；重传沿用旧 PDU（不重新打包）。eNB 侧 `enb_handle_bsr_pdu()`
+  用 `mac_pdu_unpacker::unpack` 解包还原，与协议 TS 36.321 §6.1.3 一致。`get_last_pdu()`
+  供 UE 线程把 PDU 投递进 `pdu_msg`。
 
-### 📖 知识讲解 3：main.cpp 的 TTI 主循环
+### 📖 知识讲解 3：main.cpp 的 TTI 主循环（方案 C 多线程 + 4-TTI 时延）
 
-以场景 1（main.cpp `scenario1_basic_ul_scheduling`）为例，每个 TTI 内的完整"心跳"：
+> 当前版本 main.cpp 已改写为**多线程 + 中央 TTI 时钟 + 四信道时间解耦**（方案 C），并以**方案 B 的
+> BSR 随 PUSCH 打包/解包**上报。下面以场景 2（`scenario2_multi_ue_pf`）为代表说明整体结构，所有
+> 场景共用此架构（仅 UE 数/信道/算法/增强特性配置不同）。
 
 ```cpp
-for (uint32_t tti = 0; tti < 200; tti++) {
-    // ── UE 桩侧 ──
-    if (tti % 10 == 0) ue.data_arrived(2, 500);   // ① 模拟RLC数据到达(周期性)
-    ue.run_tti(tti);                              // ② BSR.step() + SR.step()
+// 主线程: 启动中央 TTI 时钟, 推进 TTI 计数
+tti_clock clock; std::thread clock_th([&]{ clock.run(total_tti); });
 
-    // ── UE→eNB 上行信令(仿真中直接函数调用代替空口传输) ──
+// 每 UE 一个线程: 独占 ue_context, 经四信道与 eNB 交互
+for (auto& ue : ues)
+    ue_threads.emplace_back(run_ue, std::ref(*ue), std::ref(clock),
+                             std::ref(sr_ch), std::ref(grant_ch),
+                             std::ref(pdu_ch), std::ref(phich_ch), total_tti);
+
+// eNB 线程: 独占 scheduler/enb_bsr/enb_harq, 收四信道消息 → 调度 → 接收 → 反馈
+std::thread enb_th(run_enb, std::ref(clock), std::ref(scheduler),
+                   std::ref(enb_bsr), std::ref(enb_harq),
+                   std::ref(sr_ch), std::ref(grant_ch),
+                   std::ref(pdu_ch), std::ref(phich_ch), total_tti);
+```
+
+UE 线程 `run_ue` 的核心循环（每 TTI 心跳）：
+
+```cpp
+for (uint32_t tti = 0; tti < total; tti++) {
+    clock.wait_for_tti(tti);                       // ① 与中央时钟同步 (无真实 sleep)
+    if (tti % 10 == 0) ue.data_arrived(2, 500);    // ② 模拟RLC数据到达
+    ue.run_tti(tti);                               // ③ BSR.step()+SR.step()
+
+    // ── UE→eNB 上行信令: 经 timed_channel 上报, +4 TTI 才被 eNB 看见 ──
     if (ue.get_sr_manager().get_state() == sr_state::PENDING)
-        scheduler.handle_sr(ue.get_rnti());       // ③ SR 到达基站
-    auto lcg_sizes = ue.get_buffer_manager().get_all_lcg_buffer_sizes();
-    enb_handle_bsr_ul(enb_bsr, scheduler, ...);   // ④ BSR CE 编码→enb_bsr解码→喂调度器
+        // ④ SR 上 PUCCH 信道; 同时把 UE 本地待传字节数 (pending_bytes) 随 SR 告知 eNB
+        //   —— srsRAN 式简化: 跳过"先发小 Grant 探测 BSR"的空口往返, 使调度器在
+        //   PUSCH BSR CE 解包前即可按真实量分配 (真实协议须等 PUSCH 上的 BSR CE)
+        sr_ch.enqueue({ue.get_rnti(),
+            ue.get_buffer_manager().get_all_lcg_buffer_sizes()}, tti);
 
-    // ── eNB 侧 ──
-    auto results = scheduler.schedule_ul(tti);    // ⑤ 调度决策, 生成Grant
-
-    // ── eNB 接收 + 反馈闭环 ──
-    for (const auto& res : results) {
-        ul_grant grant = res.grant;
-        auto rx = enb_harq.receive_tb(rnti, grant); // ⑥ IR软合并+CRC判定(确定性SNR模型)
-        grant.phich_available = true;
-        grant.hi_value = rx.crc_ok;                 //    PHICH 反馈值由 eNB 接收端决定
-        ue.handle_ul_grant(grant);                  // ⑦ UE桩处理授权(六步曲)
-        ue.handle_harq_feedback(grant.pid, grant.hi_value); // ⑧ UE收ACK/NACK
-        scheduler.handle_ul_crc(rnti, grant.pid,
-                                rx.discarded ? true : rx.crc_ok); // ⑨ eNB记录CRC(失败→排重传)
+    // ── 等待 eNB 的 UL Grant (PDCCH 信道, 同样 +4 TTI 时延) ──
+    grant_msg g;
+    if (grant_ch.dequeue(ue.rnti, tti, g)) {       // ⑤ 收到 Grant
+        ue.handle_ul_grant(g.grant);               //   → 内部 pack_bsr_only 打包 BSR 进 last_pdu_
+        pdu_ch.enqueue({g.grant.rnti, g.grant,     // ⑥ BSR+数据 随 PUSCH 上报
+                        ue.get_last_pdu()}, tti);
     }
+
+    // ── 等待 PHICH 反馈 (同样 +4 TTI) ──
+    phich_msg p;
+    if (phich_ch.dequeue(ue.rnti, tti, p))          // ⑦ 收 ACK/NACK
+        ue.handle_harq_feedback(p.pid, p.ack);
 }
 ```
 
+eNB 线程 `run_enb` 的核心循环：
+
+```cpp
+for (uint32_t tti = 0; tti < total; tti++) {
+    clock.wait_for_tti(tti);
+    sr_msg s;  // 收 SR → handle_sr 置 sr_pending
+    while (sr_ch.dequeue_all(tti, [&](auto& m){ scheduler.handle_sr(m.rnti); })) {}
+    auto results = scheduler.schedule_ul(tti);     // ⑧ 调度决策, 生成 Grant
+    for (auto& res : results)
+        grant_ch.enqueue({res.grant.rnti, res.grant}, tti);  // ⑨ Grant 经 PDCCH 下发
+
+    pdu_msg pm;  // 收 PUSCH PDU → 解 BSR + 收 TB
+    while (pdu_ch.dequeue_all(tti, [&](auto& pm){
+        enb_handle_bsr_pdu(enb_bsr, scheduler, pm.rnti, pm.pdu); // ⑩ 解 PUSCH PDU 取 BSR
+        auto rx = enb_harq.receive_tb(pm.rnti, pm.grant);        // 软合并+CRC
+        phich_ch.enqueue({pm.grant.rnti, pm.grant.pid,          // ⑪ PHICH 反馈 (异步并行)
+                          rx.crc_ok}, tti);
+        scheduler.handle_ul_crc(pm.rnti, pm.grant.pid,
+                                rx.discarded ? true : rx.crc_ok);
+    })) {}
+}
+```
+
+**与旧版本（单线程直传）的关键区别**：
+- 旧版 BSR 以结构化 `bsr_ce` 由 UE 线程直接调 `enb_handle_bsr_ul` **内存直传**；方案 B 改为
+  UE 在 `handle_ul_grant()` 内 `pack_bsr_only` 打包进 MAC PDU 字节流，经 `pdu_channel` 上报，
+  eNB 用 `enb_handle_bsr_pdu()` 解包还原——**真实走 MAC PDU 打包/解包**。
+- 方案 C 引入 `timed_channel<T>`：四信道每条消息 `enqueue(item, send_tti)` 记
+  `available_tti = send_tti + 4`，对端仅当 `current_tti >= available_tti` 才能 `dequeue`，
+  建模"信息建立后 4 TTI 才对端可见"。所有 worker 经中央 `tti_clock::wait_for_tti()` 同步，
+  确定性、无真实 wall-clock sleep，因此不会出现线程调度抖动导致的伪随机。
+
 补充两个要点：
-- **确定性信道模型**：`receive_tb()` 按 `eff_snr = ul_snr + (合并次数-1)×2dB` 与 `MCS阈值+1dB` 比较判定 CRC，同一输入每次运行结果完全相同（可复现性，调试仿真程序的关键；早期版本用 `std::mt19937 rng(42)` 掷骰子模拟概率 BLER，已替换为更贴近物理层语义的 SNR 模型）
-- **`std::vector<std::unique_ptr<ue_context>>`**（场景 2）：ue_context 含 mutex 不可拷贝，vector 里只能放它的智能指针；`push_back(std::make_unique<ue_context>(rnti))` 是标准写法
+- **确定性信道模型**：`receive_tb()` 按 `eff_snr = ul_snr + (合并次数-1)×2dB` 与 `MCS阈值+1dB` 比较判定 CRC，同一输入每次运行结果完全相同（可复现性，调试仿真程序的关键）。
+- **`std::vector<std::unique_ptr<ue_context>>`**（场景 2）：ue_context 含 mutex 不可拷贝，vector 里只能放它的智能指针；`push_back(std::make_unique<ue_context>(rnti))` 是标准写法。方案 C 下每个 `ue_context` 由**单一 UE 线程独占**，因此 UE 侧访问无需额外锁（eNB 侧 manager 仍各自加锁作保护）。
 
 ### 🔍 代码精读指南
 
@@ -1294,6 +1356,10 @@ NR 补充：还有 2-step RA（MsgA=preamble+数据，MsgB=响应），降低时
 
 **P2 叙事建议**：㉛ 适合讲"用权威参照（3GPP 表格 + srsRAN 源码）交叉核对自己的实现"，且发现过程本身就是故事——附录 C.3 文档里的二进制值是对的、代码却是错的，文档与代码的矛盾暴露了问题；㉜ 是"检查顺序错误导致越界写"的典型内存安全案例，可与 ㉓㉔ 串讲；㉞ 是环境陷阱排查故事：面对零输出段错误，用 gdb 定位到崩溃发生在第三方 DLL 的静态构造、再用 git stash 确认问题早于自己的改动——"不冤枉业务代码，也不放过环境问题"。
 
+| ㊶ | SR 后 eNB 不知道 UE 待传量，调度依赖"上一轮解出的 BSR"（隐式流水线），首传可能按陈旧/0 的 `ul_buffer` 分配 | 真实协议须"先发小 Grant 探测 BSR → 下轮按 BSR 足额调度"；原代码 `schedule_ul` 在 `enb_handle_bsr_pdu` 之前跑，导致 BSR 滞后一轮才生效 | 改为 srsRAN 式内部捷径：`handle_sr(rnti, pending_bytes)` 在 SR 触发时把 UE 本地各 LCG 待传字节数（经 `sr_msg.pending_bytes`）预填 `ul_buffer`；PUSCH 上的 BSR CE 解包（`enb_handle_bsr_pdu`）仍生效并覆盖校准量化值。SR 信道载荷由 `uint16_t` 扩为 `sr_msg` 结构体 | 5 场景编译零警告、运行无死锁；首传即按真实待传量调度，同时保留方案 B 的空口 BSR CE 解包路径 |
+
+**㊶ 叙事建议**：这条适合讲"在协议真实时序与工程实现之间做权衡"——真实 LTE 上行是"SR(1-bit) → 小 Grant 探测 → PUSCH 上的 BSR CE → 下轮足额 Grant"的两轮时序，而 srsRAN 作为同进程基站软件用内部接口（本项目等价 `sr_msg.pending_bytes`）让 eNB 提前获知待传量、跳过空口探测。可结合附录 C.4/C.5 的 SR/BSR 协议讲"为什么 SR 不含缓冲量、为什么必须靠 PUSCH BSR CE"，以及"我的项目如何用一行 `handle_sr` 预填 + 空口解包校准两层保证，既贴合 srsRAN 又保留协议合规的 BSR CE 路径"。
+
 ---
 
 ## 附录 E：C++ 并发与多线程面试专题
@@ -1314,7 +1380,15 @@ t.detach();    // 分离: 后台自生自灭, 风险是访问已销毁的外部�
 
 **Q：线程池的原理？** A：预创建 N 个工作线程 + 一个任务队列；工作线程循环从队列取任务执行（队列空则在 condition_variable 上休眠）。好处：避免频繁创建/销毁线程的开销（Linux 上约百微秒级）、限制并发度防止资源耗尽。真实 srsRAN 的 `task_scheduler` 就是典型实现：各层把任务 post 到队列，由 stack 线程串行执行——这也是一种并发控制：**把多线程问题收敛到单线程队列里，比到处加锁更优雅**。
 
-**项目实例**：本项目 main.cpp 是单线程仿真，但所有管理器都按线程安全设计——面试可以主动说："我的锁粒度是每个管理器一把锁，如果未来把 UE 侧和 eNB 侧拆到两个线程（模拟真实协议栈），代码不需修改即可安全运行"。
+**项目实例（方案 C 多线程）**：本项目 main.cpp 已落地真实多线程架构——每个 UE 一个 `std::thread`
+（`run_ue`），独占自己的 `ue_context`；另起一个 eNB 线程（`run_enb`）独占访问
+`scheduler`/`enb_bsr`/`enb_harq`；主线程启动中央 `tti_clock` 推进 TTI 计数，所有 worker 经
+`tti_clock::wait_for_tti()` 同步（无真实 wall-clock sleep）。UE 与 eNB 之间的 SR/Grant/PDU/PHICH
+四类消息通过 `timed_channel<T>`（见 `include/ul_mac/tti_channel.h`）解耦：发送方
+`enqueue(item, send_tti)` 记 `available_tti = send_tti + 4`，接收方仅当 `current_tti >= available_tti`
+才能 `dequeue`，建模"信息建立后 4 TTI 才对端可见"。eNB 线程内对多 UE 的 `receive_tb` 用
+`std::async` 并行。面试可以主动说："我的锁粒度是每个管理器一把锁，UE 侧对象由单一线程独占，
+eNB 侧 manager 仍各自加锁作额外保护，因此并发安全由'线程独占 + manager 锁'双重保证"。
 
 ### E.2 竞态条件与数据竞争
 
@@ -1515,7 +1589,12 @@ cv.wait(lk, []{ return !q.empty(); });   // ← 谓词形式, 防两大坑
 - **丢失唤醒 (lost wakeup)**：notify 发生在 wait 之前 → 谓词形式进 wait 前先查一次条件，天然免疫
 - 为什么 wait 必须用 `unique_lock`：wait 内部要"解锁→睡→醒来再加锁"，`lock_guard` 不支持中途解锁
 
-**项目关联**：本项目是 TTI 轮询驱动（每 1ms 主动 step）所以不需要 cv；但真实 srsRAN 的层间任务队列（PHY→MAC 投递事件）就是标准生产者-消费者。可主动说："如果把本项目的 UE/eNB 拆成两个线程，中间的 SR/BSR/Grant 传递就应该改成 cv 驱动的消息队列——这是我规划的演进方向。"
+**项目关联（方案 C）**：本项目已落地多线程，UE 线程与 eNB 线程之间的 SR/Grant/PDU/PHICH 四类消息通过
+`timed_channel<T>` 解耦——它底层正是"带 TTI 门控的生产者-消费者队列"：发送方 `enqueue` 入队并
+打上 `available_tti = send_tti + 4`，接收方 `dequeue` 时检查 `current_tti >= available_tti`
+（不满足则相当于条件不满足、需等中央时钟推进到该 TTI 再来）。其"等待可用消息"的语义与
+`condition_variable::wait` 的谓词形式同源。可主动说："我的 timed_channel 用中央 tti_clock 代替
+cv 做同步，是因为仿真要确定性（不依赖 OS 线程调度），但生产/消费模型与 cv 队列一致。"
 
 ### E.9 并发容器：标准库容器的线程安全真相
 

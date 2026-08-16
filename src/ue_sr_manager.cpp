@@ -17,7 +17,8 @@ sr_manager::sr_manager(uint16_t rnti)
     , state_(sr_state::IDLE)
     , sr_counter_(0)
     , last_sr_tx_tti_(0xFFFFFFFF)  // 初始化为极大值, 表示尚未发送过SR
-    , sr_prohibit_counter_(0)  // 【说明】sr-ProhibitTimer 标准存在, 但本项目未实现其递减/判定逻辑 (字段空置)
+    , sr_prohibit_counter_(0)      // sr-ProhibitTimer 剩余 TTI 数 (TS 36.321 §5.4.4)
+    , sr_transmitted_flag_(false)
     , tx_callback_(nullptr)
     , fail_callback_(nullptr)
     , avg_traffic_rate_(0.0)
@@ -70,12 +71,19 @@ void sr_manager::reset() {
     state_ = sr_state::IDLE;
     sr_counter_ = 0;
     sr_prohibit_counter_ = 0;
+    sr_transmitted_flag_ = false;
     LOG_DEBUG("SR", rnti_, 0, "SR state reset");
 }
 
 void sr_manager::start() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_) return;
+
+    // 【协议守卫】TS 36.321 §5.4.4.1: 若 UE 未配置 SR 的 PUCCH 资源
+    // (sr_cfg_.enabled == false), 则**不应触发 SR**, 数据到达应直接走 RA。
+    // 此处统一拦截, 保证所有 SR 触发入口 (BSR 桥接 set_trigger、外部调用) 都遵守该前提,
+    // 避免 SR 被错误置为 PENDING 并误走一次 SR 失败流程 (协议下 SR 应完全不参与)。
+    if (!sr_cfg_.enabled) return;
 
     // 仅在当前无SR待发送时才触发新的SR
     // 对应 srsRAN proc_sr.cc start() 中的 is_pending_sr 检查
@@ -119,21 +127,48 @@ void sr_manager::step(uint32_t tti) {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+
+        // ---- 前置守卫 (非协议判定, 模块级) ----
+        // initialized_ 是"本 SR 模块是否已通过 init() 配置"的守卫, 语义上**不等同于**
+        // "UE 是否已配置 PUCCH/SR 资源"。后者由 sr_cfg_.enabled 表达 (见下方分支)。
         if (!initialized_) return;
+
+        // ---- 协议 §5.4.4 SR 发送阶段的入口条件 ----
+        // 协议将 SR 分为"触发(trigger)"与"发送(transmit)"两阶段:
+        //   触发: 由 BSR 过程在数据到达且无 UL grant 时调用 start() 完成 (本模块的 PENDING 态)。
+        //   发送: 本函数 step() 在 SR 已 pending 时, 在 PUCCH 上实际调度发送。
+        // 此处若 state_ != PENDING, 说明无 pending SR (可能已被 UL grant 取消,
+        // 见 notify_ul_grant_received), 直接退出——对应协议"无 pending SR 则不发"。
         if (state_ != sr_state::PENDING) return;
 
-        // 【协议说明 / 简化实现】标准 sr-ProhibitTimer 用于限制 SR 发送间隔、避免 PUCCH
-        // 拥塞; 本项目未实现该定时器判定 (sr_prohibit_counter_ 恒为 0),
-        // 实际发送间隔仅由 SR 周期 (can_send_sr) 控制。
+        // ---- sr-ProhibitTimer 每 TTI 递减 (SR pending 期间定时器持续走) ----
+        // TS 36.321 §5.4.4: 每次发送 SR 后启动 sr-ProhibitTimer, 其运行期间
+        // UE 不得再次发送 SR, 防止 PUCCH 上 SR 信令过于密集。
+        if (sr_prohibit_counter_ > 0) --sr_prohibit_counter_;
+
+        // ---- 协议判定顺序①: PUCCH / SR 资源是否配置 ----
+        // 协议 §5.4.4.1: 若 UE 未配置 SR 的 PUCCH 资源 (即无 schedulingRequestConfig),
+        // 则**不应触发/发送 SR**, 数据到达应转而触发随机接入(RA)过程。
+        // 本项目以 sr_cfg_.enabled 表达"PUCCH/SR 资源已配置"。
         if (sr_cfg_.enabled) {
-            // PUCCH已配置, 在PUCCH上发送SR
+            // ---- 协议判定顺序②: 是否超过最大 SR 传输次数 (dsr-TransMax) ----
             if (sr_counter_ < static_cast<int>(sr_cfg_.dsr_transmax)) {
-                // 未达到最大传输次数, 检查是否可以发送
-                if (sr_counter_ == 0 || can_send_sr(tti)) {
+                // ---- 协议判定顺序③: 发送间隔约束 ----
+                // 标准下 SR 发送同时受 sr-ProhibitTimer 与 SR 周期(sr-ConfigIndex)约束:
+                //   a) sr-ProhibitTimer 运行期间 (sr_prohibit_counter_ > 0) 禁止发送;
+                //   b) 两次发送间隔需满足 SR 周期 (can_send_sr)。
+                if (sr_prohibit_counter_ == 0 &&
+                    (sr_counter_ == 0 || can_send_sr(tti))) {
                     sr_counter_++;
-                    state_ = sr_state::TRANSMITTING;
+                    // 协议: 发送后保持 PENDING (按 sr-ConfigIndex 周期持续重发直到获 UL grant 或达 dsr-TransMax)。
+                    // 原 TRANSMITTING 瞬态 (同临界区内置位后立即回 PENDING) 已删除:
+                    // 外部始终观察 PENDING, 与 3GPP §5.4.4 行为一致。
                     last_sr_tx_tti_ = tti;
                     do_send_sr = true;
+                    // 发送后启动 sr-ProhibitTimer (配置为 0 时不禁止, 行为同旧版)
+                    sr_prohibit_counter_ = sr_cfg_.sr_prohibit_timer;
+                    // 置一次性通知标志: 供仿真接线在本 TTI 将 SR 投递到 PUCCH 信道
+                    sr_transmitted_flag_ = true;
 
                     // 统计在锁内更新, 避免与其他线程的stats_访问产生数据竞争
                     stats_.total_sr_sent++;
@@ -143,12 +178,14 @@ void sr_manager::step(uint32_t tti) {
                         "Sending SR on PUCCH, sr_counter=" + std::to_string(sr_counter_) +
                         "/" + std::to_string(sr_cfg_.dsr_transmax));
 
-                    // 发送后回到PENDING状态等待响应
-                    state_ = sr_state::PENDING;
+                    // 发送后保持 PENDING, 等待 PHICH/UL grant 响应
+                    // (协议 §5.4.4: UE 按周期持续重发 SR 直到获 grant 或达上限)
                 }
             } else {
-                // 达到最大SR传输次数, SR失败
+                // ---- 协议判定顺序④: 达 dsr-TransMax 仍未获 grant -> SR 失败 ----
+                // 协议 §5.4.4.3: 达到最大传输次数后, 释放 PUCCH/SRS 资源并触发 RA 过程。
                 // 对应 srsRAN proc_sr.cc: "Releasing PUCCH/SRS resources"
+                // 【简化】本项目不内嵌 RA, 仅当满足发送间隔时才上报失败 (避免每 TTI 刷日志)。
                 if (can_send_sr(tti)) {
                     LOG_ERROR("SR", rnti_, tti,
                         "SR FAILED: max transmissions reached (" +
@@ -157,15 +194,14 @@ void sr_manager::step(uint32_t tti) {
                     state_ = sr_state::FAILED;
                     do_fail = true;
 
-                    // 记录统计
                     stats_.total_sr_fail++;
                     metrics_collector::instance().record_sr_fail();
                 }
             }
         } else {
-            // 【协议说明 / 简化实现】
-            // 真实协议 (TS 36.321 §5.4.4): PUCCH 未配置 SR 时, 数据到达应直接触发随机接入(RA),
-            // 且 RA 过程横跨 MAC/RLC/PHY 与 eNB 侧, 不属于 SR 模块职责。
+            // ---- 协议分支: PUCCH 未配置 SR 资源 -> 应触发 RA, 而非发 SR ----
+            // 真实协议 (TS 36.321 §5.4.4.1): PUCCH 未配置 SR 时, 数据到达应直接触发
+            // 随机接入(RA); RA 过程横跨 MAC/RLC/PHY 与 eNB 侧, 不属于 SR 模块职责。
             // 本项目未实现 RA 模块, 此处仅通过 fail_callback_ 通知上层 "需要 RA"。
             // 措辞上应为 "RA fallback required (deferred to upper layer)", 而非模块内触发。
             // 对应 srsRAN proc_sr.cc: "PUCCH not configured. Starting RA procedure"
@@ -198,7 +234,7 @@ void sr_manager::step(uint32_t tti) {
 
 void sr_manager::notify_ul_grant_received() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ == sr_state::PENDING || state_ == sr_state::TRANSMITTING) {
+    if (state_ == sr_state::PENDING) {
         // 仅当确实发送过SR才计为SR成功
         // (BSR途径可能在SR尚未发出时就已获得授权, 此时只需取消pending状态)
         if (sr_counter_ > 0) {
@@ -209,23 +245,35 @@ void sr_manager::notify_ul_grant_received() {
         }
         state_ = sr_state::IDLE;
         sr_counter_ = 0;
+        // 收到 UL grant 时清零 sr-ProhibitTimer, 防止已获 grant 的 UE 因 prohibit
+        // 未过期而错过后续 SR (尽管正常流程下 SR 已被 IDLE 取消, 但在 grant 到达
+        // 与 SR 状态机之间存在短暂窗口, 此处防御性清零)
+        sr_prohibit_counter_ = 0;
     }
+}
+
+bool sr_manager::take_sr_transmitted() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    bool v = sr_transmitted_flag_;
+    sr_transmitted_flag_ = false;
+    return v;
 }
 
 void sr_manager::adjust_sr_period(double traffic_rate) {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // 【strict 模式守卫】g_strict_3gpp_mode=true 时禁用自适应 SR 周期调整
+    // (3GPP 标准下 SR 周期由 eNB RRC 半静态配置, UE 不应单方面修改)
+    if (g_strict_3gpp_mode) return;
+
     // 【增强/仿真优化】自适应SR周期调整算法 (深化版)
-    //
     // 【协议澄清】3GPP标准里SR周期由eNB通过RRC (SchedulingRequestConfig /
     // sr-ConfigIndex) 半静态配置, UE无权单方面修改。本函数为仿真/教学增强,
     // 由UE根据流量模式自决调整SR周期, 用于演示"流量大->SR更频繁->接入时延更低"
     // 的权衡; 真实部署应改由eNB侧根据测量触发RRC重配置。
-    //
     // 原理: 根据UE的流量模式动态调整SR发送周期
     //   - 高流量UE: 缩短SR周期, 快速获取上行授权
     //   - 低流量UE: 增大SR周期, 减少PUCCH信令开销
-    //
     // 深化点:
     //   1. 使用指数移动平均(EMA)平滑流量速率, 抑制瞬时抖动
     //   2. 连续映射: 用对数尺度将流量速率平滑映射到SR周期,

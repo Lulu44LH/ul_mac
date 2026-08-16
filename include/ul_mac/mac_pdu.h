@@ -9,9 +9,10 @@
 //
 // 设计说明 (演示级):
 //   - 聚焦"组包/解包状态机与字节布局正确性", 不实现 RLC/MAC 层间真实 SDU 来源
-//   - LCID 编码遵循 TS 36.321 Table 6.2.1-1 (LTE UL) 的常用值
-//   - 子头无 L 字段的 LCID: Padding(31), Short BSR(21), Truncated BSR(22? 见下)
-//     实际实现采用: Short BSR=21, Long BSR=26, Truncated BSR=22, Padding=31
+//   - LCID 编码遵循 TS 36.321 Table 6.2.1-1 (LTE UL-SCH):
+//     Truncated BSR=28, Short BSR=29, Long BSR=30, Padding=31 (均无 L 字段)
+//   - 末个子头 E 位清 0: 若 PDU 恰好结束于某载荷 (无 Padding), 组包器
+//     将最后一个子头的 E 位置 0, 符合 TS 36.321 §6.2.1 子头链接语义
 //
 // 关键参考:
 //   - 3GPP TS 36.321 Section 6.1.2 (MAC PDU 格式) / Section 6.2.1 (LCID)

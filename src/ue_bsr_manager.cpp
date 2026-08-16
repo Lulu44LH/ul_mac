@@ -81,23 +81,36 @@ void bsr_manager::set_trigger(bsr_trigger_type type) {
 
     // 【关键】当Regular BSR被触发时, 自动触发SR过程
     // 对应 srsRAN proc_bsr.cc: "Triggering SR procedure"
-    if (type == bsr_trigger_type::REGULAR && sr_proc_) {
+    // 【协议缺口修复】TS 36.321 §5.4.4: Regular BSR 触发 SR 的前提是"UE 无 UL grant"。
+    // 若 UE 已有可承载待发数据的 UL grant, 则不应触发 SR (直接借该 grant 发数据+BSR)。
+    // 故此处先查询 ul_grant_available_: 仅当无可用 UL grant 时才 start() SR。
+    if (type == bsr_trigger_type::REGULAR && sr_proc_ && !ul_grant_available_) {
         LOG_DEBUG("BSR", rnti_, 0, "Regular BSR triggered, triggering SR procedure");
         sr_proc_->start();
+    } else if (type == bsr_trigger_type::REGULAR && ul_grant_available_) {
+        LOG_DEBUG("BSR", rnti_, 0,
+            "Regular BSR triggered but UL grant available, SR suppressed (§5.4.4)");
     }
 }
 
 bool bsr_manager::check_regular_bsr_trigger() {
     // 对应 srsRAN proc_bsr.cc step() 中的触发条件检查
     //
-    // Regular BSR触发条件 (3GPP TS 36.321 Section 5.4.4):
-    //   1. 当UL缓冲区为空且有新数据到达 (check_new_data)
-    //   2. 当有数据属于比当前缓冲区中数据更高优先级的LCG (check_highest_priority_channel)
+    // Regular BSR触发条件 (3GPP TS 36.321 Section 5.4.5):
+    //   1. 属于某LCG的数据变成"有数据可传" (该LCG从空变非空)
+    //   2. 有数据到达, 且属于比当前已缓冲数据更高优先级的LCG
     //   3. retxBSR-Timer超时且有数据待发送
+    //
+    // 【协议说明 / 实现来源】
+    // 3GPP 协议条文本身**没有 old_buffer/new_buffer 的"新旧快照"概念**, 它依赖
+    // RLC 上报的缓冲状态变化事件来判定"数据刚刚到达"。本项目的 check_new_data() /
+    // check_highest_priority_channel() 通过对比 old(上次快照) 与 new(当前RLC缓冲)
+    // 来推断上述事件, 这是 **srsRAN 的工程实现手段 (proc_bsr.cc), 并非协议原文**。
+    // 功能上等价于协议语义, 但判定依据的"快照对比"思路源自 srsRAN。
 
     bool trigger = false;
 
-    // 条件1: 新数据到达
+    // 条件1: 新数据到达 (srsRAN 风格: old==0 且 new>0, 即 LCG 从空变非空)
     if (buffer_mgr_.check_new_data()) {
         LOG_DEBUG("BSR", rnti_, 0, "Regular BSR trigger: new data arrived in empty LCG");
         trigger = true;
@@ -156,10 +169,17 @@ void bsr_manager::step(uint32_t tti) {
     // 对应 srsRAN proc_bsr.cc step() 中的触发检查
     if (check_regular_bsr_trigger()) {
         LOG_INFO("BSR", rnti_, tti, "Triggering Regular BSR");
+        // 触发Regular BSR同时开启判断是否激活SR流程，若激活则直接模拟发送SR
         set_trigger(bsr_trigger_type::REGULAR);
     }
 
-    // 4. 更新缓冲区状态 (将new_buffer复制到old_buffer)
+    // 4. 更新缓冲区快照 (将new_buffer复制到old_buffer)
+    // 【实现原理 / 源自 srsRAN, 非3GPP协议原文】
+    // 在每个 TTI 结束时把当前 new_buffer 拷到 old_buffer, 等价于"打一次快照"。
+    // 下一 TTI 新数据到达后, 通过对比 old(快照) 与 new(当前) 即可推断协议要求的
+    // "数据刚刚到达(空→非空)"事件, 从而触发 Regular BSR。
+    // 注意: old/new 快照机制是 srsRAN proc_bsr.cc 的工程做法; 3GPP 协议本身不规定
+    // 这种新旧缓冲对比, 而是依赖 RLC 缓冲状态变化事件。本实现功能上等价于协议语义。
     // 对应 srsRAN proc_bsr.cc step() 中的 update_old_buffer()
     buffer_mgr_.update_old_buffer();
 }
@@ -232,7 +252,9 @@ bool bsr_manager::generate_bsr(bsr_ce& bsr, uint32_t pdu_space) {
     // 仅Padding BSR场景下生效: 比较当前各LCG的BSR索引与上次报告值,
     // 若全部未变化则跳过本次发送, 利用剩余填充空间携带状态但无需重复上报
     // 注意: Regular/Periodic BSR不受此优化影响 (3GPP标准要求必须发送)
-    if (differential_enabled_ && triggered_type_ == bsr_trigger_type::PADDING) {
+    // strict 模式下禁用: 3GPP 标准要求 Padding BSR 始终发送, 差分抑制是非标准优化
+    bool suppress_padding = differential_enabled_ && !g_strict_3gpp_mode;
+    if (suppress_padding && triggered_type_ == bsr_trigger_type::PADDING) {
         bool any_change = false;
         for (uint32_t i = 0; i < NOF_LCGS; i++) {
             uint8_t cur_idx = bytes_to_bsr_index(lcg_sizes[i]);
@@ -413,6 +435,8 @@ bool bsr_manager::generate_padding_bsr(uint32_t nof_padding_bytes, bsr_ce& bsr) 
 void bsr_manager::update_bsr_tti_end(const bsr_ce& bsr) {
     // 对应 srsRAN proc_bsr.cc update_bsr_tti_end() 方法
     // 在TTI结束后更新缓冲区状态
+    // 【锁一致性】与本类其他方法一致, 访问 bsr_cfg_/retx定时器需持锁
+    std::lock_guard<std::mutex> lock(mutex_);
 
     // 启动retxBSR-Timer (如果有数据被发送)
     // 对应 srsRAN: retxBSR-Timer在BSR发送后启动

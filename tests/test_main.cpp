@@ -4,6 +4,7 @@
 // 不依赖外部测试框架 (如 Google Test), 自行实现轻量级 assert 宏。
 // 每个 TEST 宏在静态初始化期执行, 失败抛 std::runtime_error 由 runner 捕获。
 // 测试覆盖: LCP令牌桶 / MCS-TBS / HARQ / SR / BSR / 延迟统计 / 死锁修复 / 线程安全
+//           / tti_channel与tti_clock并发时延 (屏障同步, per-RNTI信道隔离)
 // =============================================================================
 
 #include <iostream>
@@ -24,6 +25,7 @@
 #include "ul_mac/enb_ul_scheduler.h"
 #include "ul_mac/mac_pdu.h"
 #include "ul_mac/ue_context.h"
+#include "ul_mac/tti_channel.h"
 #include "ul_mac/mac_logger.h"
 #include "ul_mac/metrics_collector.h"
 
@@ -417,12 +419,15 @@ TEST(test_harq_rtt_delay) {
 
 // 测试10: 连续 NACK 触发早期终止
 // 配置 max_harq_tx=10 (避免 max retx 干扰), 连续 3 次 NACK + tx_nb>=2 -> 丢弃
+// 【注意】早期终止默认已关闭 (无RLC兜底时提前丢TB会静默丢数据),
+// 本测试显式开启以验证该机制本身
 TEST(test_harq_early_termination) {
     ul_harq_manager mgr(0x0001);
     ul_harq_config cfg;
     cfg.max_harq_tx = 10;  // 高阈值, 隔离早期终止逻辑
     cfg.harq_rtt_ttis = 0;
     mgr.init(cfg);
+    mgr.set_early_termination_enabled(true); // 显式开启 (默认关闭)
 
     // 新传: tx_nb=1
     ul_grant g1;
@@ -457,8 +462,8 @@ TEST(test_harq_early_termination) {
 // SR (调度请求) 测试
 // ============================================================================
 
-// 测试11: SR 状态机 IDLE -> PENDING -> (TRANSMITTING 瞬态) -> IDLE
-// step() 内部 state 先置 TRANSMITTING 再回到 PENDING, 外部观察到 PENDING
+// 测试11: SR 状态机 IDLE -> PENDING -> IDLE
+// 发送后保持 PENDING 等待响应 (TRANSMITTING 瞬态已删除, 3GPP §5.4.4 要求按周期持续重发)
 TEST(test_sr_state_machine) {
     sr_manager sr(0x0001);
     sr_config cfg;
@@ -474,9 +479,9 @@ TEST(test_sr_state_machine) {
     sr.start();
     EXPECT_TRUE(sr.get_state() == sr_state::PENDING);
 
-    // step: 发送 SR (内部经 TRANSMITTING 后回到 PENDING 等待响应)
+    // step: 发送 SR (发送后保持 PENDING, 由 sr_transmitted_flag_ 通知外部)
     sr.step(0);
-    EXPECT_TRUE(sr.get_state() == sr_state::PENDING);  // 发送后回到 PENDING
+    EXPECT_TRUE(sr.get_state() == sr_state::PENDING);  // 发送后仍保持 PENDING
     EXPECT_EQ(sr.get_sr_counter(), 1u);                // SR 计数+1
 
     // 收到上行授权: SR 成功, PENDING -> IDLE
@@ -876,12 +881,12 @@ TEST(test_enb_bsr_truncated_decode) {
     enb_bsr_manager bsr;
     bsr.add_ue(0x0001);
 
-    // Truncated BSR: LCG=3, idx=25 → bytes=256
+    // Truncated BSR: LCG=3, idx=25 → bytes=274
     auto b = make_short_bsr(bsr_format::TRUNCATED_BSR, 3, 25);
     EXPECT_TRUE(bsr.receive_bsr(0x0001, b));
 
-    EXPECT_EQ(bsr.get_ul_buffer(0x0001, 3), 256u); // bsr_index_to_bytes(25) = 256
-    EXPECT_EQ(bsr.get_total_buffer(0x0001), 256u);
+    EXPECT_EQ(bsr.get_ul_buffer(0x0001, 3), bsr_index_to_bytes(25)); // 440
+    EXPECT_EQ(bsr.get_total_buffer(0x0001), bsr_index_to_bytes(25));
 
     auto stats = bsr.get_ue_stats(0x0001);
     EXPECT_EQ(stats.truncated_count, 1u);
@@ -947,20 +952,21 @@ TEST(test_enb_bsr_quantization_mapping) {
     EXPECT_EQ(bsr.get_ul_buffer(0x0001, 0), bsr_index_to_bytes(1)); // 10
 
     bsr.receive_bsr(0x0001, make_short_bsr(bsr_format::SHORT_BSR, 0, 63));
-    EXPECT_EQ(bsr.get_ul_buffer(0x0001, 0), bsr_index_to_bytes(63)); // 25000
+    EXPECT_EQ(bsr.get_ul_buffer(0x0001, 0), bsr_index_to_bytes(63)); // 150000
 
     // 端到端: UE 端 bytes_to_bsr_index(1500) → 编码 idx, eNB 解码 idx → bytes
-    // 协议语义 (TS 36.321 §6.1.3.1): BSR 上报缓冲区为区间下界, 解码值 <= 原值
+    // 协议语义 (TS 36.321 Table 6.1.3.1-1, 上界编码): 缓冲区大小字段表示
+    // "大于该值则进位到下一级"的上界, 解码值 >= 原值 (向上取整)
     uint32_t orig_bytes = 1500;
     uint8_t enc_idx = bytes_to_bsr_index(orig_bytes);
     bsr.receive_bsr(0x0001, make_short_bsr(bsr_format::SHORT_BSR, 0, enc_idx));
     uint32_t decoded_bytes = bsr.get_ul_buffer(0x0001, 0);
-    // 解码值 <= 原值 (向下取整, 符合协议下界语义), 且等于对应索引的字节数
-    EXPECT_TRUE(decoded_bytes <= orig_bytes);
+    // 解码值 >= 原值 (上界编码), 且等于对应索引的字节数
+    EXPECT_TRUE(decoded_bytes >= orig_bytes);
     EXPECT_EQ(decoded_bytes, bsr_index_to_bytes(enc_idx));
-    // 区间下界性质: 不存在更小的索引其字节数 > 原值
+    // 上界编码区间性质: 前一级索引的字节数严格小于原值 (否则应编码为更小索引)
     if (enc_idx > 0) {
-        EXPECT_TRUE(bsr_index_to_bytes(enc_idx - 1) <= orig_bytes);
+        EXPECT_TRUE(bsr_index_to_bytes(enc_idx - 1) < orig_bytes);
     }
 }
 
@@ -1103,6 +1109,230 @@ TEST(test_mac_pdu_empty_and_oob) {
     uint8_t bad[4] = {0};
     auto ur2 = mac_pdu_unpacker::unpack(bad, 4);
     EXPECT_TRUE(ur2.ok); // 容错, 不崩溃
+}
+
+// ============================================================================
+// tti_channel / tti_clock 并发与时延测试
+// ============================================================================
+
+// 测试35: timed_channel 传播时延 (enqueue 后 +CHANNEL_PROPAGATION_TTI 才可见)
+TEST(test_timed_channel_propagation_delay) {
+    timed_channel<uint16_t> ch;
+    ch.enqueue(0x0001, 10);   // TTI=10 入队
+
+    EXPECT_EQ(ch.size(), 1u);
+    // TTI=13: 尚未到达可见时刻 (10+4=14)
+    EXPECT_FALSE(ch.ready(13));
+    EXPECT_TRUE(!ch.dequeue(13).has_value());
+    // TTI=14: 恰好可见
+    EXPECT_TRUE(ch.ready(14));
+    auto v = ch.dequeue(14);
+    EXPECT_TRUE(v.has_value());
+    EXPECT_EQ(*v, 0x0001);
+    // 取出后队列为空
+    EXPECT_EQ(ch.size(), 0u);
+    EXPECT_TRUE(!ch.dequeue(15).has_value());
+}
+
+// 测试36: timed_channel FIFO 顺序与逐条时延 (队头决定可见性)
+TEST(test_timed_channel_fifo_order) {
+    timed_channel<uint32_t> ch;
+    ch.enqueue(100, 0);
+    ch.enqueue(200, 1);
+    ch.enqueue(300, 5);
+    EXPECT_EQ(ch.size(), 3u);
+
+    // TTI=4: 第一条(0+4)可见, 第二条(1+4=5)不可见
+    auto a = ch.dequeue(4);
+    EXPECT_TRUE(a.has_value());
+    EXPECT_EQ(*a, 100u);
+    EXPECT_TRUE(!ch.dequeue(4).has_value());
+
+    // TTI=5: 第二条可见, 第三条(5+4=9)不可见
+    auto b = ch.dequeue(5);
+    EXPECT_TRUE(b.has_value());
+    EXPECT_EQ(*b, 200u);
+    EXPECT_TRUE(!ch.dequeue(8).has_value());
+
+    auto c = ch.dequeue(9);
+    EXPECT_TRUE(c.has_value());
+    EXPECT_EQ(*c, 300u);
+    EXPECT_EQ(ch.size(), 0u);
+}
+
+// 测试37: per_rnti_channel_map 点对点隔离 (RNTI 加扰语义)
+// 修复前: 多 UE 线程共享一个 grant/PHICH FIFO, 会"错领"别人的消息;
+// 修复后: 每个 rnti 独占信道, UE 只能取到自己的消息.
+TEST(test_per_rnti_channel_map_isolation) {
+    per_rnti_channel_map<phich_msg> map;
+    map.add_rnti(0x0001);
+    map.add_rnti(0x0002);
+
+    phich_msg m1{0x0001, 3, true};
+    map.at(0x0001).enqueue(m1, 0);
+
+    // UE 0x0002 的信道不应看到 0x0001 的消息
+    EXPECT_EQ(map.at(0x0002).size(), 0u);
+    EXPECT_TRUE(!map.at(0x0002).dequeue(CHANNEL_PROPAGATION_TTI).has_value());
+
+    // UE 0x0001 只能在自己的信道取到消息
+    auto v = map.at(0x0001).dequeue(CHANNEL_PROPAGATION_TTI);
+    EXPECT_TRUE(v.has_value());
+    EXPECT_EQ(v->rnti, 0x0001);
+    EXPECT_EQ(v->pid, 3u);
+    EXPECT_TRUE(v->ack);
+}
+
+// 测试38: tti_clock 屏障同步 —— 每 TTI 须等全部 worker 完成才推进
+// 2 个 worker + 时钟线程: 每个 worker 必须完整经历 0..MAX_TTI 全部 TTI
+// (无跳过/无丢失), 验证屏障修复后 worker 不会被时钟"甩在后面".
+TEST(test_tti_clock_barrier_sync) {
+    constexpr uint32_t MAX_TTI = 20;
+    constexpr int NOF_WORKERS = 2;
+    tti_clock clock(MAX_TTI, NOF_WORKERS);
+
+    std::vector<std::vector<uint32_t>> seen(NOF_WORKERS);
+    std::vector<std::thread> workers;
+    for (int w = 0; w < NOF_WORKERS; ++w) {
+        workers.emplace_back([&, w]() {
+            for (uint32_t tti = 0; tti <= MAX_TTI; ++tti) {
+                clock.wait_for_tti(tti);
+                if (clock.done()) break;
+                seen[w].push_back(tti);   // 记录本 worker 经历的 TTI
+                clock.mark_tti_done();    // 屏障: 汇报本 TTI 完成
+            }
+        });
+    }
+    clock.run();
+    for (auto& t : workers) t.join();
+
+    EXPECT_TRUE(clock.done());
+    // 每个 worker 必须经历完整 0..MAX_TTI 序列 (屏障保证不跳过)
+    for (int w = 0; w < NOF_WORKERS; ++w) {
+        EXPECT_EQ(seen[w].size(), static_cast<size_t>(MAX_TTI + 1));
+        for (uint32_t t = 0; t <= MAX_TTI; ++t) {
+            EXPECT_EQ(seen[w][t], t);
+        }
+    }
+}
+
+// 测试39: tti_clock + timed_channel 联合 —— 跨线程端到端时延语义
+// worker A (发送方) 在 TTI=t 向信道写入; worker B (接收方) 只能在 t+4 取出.
+// 屏障保证两 worker 同 TTI 内完成, 验证信道时延在并发下仍为确定值.
+TEST(test_tti_clock_channel_cross_thread) {
+    constexpr uint32_t MAX_TTI = 30;
+    tti_clock clock(MAX_TTI, 2);
+    timed_channel<uint32_t> ch;
+    std::atomic<int> rx_count{0};
+    std::atomic<bool> early_rx{false};
+
+    std::thread sender([&]() {
+        for (uint32_t tti = 0; tti <= MAX_TTI; ++tti) {
+            clock.wait_for_tti(tti);
+            if (clock.done()) break;
+            if (tti % 5 == 0) ch.enqueue(tti, tti);  // TTI 0,5,10,... 入队
+            clock.mark_tti_done();
+        }
+    });
+    std::thread receiver([&]() {
+        for (uint32_t tti = 0; tti <= MAX_TTI; ++tti) {
+            clock.wait_for_tti(tti);
+            if (clock.done()) break;
+            while (auto v = ch.dequeue(tti)) {
+                rx_count++;
+                // 不变量: 取出时刻必须 >= 发送时刻 + 传播时延
+                if (tti < *v + CHANNEL_PROPAGATION_TTI) early_rx = true;
+            }
+            clock.mark_tti_done();
+        }
+    });
+    clock.run();
+    sender.join();
+    receiver.join();
+
+    EXPECT_FALSE(early_rx.load());
+    // 发送 TTI 0,5,10,15,20,25,30 共 7 条; 可见条件 send+4 <= 30,
+    // 即 send<=26 的 6 条在仿真期内可见, TTI=30 发出的一条仍在途中
+    EXPECT_EQ(rx_count.load(), 6);
+    EXPECT_EQ(ch.size(), 1u);
+}
+
+// 测试R1: 陈旧PDU回归 - 新传无BSR时不得复用上一TB的PDU
+// 【缺陷背景】原先 last_pdu_ 在新传(无BSR)时不清理, UE 会把上一个 TB 的
+// 旧 PDU (含陈旧 BSR CE) 再发一次, eNB 解码后用过期缓冲视图覆盖真实状态,
+// 导致调度器误判并饿死后续数据。
+TEST(test_ue_stale_pdu_regression) {
+    ue_context ue(0x0001);
+    ue.setup_lcid(2, 0, 8);
+
+    // 无数据无BSR的新传: PDU 应为空 (而非复用任何历史 PDU)
+    ul_grant g0;
+    g0.pid = 0; g0.tbs = 100; g0.ndi = true; g0.ndi_present = true;
+    g0.rv = 0; g0.tti_tx = 0;
+    ue.handle_ul_grant(g0);
+    EXPECT_TRUE(ue.get_last_pdu().empty());
+
+    // 数据到达 -> 触发 Regular BSR -> 新传携带 BSR 的 PDU (非空)
+    ue.data_arrived(2, 500);
+    ue.run_tti(1);
+    ul_grant g1;
+    g1.pid = 1; g1.tbs = 200; g1.ndi = true; g1.ndi_present = true;
+    g1.rv = 0; g1.tti_tx = 1;
+    ue.handle_ul_grant(g1);
+    EXPECT_FALSE(ue.get_last_pdu().empty());  // 本次确实携带 BSR
+
+    // 再次新传 (无新触发的 BSR): 不得复用上一 TB 的含 BSR PDU
+    ul_grant g2;
+    g2.pid = 2; g2.tbs = 200; g2.ndi = true; g2.ndi_present = true;
+    g2.rv = 0; g2.tti_tx = 2;
+    ue.handle_ul_grant(g2);
+    EXPECT_TRUE(ue.get_last_pdu().empty());   // 陈旧 PDU 缺陷回归点
+}
+
+// 测试R2: PHICH ACK 落地回归 - handle_harq_feedback(ACK) 必须释放进程
+// 【缺陷背景】原先 ACK 只写 harq_feedback_(bool, false=默认), 进程状态机
+// 无法区分"NACK"与"尚未收到反馈", ACK 后 has_pending_transmission() 恒真,
+// UE 端持续认为有传输挂起 (SR 被抑制/延迟的根因之一)。
+TEST(test_ue_harq_ack_releases_process) {
+    ul_harq_manager mgr(0x0001);
+    ul_harq_config cfg;
+    cfg.max_harq_tx = 4;
+    cfg.harq_rtt_ttis = 8;
+    mgr.init(cfg);
+
+    // 新传: 进入 WAITING_FB
+    ul_grant g;
+    g.pid = 0; g.tbs = 500; g.ndi = true; g.ndi_present = true;
+    g.rv = 0; g.tti_tx = 0;
+    auto a = mgr.new_grant_ul(g, false);
+    EXPECT_TRUE(a.is_new_tx);
+    EXPECT_TRUE(mgr.has_pending_transmission());
+
+    // PHICH ACK 落地: 进程必须释放 (INACTIVE, 无挂起传输)
+    mgr.handle_harq_feedback(0, harq_feedback::ACK);
+    auto info = mgr.get_process_info(0);
+    EXPECT_TRUE(info.state == harq_state::INACTIVE);
+    EXPECT_FALSE(mgr.has_pending_transmission());
+}
+
+// 测试R3: strict 3GPP 模式 - 禁用非标准增强 (自适应SR周期)
+TEST(test_strict_mode_disables_enhancements) {
+    // 记录并恢复全局开关, 避免污染其他测试
+    bool saved = g_strict_3gpp_mode;
+
+    sr_manager sr(0x0001);
+    sr_config cfg;
+    cfg.enabled = true;
+    cfg.sr_period = 40;
+    sr.init(cfg, nullptr, nullptr);
+
+    g_strict_3gpp_mode = true;
+    for (int i = 0; i < 20; i++) {
+        sr.adjust_sr_period(1000.0);  // strict 模式下应被完全忽略
+    }
+    EXPECT_EQ(sr.get_stats().current_sr_period, 40u);  // 周期保持 RRC 配置值
+
+    g_strict_3gpp_mode = saved;
 }
 
 // ============================================================================

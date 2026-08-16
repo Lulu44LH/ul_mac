@@ -167,7 +167,7 @@ eNB: ul_scheduler::handle_sr(rnti) ──> ue_sched_context.sr_pending = true
 **UE 侧（`sr_manager`）—— 完整的 SR 过程状态机**
 
 ```cpp
-enum class sr_state { IDLE, PENDING, TRANSMITTING, FAILED };
+enum class sr_state { IDLE, PENDING, FAILED };  // TRANSMITTING 瞬态已删除
 
 struct sr_config {
     bool     enabled;        // PUCCH 上的 SR 是否配置
@@ -227,10 +227,10 @@ if (sr_cfg_.enabled) {
     if (sr_counter_ < dsr_transmax) {
         if (sr_counter_ == 0 || can_send_sr(tti)) {  // 周期约束
             sr_counter_++;
-            state_ = sr_state::TRANSMITTING;
+            state_ = sr_state::PENDING;    // 保持 PENDING (TRANSMITTING 瞬态已删除)
             last_sr_tx_tti_ = tti;
+            sr_transmitted_flag_ = true;   // 一次性通知: 本 TTI 实际发送过
             do_send_sr = true;
-            state_ = sr_state::PENDING;   // 发完回到 PENDING 等授权
         }
     } else {
         state_ = sr_state::FAILED;        // 达上限 -> 回退 RA

@@ -142,22 +142,23 @@ void ul_scheduler::handle_sr(uint16_t rnti) {
 
 ### 3.2 SR 状态机
 
-状态定义见 [common_types.h:124-129](include/ul_mac/common_types.h#L124-L129)：`IDLE / PENDING / TRANSMITTING / FAILED`。
+状态定义见 [common_types.h:140-144](include/ul_mac/common_types.h#L140-L144)：`IDLE / PENDING / FAILED`。
+
+> 注：`TRANSMITTING` 瞬态已删除（common_types.h:138-139）。旧实现在同一临界区内置位 `TRANSMITTING` 后立即回 `PENDING`，外部永远观察不到，属冗余状态。发送 SR 后保持 `PENDING` 按周期重发，直到收到 Grant。
 
 ```mermaid
 stateDiagram-v2
     [*] --> IDLE
     IDLE --> PENDING: Regular BSR 触发<br/>调用 start()
-    PENDING --> TRANSMITTING: SR 周期到达<br/>can_send_sr(tti) 为真
-    TRANSMITTING --> IDLE: 收到 UL Grant<br/>notify_ul_grant_received()
-    TRANSMITTING --> PENDING: 未收到 Grant<br/>sr_counter < dsr_transmax
-    TRANSMITTING --> FAILED: sr_counter >= dsr_transmax
+    PENDING --> PENDING: SR 周期到达, 发送 SR<br/>can_send_sr(tti) 为真, 置 sr_transmitted_flag_
+    PENDING --> IDLE: 收到 UL Grant<br/>notify_ul_grant_received()
+    PENDING --> FAILED: sr_counter >= dsr_transmax
     FAILED --> IDLE: 触发 RA 过程<br/>释放 PUCCH/SRS 资源
 ```
 
 **对应源码方法**：
 - `start()` — BSR 触发 SR，IDLE → PENDING
-- `step(tti)` — 每 TTI 调用，检查周期、发送 SR，PENDING → TRANSMITTING
+- `step(tti)` — 每 TTI 调用，周期到达且未超限时发送 SR；发送后保持 PENDING（经 `sr_transmitted_flag_` 通知外部），收到 Grant 才回 IDLE
 - `notify_ul_grant_received()` — 收到授权，回到 IDLE
 - `fail_callback_` — 达到 `dsr_transmax` 触发失败回调
 

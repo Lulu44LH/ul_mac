@@ -46,7 +46,8 @@ using sr_fail_callback = std::function<void(uint16_t rnti)>;
 /// 调度请求(SR)管理器
 ///
 /// 实现3GPP标准的SR过程并增加自适应优化功能
-/// 状态机: IDLE -> PENDING -> TRANSMITTING -> (IDLE | FAILED)
+/// 状态机: IDLE -> PENDING -> (IDLE | FAILED)
+/// TRANSMITTING 瞬态已删除 (同临界区内置位后立即回 PENDING, 外部不可观测)
 class sr_manager {
 public:
     /// 构造函数
@@ -82,6 +83,12 @@ public:
     /// 通知SR成功收到上行授权 (收到UL Grant即表示SR成功)
     void notify_ul_grant_received();
 
+    /// 【一次性通知】取走"本TTI内SR是否真正在PUCCH上发送过"的标志
+    /// 供仿真接线使用: SR信道(PUCCH)应仅在SR实际发送的那一个TTI投递一次,
+    /// 而不是只要状态为PENDING就每TTI重复投递 (会让eNB收到大量重复SR)。
+    /// @return 自上次调用以来是否发生过SR发送; 调用后标志清零
+    bool take_sr_transmitted();
+
     /// 获取当前SR状态
     sr_state get_state() const { return state_; }
 
@@ -97,7 +104,8 @@ public:
     /// @param traffic_rate 当前流量速率 (bytes/TTI)
     void adjust_sr_period(double traffic_rate);
 
-    /// 【增强】获取SR统计信息
+    /// 获取SR统计信息
+    /// 【线程安全】与写路径 (step/init) 共享 stats_, 须持锁拷贝
     struct sr_stats {
         uint32_t total_sr_sent;       ///< 总SR发送次数
         uint32_t total_sr_success;    ///< 总SR成功次数
@@ -108,7 +116,10 @@ public:
                    , total_sr_fail(0), current_sr_period(0) {}
     };
 
-    sr_stats get_stats() const { return stats_; }
+    sr_stats get_stats() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stats_;
+    }
 
 private:
     /// 检查是否可以发送SR (SR间隔检查)
@@ -125,7 +136,8 @@ private:
     int sr_counter_;              ///< SR发送计数器
     sr_config sr_cfg_;            ///< SR配置
     uint32_t last_sr_tx_tti_;     ///< 上次发送SR的TTI
-    uint32_t sr_prohibit_counter_; ///< SR禁止定时器计数
+    uint32_t sr_prohibit_counter_; ///< sr-ProhibitTimer剩余TTI数 (TS 36.321 §5.4.4, 发送SR后启动, 运行期间禁止再发)
+    bool sr_transmitted_flag_;     ///< 本TTI内SR实际发送过的一次性通知标志 (take_sr_transmitted取走)
 
     // 回调函数
     sr_tx_callback tx_callback_;

@@ -8,38 +8,57 @@
 
 ---
 
-## 1. 整体架构：发送桩 ↔ 接收链路
+## 1. 整体架构：发送桩 ↔ 接收链路（方案 B + 方案 C）
 
 ```
-                        每 TTI 数据流
- ┌──────────────────────────────────────────────────────────────┐
- │  UE 发送桩 (ue_context)              eNB 接收链路              │
- │  ───────────────────               ───────────────            │
- │  data_arrived()                      handle_sr()             │
- │       │                              (sr_pending 置位)         │
- │  run_tti()  ── 触发 SR / 组包 BSR      │                       │
- │       │                              enb_bsr.receive_bsr()    │
- │  get_all_lcg_buffer_sizes() ───────►  (解码 6-bit 索引→bytes)   │
- │                                       │                       │
- │                                       scheduler.handle_bsr()  │
- │                                       scheduler.schedule_ul() │
- │                                            │ 生成 ul_grant     │
- │                                            ▼                  │
- │  enb_harq.receive_tb(grant) ──► 软合并+CRC ──► 产生 PHICH       │
- │       │                                     │                 │
- │  ue.handle_ul_grant() ◄── grant ───────────┘                  │
- │  ue.handle_harq_feedback() ◄── hi_value (PHICH)               │
- │                                            │                  │
- │  scheduler.handle_ul_crc() ◄── crc_ok/discard                 │
- └──────────────────────────────────────────────────────────────┘
+                  多线程 + 中央 TTI 时钟 + 四信道时间解耦 (各 +4 TTI 可见时延)
+ ┌──────────────────────── UE 线程 (每UE一个) ────────────────┐   ┌──── eNB 调度线程 ────┐
+ │ data_arrived()                                              │   │                     │
+ │ run_tti() ── 触发SR(PUCCH) + 编码BSR CE                      │   │                     │
+ │   │ SR ──enqueue──► [SR信道 (PUCCH)] ──(+4TTI)──► handle_sr │   │                     │
+ │   │                                                         │   │ schedule_ul()       │
+ │   │ ◄─(+4TTI)── [UL Grant信道 (PDCCH)] ◄── enqueue ─────────┼───┼─ grant             │
+ │   │ ue.handle_ul_grant()→打包BSR进MAC PDU                    │   │                     │
+ │   │ PUSCH ──enqueue──► [MAC PDU信道 (PUSCH)] ──(+4TTI)───────┼───┼─► enb_handle_bsr_pdu│
+ │   │                                          解PUSCH PDU取BSR│   │   + receive_tb()    │
+ │   │                                           ──(+4TTI)──► [PHICH信道]──enqueue──► handle_harq_feedback │
+ │   │ ◄─(+4TTI)── PHICH (ACK/NACK) ◄──────────────────────────┘   │                     │
+ └────────────────────────────────────────────────────────────┘   └─────────────────────┘
 ```
+
+**方案 B（BSR 随 PUSCH 上报）**：UE 在 `handle_ul_grant()` 内用 `mac_pdu_packer::pack_bsr_only`
+把 BSR CE 打包进 UL-SCH MAC PDU 字节流（`ue_context::last_pdu_`），随 PUSCH 经 `pdu_msg`
+信道上报；eNB 侧 `enb_handle_bsr_pdu()` 用 `mac_pdu_unpacker::unpack` 解出 BSR CE 再喂调度器。
+**BSR 不再以结构化 `bsr_ce` 在内存中直传**，而是真实走 MAC PDU 打包/解包，与协议一致。
+
+**SR → 待传量的 srsRAN 式建模（本项目对协议时序的简化）**：
+真实协议中 SR 仅是 PUCCH 上的 1-bit 信号，eNB 须等 UE 拿到 PUSCH 授权后发 BSR CE 才知待传量，
+即"先发小 Grant 探测 BSR → 下一轮按 BSR 足额调度"的两轮时序。本项目（与 srsRAN 真实基站软件的
+"同进程内部捷径"一致）改为：**SR 触发的同一时刻，UE 本地已知各 LCG 待传字节数，经 `sr_msg`
+的 `pending_bytes` 字段直接随 SR 信道告知 eNB 调度器**（`handle_sr(rnti, pending_bytes)` 预填
+`ul_buffer`），使 `schedule_ul` 在 PUSCH 上的 BSR CE 经空口解包前即可按真实量分配资源，
+**跳过"先发小 Grant 探测 BSR"的空口往返**。真实空口的 BSR CE 路径（方案 B 的 `enb_handle_bsr_pdu`
+解包）仍生效，并在解包后用更精确的量化值覆盖校准 `ul_buffer`。此简化与协议的差异已在
+`handle_sr` / `sr_msg` / `main.cpp` 注释中明确标注。
+
+**方案 C（多线程 + 4-TTI 时延）**：
+- **中央 TTI 时钟线程**（主线程 `clock.run()`）统一推进 TTI 计数，所有 worker 经
+  `tti_clock::wait_for_tti()` 同步，确定性无真实 wall-clock sleep。
+- **每 UE 一个独立线程**，`ue_context` 由该线程独占（无需额外锁）。
+- **eNB 调度线程**独占访问 `scheduler`/`enb_bsr`/`enb_harq`（内部本已加锁，作额外保护）。
+- **HARQ 接收并行**：eNB 线程内对多 UE 的 PUSCH 接收用 `std::async` 并行 `receive_tb`。
+- **四信道时间解耦**（`timed_channel<T>`，见 `include/ul_mac/tti_channel.h`）：SR(PUCCH) /
+  UL Grant(PDCCH) / MAC PDU(PUSCH) / PHICH 各带 `CHANNEL_PROPAGATION_TTI = 4` 时延——
+  发送方 `enqueue(item, send_tti)` 记 `available_tti = send_tti + 4`，接收方仅当
+  `current_tti >= available_tti` 才能 `dequeue`，建模"信息建立后 4 TTI 才对端可见"。
 
 **关键耦合点**：
-- `grant.hi_value = rx.crc_ok`（`main.cpp:182`）：eNB 接收端把 CRC 结果写入 PHICH 值，
-  经 `ul_grant` 回传给 UE —— 这是用结构体字段**模拟真实 PHICH 信道**的做法（真实系统里
-  PHICH 是独立物理信道，UE 通过 `get_phich()` 读取，本项目用 `main.cpp` 显式赋值等效）。
-- `scheduler.handle_ul_crc(rnti, pid, rx.discarded ? true : rx.crc_ok)`（`main.cpp:189`）：
-  把 eNB 接收结果回馈给调度器，用于清除/保留重传标志。
+- `grant.hi_value = rx.crc_ok`：eNB 接收端把 CRC 结果经 PHICH 信道回传 UE（方案 C 下
+  经由 `phich_ch.enqueue(pm, tti)` 在 `send_tti + 4` 后才被 UE 线程 `dequeue` 见到）。
+- `scheduler.handle_ul_crc(rnti, pid, rx.discarded ? true : rx.crc_ok)`：eNB 线程内
+  把接收结果回馈调度器，用于清除/保留重传标志。
+- `pdu_msg` 同时携带 `ul_grant`（UE 从 PDCCH 收到的 grant 副本），供 eNB 侧 `receive_tb`
+  用正确 pid/ndi/mcs/tbs 收 TB（等效"eNB 用 grant 收 PUSCH TB"的真实语义）。
 
 ---
 
@@ -76,25 +95,38 @@ int main(int, char**) {                  // main.cpp:462
 
 ---
 
-## 3. 通用 TTI 循环（5 个场景的公共骨架）
+## 3. 通用 TTI 循环（5 个场景的公共骨架，方案 C 多线程版）
 
-每个 scenario 的 `for (tti = 0; tti < N; tti++)` 循环都遵循如下 8 步顺序。以
-`scenario1`（`main.cpp:158-192`）为例：
+方案 C 下每个 scenario 不再是单线程 `for` 循环，而是**多线程 + 中央 TTI 时钟 + 四信道时间解耦**：
+- **主线程**启动 `tti_clock`（`clock.run()`），统一推进 TTI 计数；
+- **每 UE 一个线程**（`std::thread`，`run_ue(ue, ...)`），内部通过 `clock.wait_for_tti(tti)`
+  与中央时钟同步，独占自己的 `ue_context`；
+- **一个 eNB 线程**（`run_enb(...)`），独占访问 `scheduler`/`enb_bsr`/`enb_harq`，
+  依次 `dequeue` 四信道消息、执行调度与接收；
+- 四信道（`sr_channel`/`grant_channel`/`pdu_channel`/`phich_channel`）均为 `timed_channel<T>`，
+  **发送方 `enqueue(item, send_tti)` 记 `available_tti = send_tti + 4`**，接收方仅当
+  `current_tti >= available_tti` 才能 `dequeue`——即"信息建立后 4 TTI 才对端可见"。
 
-| 步骤 | 代码位置 | 函数/作用 | 所属侧 |
-|------|----------|-----------|--------|
-| 1 | `:160-161` | `ue.data_arrived(lcid, bytes)` — 模拟 RLC 数据到达，写入 LCG 缓冲区 | UE 桩 |
-| 2 | `:162` | `ue.run_tti(tti)` — 驱动 BSR 触发判断 + SR 状态机 + 令牌桶步进 | UE 桩 |
-| 3 | `:165-167` | 若 `sr_state::PENDING` → `scheduler.handle_sr(rnti)` 置 `sr_pending` | eNB |
-| 4 | `:170-171` | 取 `lcg_sizes` → `enb_handle_bsr_ul()` 编码+解码+喂调度器 | eNB |
-| 5 | `:174` | `scheduler.schedule_ul(tti)` — 执行调度算法，输出 `sched_result` 列表 | eNB |
-| 6 | `:180` | `enb_harq.receive_tb(rnti, grant)` — 软合并+CRC，返回 `rx_result` | eNB |
-| 7 | `:182` | `grant.hi_value = rx.crc_ok` — 把 PHICH 反馈值写回 grant | eNB→UE 桥 |
-| 8 | `:185-190` | `ue.handle_ul_grant()` + `ue.handle_harq_feedback()` + `scheduler.handle_ul_crc()` | 两侧闭环 |
+以 `scenario2`（`main.cpp`）为例，UE 线程与 eNB 线程的交互为：
 
-> **注意**：步骤 6 在真实系统中发生在"UE 发送后约 8 TTI（HARQ RTT）"，但本项目为演示
-> 方便**在同一 TTI 内即时闭环**（无 RTT 延迟建模）。`ul_harq_manager` 内部 `harq_rtt_ttis_`
-> 字段保留但主流程未用。
+| 步骤 | 角色 | 动作 | 信道 / 时延 |
+|------|------|------|-------------|
+| 1 | UE 线程 | `ue.data_arrived()` + `ue.run_tti()` 触发 SR、编码 BSR | — |
+| 2 | UE → eNB | `sr_channel.enqueue(sr_msg, tti)` | SR(PUCCH) **+4 TTI** |
+| 3 | eNB 线程 | `scheduler.handle_sr(rnti)` 置 `sr_pending` | 收到 SR |
+| 4 | eNB 线程 | `scheduler.schedule_ul(tti)` 生成 Grant | — |
+| 5 | eNB → UE | `grant_channel.enqueue(grant_msg, tti)` | UL Grant(PDCCH) **+4 TTI** |
+| 6 | UE 线程 | `ue.handle_ul_grant()` 内 `pack_bsr_only` 把 BSR 打包进 `last_pdu_` | 收到 Grant |
+| 7 | UE → eNB | `pdu_channel.enqueue(pdu_msg, tti)`（含 grant 副本 + PDU 字节流） | MAC PDU(PUSCH) **+4 TTI** |
+| 8 | eNB 线程 | `enb_handle_bsr_pdu()` 解 PUSCH PDU 取 BSR → `receive_tb()` 软合并+CRC | 收到 PDU |
+| 9 | eNB → UE | `phich_channel.enqueue(phich_msg, tti)`（`ack = rx.crc_ok`） | PHICH **+4 TTI** |
+| 10 | UE 线程 | `ue.handle_harq_feedback()` 收 ACK/NACK；`scheduler.handle_ul_crc()` | 收到 PHICH |
+
+> **注意**：方案 C 已建模**信道传播时延**——SR/Grant/PDU/PHICH 四者各带 `CHANNEL_PROPAGATION_TTI = 4`
+> 的可见时延（见 `include/ul_mac/tti_channel.h`），所以主流程中每一步交互都不再是"同一 TTI 即时闭环"，
+> 而是经过 4 TTI 的空口传播才被对端观察到。这与真实 LTE 的时序（DCI 0 → n+4 PUSCH → n+8 PHICH）方向一致，
+> 仅数值取 4 作演示常量。`ul_harq_manager` 内部的 `harq_rtt_ttis_` 字段保留但本主流程时延由
+> `timed_channel` 统一建模，不再依赖它。
 
 ---
 
@@ -102,43 +134,50 @@ int main(int, char**) {                  // main.cpp:462
 
 | 函数 | 位置 | 作用 |
 |------|------|------|
-| `print_separator(title)` | `:54` | 打印带标题的分隔线 |
-| `print_ue_metrics(m)` | `:62` | 打印单 UE 统计（SR/BSR/HARQ/吞吐） |
-| `print_enb_rx_stats(enb_bsr, enb_harq)` | `:78` | 打印 eNB 接收侧统计（BSR 解码计数 + HARQ 收发/软合并/丢弃） |
-| `make_ue_bsr_ce(lcg_sizes)` | `:97` | **UE 发送桩**：模拟 `bsr_manager::generate_bsr` 的 Long BSR 分支，把各 LCG 字节数压成 6-bit 索引的 `bsr_ce` |
-| `enb_handle_bsr_ul(enb_bsr, scheduler, rnti, lcg_sizes)` | `:112` | **eNB 接收桥**：①调用 `make_ue_bsr_ce` 编码；②`enb_bsr.receive_bsr()` 解码；③逐 LCG 调 `scheduler.handle_bsr()` 把缓冲视图喂给调度器 |
+| `print_separator(title)` | `main.cpp` | 打印带标题的分隔线 |
+| `print_ue_metrics(m)` | `main.cpp` | 打印单 UE 统计（SR/BSR/HARQ/吞吐） |
+| `print_enb_rx_stats(enb_bsr, enb_harq)` | `main.cpp` | 打印 eNB 接收侧统计（BSR 解码计数 + HARQ 收发/软合并/丢弃） |
+| `enb_handle_bsr_pdu(enb_bsr, scheduler, rnti, pdu)` | `main.cpp` | **eNB 接收桥（方案 B）**：用 `mac_pdu_unpacker::unpack` 解 PUSCH MAC PDU 字节流还原 BSR CE，再 `enb_bsr.receive_bsr()` 写 per-UE LCG 视图，逐 LCG `scheduler.handle_bsr()` 喂调度器。BSR 真实走 MAC PDU 打包/解包，与协议一致 |
 
-### `enb_handle_bsr_ul` 的桥接细节（`:112-128`）
+### `enb_handle_bsr_pdu` 的桥接细节（方案 B）
 
 ```cpp
-bsr_ce bsr = make_ue_bsr_ce(lcg_sizes);   // UE 编码
+// 解 PUSCH PDU 还原 BSR（UE 侧在 handle_ul_grant 内 pack_bsr_only 打包）
+mac_pdu_unpacker unpacker;
+auto bsr = unpacker.unpack(pdu);            // PDU 字节流 → BSR CE (结构化对象)
 if (bsr.reports.empty()) return;
-enb_bsr.receive_bsr(rnti, bsr);          // eNB 解码 → 维护 per-UE LCG 视图
+enb_bsr.receive_bsr(rnti, bsr);             // 索引 → 字节下界, 写 per-UE LCG 视图
 for (uint32_t i = 0; i < NOF_LCGS; i++) {
     uint32_t buf = enb_bsr.get_ul_buffer(rnti, i);
     if (buf > 0)
-        scheduler.handle_bsr(rnti, i, bytes_to_bsr_index(buf)); // 转回索引喂调度器
+        scheduler.handle_bsr(rnti, i, bytes_to_bsr_index(buf)); // 转回索引写入调度器缓冲变量
 }
 ```
 
-注意这里**编码→解码→再编码**的往返：UE 把字节压成索引（`make_ue_bsr_ce`），
-eNB 把索引解回字节（`receive_bsr` 内部 `bsr_index_to_bytes`），再调 `handle_bsr` 时又
-`bytes_to_bsr_index(buf)` 压回索引。这是为了演示"eNB 解码视图 ↔ 调度器索引口径"一致，
-真实系统中调度器直接消费解码后的字节数即可（此处多一次往返仅作教学演示）。
+**与旧方案（A）的关键区别**：旧版 `make_ue_bsr_ce` + `enb_handle_bsr_ul` 让 BSR 以结构化
+`bsr_ce` 在内存中**直传**（UE 线程直接调 eNB 侧函数），未经过空口字节流。方案 B 改为：
+UE 在 `ue_context::handle_ul_grant()` 内调用 `mac_pdu_packer::pack_bsr_only` 把 BSR CE 封装进
+UL-SCH MAC PDU 字节流（`ue_context::last_pdu_`），随 PUSCH 经 `pdu_channel` 上报；eNB 侧
+`enb_handle_bsr_pdu()` 用 `mac_pdu_unpacker::unpack` 解包还原 CE。**BSR 现在真实走 MAC PDU
+打包/解包**，与协议 TS 36.321 §6.1.3 一致（`mac_pdu_packer/unpacker` 能力原本独立存在，现正式接入 BSR 链路）。
 
 ---
 
-## 5. 四个场景差异对照
+## 5. 五个场景差异对照
 
-| 场景 | 函数 | UE 数 | 信道(ul_snr) | 调度算法 | 重点演示 |
+> 方案 C 下 5 个场景**共用同一套多线程 + 中央时钟 + 四信道架构**（每 UE 线程 + eNB 线程 + 四
+> `timed_channel`），仅 UE 数量、信道质量、调度算法、增强特性的配置不同。场景 2 为首个改写为
+> 多线程原型的场景，其余场景在原型基础上做配置推广。
+
+| 场景 | 函数 | UE 数 | 信道(ul_snr) | 调度算法 | 重点演示（方案 C 行为） |
 |------|------|-------|--------------|----------|----------|
-| 1 | `scenario1_basic_ul_scheduling` | 1 | 2000 (20dB) | PF | 基本链路：SR→BSR解码→Grant→HARQ |
-| 2 | `scenario2_multi_ue_pf` | 5 | 2000 (20dB) | PF | 多 UE 公平共享 PRB |
-| 3 | `scenario3_harq_retx` | 1 | **200 (2dB)** | RR | **弱信道新传 NACK→重传 IR 增益后 ACK** |
-| 4 | `scenario4_enhanced_features` | 1 | 2000 (20dB) | PF | 自适应 SR 周期 + 调度实时性度量 |
-| 5 | `scenario5_epf` | 5 | 2000/200(弱) | **EPF** | 华为增强型PF：QoS权重(VoIP/视频/BE) + 信道感知 + 饿死保护 |
+| 1 | `scenario1_basic_ul_scheduling` | 1 | 2000 (20dB) | PF | 基本链路：SR→BSR解码→Grant→HARQ 多线程闭环 |
+| 2 | `scenario2_multi_ue_pf` | 5 | 2000 (20dB) | PF | **多线程原型**：5 UE 线程 + eNB 线程 + 中央时钟 + 四信道；多 UE 公平共享 PRB |
+| 3 | `scenario3_harq_retx` | 1 | **200 (2dB)** | RR | **弱信道新传 NACK→重传 IR 增益后 ACK**；eNB 线程用 `pdu_msg.grant` 收 TB，atomic 计数 retx/fail |
+| 4 | `scenario4_enhanced_features` | 1 | 2000 (20dB) | PF | 自适应 SR 周期 + 调度实时性度量（流量模式与 `adjust_sr_period` 移入 UE 线程） |
+| 5 | `scenario5_epf` | 5 | 2000/200(弱) | **EPF** | 华为增强型PF：QoS权重(VoIP/视频/BE) + 信道感知 + 饿死保护；`vector<atomic<uint32_t>> sched_count` 按 rnti 递增 |
 
-### 场景3 的 HARQ 软合并验证逻辑（`:294-296`）
+### 场景3 的 HARQ 软合并验证逻辑
 
 ```cpp
 enb_harq.set_ul_snr(0x0001, 200);   // 弱信道 2dB
@@ -147,7 +186,9 @@ enb_harq.set_ul_snr(0x0001, 200);   // 弱信道 2dB
 ```
 
 这是本项目软合并模型（`eff_snr = ul_snr + (combined_count-1)*IR_GAIN`）的核心卖点演示：
-弱信号下新传失败，但重传累积 IR 增益后边缘 MCS 也能解调成功。
+弱信号下新传失败，但重传累积 IR 增益后边缘 MCS 也能解调成功。方案 C 下，eNB 线程从
+`pdu_channel` 取出 `pdu_msg` 后直接用 `msg.grant` 调 `receive_tb(rnti, msg.grant)`，
+重传/丢弃计数用 `std::atomic` 在 eNB 线程内安全累加。
 
 ---
 
@@ -186,12 +227,17 @@ enb_harq.set_ul_snr(0x0001, 200);   // 弱信道 2dB
 `main.cpp` 使用的模块在以下方面为**演示级简化**，已在对应源文件以
 `【协议说明 / 简化实现】` 注释标注：
 
-1. PHICH 用 `grant.hi_value` 字段模拟，真实系统为独立物理信道。
-2. HARQ 反馈即时闭环，未建模 8-TTI RTT 延迟（虽 `harq_rtt_ttis_` 字段保留）。
-3. `MAX_HARQ_PROCESSES = 8` 为 LTE 4G 上行固定值（见 `common_types.h`，已按 LTE 规范取值）。
-4. TBS 用线性插值近似，非 3GPP 离散查表。
-5. 重传锁定 MCS/PRB（非自适应），未实现 eNB 自适应重传。
-6. eNB 侧无独立 SR Manager，SR 退化为 `sr_pending` 标志。
-7. RA（随机接入）未在 MAC 层实现；SR 失败回调仅作日志占位（见 `ue_sr_manager.cpp` /
+1. PHICH 用 `phich_channel` 独立信道模拟（含 4-TTI 传播时延），方向正确但未建模真实物理层编码。
+2. **信道传播时延已建模**：SR/Grant/PDU/PHICH 四信道各带 `CHANNEL_PROPAGATION_TTI = 4` 的可见时延，
+   对端需 `send_tti + 4` 才能读取（见 `include/ul_mac/tti_channel.h`）。数值取 4 为演示常量，
+   与真实 LTE 时序（DCI 0 → n+4 PUSCH → n+8 PHICH）方向一致但非精确值。
+3. 多线程架构：每 UE 一个 `std::thread` + 一个 eNB 线程 + 中央 `tti_clock` 线程；UE 线程独占
+   `ue_context`，eNB 线程独占 `scheduler/enb_bsr/enb_harq`，四信道 `timed_channel<T>` 做时间解耦，
+   `std::async` 并行 `receive_tb`，manager 内部 mutex 作额外保护。
+4. `MAX_HARQ_PROCESSES = 8` 为 LTE 4G 上行固定值（见 `common_types.h`，已按 LTE 规范取值）。
+5. TBS 用线性插值近似，非 3GPP 离散查表。
+6. 重传锁定 MCS/PRB（非自适应），未实现 eNB 自适应重传。
+7. eNB 侧无独立 SR Manager，SR 退化为 `sr_pending` 标志（经 `sr_channel` 上报）。
+8. RA（随机接入）未在 MAC 层实现；SR 失败回调仅作日志占位（见 `ue_sr_manager.cpp` /
    `ue_context.h` 注释）。
 ```

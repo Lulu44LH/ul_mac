@@ -19,6 +19,7 @@ ul_harq_process::ul_harq_process(uint32_t pid)
     , current_irv_(0)
     , harq_feedback_(false)
     , is_grant_configured_(false)
+    , feedback_received_(false)
     , cur_ndi_(false)
     , cur_tbs_(0)
     , cur_rv_(-1)
@@ -26,8 +27,25 @@ ul_harq_process::ul_harq_process(uint32_t pid)
     , rtt_ttis_(8)
     , feedback_pending_(false)
     , consecutive_nack_(0)
-    , early_termination_enabled_(true)
+    // 早期终止默认关闭: 非标准机制且无 RLC 兜底, 提前丢弃即数据丢失 (见头文件说明)
+    , early_termination_enabled_(false)
 {
+}
+
+void ul_harq_process::apply_phich_feedback(bool ack) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // 守卫: 仅当当前 TB 在途且尚未收到反馈时应用。
+    //  - 进程空闲 (无 grant 或已 ACK 释放): 迟到的重复反馈直接忽略;
+    //  - 已收到过反馈: 同一 TB 的重复 NACK 不再改状态 (重传由 eNB 授权驱动)。
+    if (!is_grant_configured_ || harq_feedback_ || feedback_received_) return;
+    harq_feedback_ = ack;
+    feedback_received_ = true;
+    // ACK: harq_feedback_=true -> get_state()/fill_process_info 呈现 INACTIVE,
+    //      进程视为释放 (计数等字段由下一次新传 generate_new_tx 重置);
+    //      NACK: feedback_received_=true 且 harq_feedback_=false -> RETX_PENDING。
+    LOG_DEBUG("HARQ", 0, tx_tti_,
+        "PID=" + std::to_string(pid_) + ": PHICH " +
+        std::string(ack ? "ACK -> process released" : "NACK -> retx pending"));
 }
 
 void ul_harq_process::reset() {
@@ -40,6 +58,7 @@ void ul_harq_process::reset_unlocked() {
     current_irv_ = 0;
     is_grant_configured_ = false;
     harq_feedback_ = false;
+    feedback_received_ = false;
     cur_tbs_ = 0;
     cur_rv_ = -1;
     cur_ndi_ = false;
@@ -63,8 +82,9 @@ uint32_t ul_harq_process::get_rv() const {
 harq_state ul_harq_process::get_state() const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!is_grant_configured_) return harq_state::INACTIVE;
-    if (harq_feedback_) return harq_state::INACTIVE;
-    if (current_tx_nb_ > 0) return harq_state::RETX_PENDING;
+    if (harq_feedback_) return harq_state::INACTIVE;       // ACK -> 进程释放
+    if (feedback_received_) return harq_state::RETX_PENDING; // NACK 已收到 -> 等重传授权
+    // TB 已发送但尚未收到任何 PHICH 反馈 -> 等待中
     return harq_state::WAITING_FB;
 }
 
@@ -74,12 +94,15 @@ void ul_harq_process::fill_process_info(harq_process_info& info) const {
     //   2. cur_tbs_ 等非原子成员的数据竞争
     std::lock_guard<std::mutex> lock(mutex_);
     info.pid = pid_;
-    // 在锁内一次性读取所有状态
+    // 状态推导 (与 get_state 同源, 保持一致):
+    //   INACTIVE: 无 grant 或已 ACK 释放
+    //   WAITING_FB: TB 已发送, 尚未收到任何 PHICH 反馈
+    //   RETX_PENDING: 明确收到 PHICH NACK, 等待 eNB 重传授权
     if (!is_grant_configured_) {
         info.state = harq_state::INACTIVE;
     } else if (harq_feedback_) {
         info.state = harq_state::INACTIVE;
-    } else if (current_tx_nb_ > 0) {
+    } else if (feedback_received_) {
         info.state = harq_state::RETX_PENDING;
     } else {
         info.state = harq_state::WAITING_FB;
@@ -88,6 +111,14 @@ void ul_harq_process::fill_process_info(harq_process_info& info) const {
     info.is_grant_configured = is_grant_configured_;
     info.last_tbs = cur_tbs_;
     info.current_irv = current_irv_;
+    // 【last_feedback 语义】
+    //   feedback_received_=true + harq_feedback_=true -> ACK (已收到)
+    //   feedback_received_=true + harq_feedback_=false -> NACK (已收到)
+    //   feedback_received_=false + harq_feedback_=false -> NACK (尚未收到,
+    //     兼容 test_harq_rtt_delay 的断言: "反馈未处理时 last_feedback 仍为 NACK")
+    //   注意: harq_feedback_ 默认 false 且不区分"未收到"与"NACK",
+    //     但 feedback_received_ 帮助区分两种情况; 外部对 last_feedback 的
+    //     观察: WAITING_FB -> NACK, RETX_PENDING -> NACK, INACTIVE -> ACK
     info.last_feedback = harq_feedback_ ? harq_feedback::ACK : harq_feedback::NACK;
 }
 
@@ -147,13 +178,15 @@ ul_harq_process::tx_action ul_harq_process::new_grant_ul(
             } else {
                 harq_feedback_ = grant.hi_value;
             }
+            feedback_received_ = true;  // 标记: 已收到反馈 (区分"NACK"与"尚未收到")
 
             // 【增强/非标准】早期终止: 基于连续NACK统计提前终止重传
             // 【协议澄清】3GPP 标准 HARQ 重传上限由 RRC maxHARQ-Tx 决定, 并无
             // "连续NACK提前丢弃"机制 (无损投递保证由 RLC 重传兜底)。本逻辑是
             // 本项目额外资源优化: 当连续收到3次NACK且已重传至少2次时, 认为该
             // TB 在当前信道条件下难以成功解码, 提前丢弃以节省无线资源。
-            // 开关 early_termination_enabled_ 默认启用, 可通过 set_early_termination_enabled() 关闭
+            // 开关 early_termination_enabled_ 默认关闭 (无 RLC 兜底时提前丢 TB
+            // 会静默丢数据), 需演示资源优化时通过 set_early_termination_enabled(true) 开启
             if (early_termination_enabled_ && current_tx_nb_ >= 2
                 && consecutive_nack_ >= 3) {
                 LOG_WARN("HARQ", 0, grant.tti_tx,
@@ -163,6 +196,7 @@ ul_harq_process::tx_action ul_harq_process::new_grant_ul(
                 tx_action action;
                 action.is_discarded = true;
                 action.tx_nb = current_tx_nb_;
+                action.tbs = cur_tbs_;  // 携带 TB 大小, 供数据回滚
                 // 注意: 此处已持有 mutex_, 必须用不加锁版本
                 reset_unlocked();
                 return action;
@@ -177,6 +211,7 @@ ul_harq_process::tx_action ul_harq_process::new_grant_ul(
                 tx_action action;
                 action.is_discarded = true;
                 action.tx_nb = current_tx_nb_;
+                action.tbs = cur_tbs_;  // 携带 TB 大小, 供数据回滚
                 // 注意: 此处已持有 mutex_, 必须用不加锁版本
                 // (早期版本调用 reset() 导致同锁重入自死锁, 见 LEARNING_PATH.md 附录 D)
                 reset_unlocked();
@@ -208,7 +243,10 @@ ul_harq_process::tx_action ul_harq_process::new_grant_ul(
             return action;
         }
     } else if (is_grant_configured_) {
-        if (!harq_feedback_) {
+        // 非自适应重传: 仅在明确收到 NACK 后才重传
+        // (feedback_received_=false 表示尚未收到任何反馈, 进程仍 WAITING_FB,
+        //  不应触发重传; 真实协议中非自适应重传由 PHICH NACK 直接触发)
+        if (feedback_received_ && !harq_feedback_) {
             action = generate_retx(grant);
             action.is_retx = true;
         }
@@ -223,6 +261,7 @@ ul_harq_process::tx_action ul_harq_process::generate_new_tx(
     cur_tbs_ = grant.tbs;
     cur_rv_ = grant.rv;
     harq_feedback_ = false;
+    feedback_received_ = false;  // 新 TB: 尚未收到任何 PHICH 反馈
     is_grant_configured_ = true;
     current_tx_nb_ = 0;
     current_irv_ = 0;
@@ -251,6 +290,7 @@ ul_harq_process::tx_action ul_harq_process::generate_retx(const ul_grant& grant)
         cur_tbs_ = grant.tbs;
         cur_rv_ = grant.rv;
         harq_feedback_ = false;
+        feedback_received_ = false;  // 重传后等待新的 PHICH 反馈
 
         LOG_INFO("HARQ", 0, grant.tti_tx,
             "PID=" + std::to_string(pid_) +
@@ -321,8 +361,16 @@ ul_harq_process::tx_action ul_harq_manager::new_grant_ul(
         return ul_harq_process::tx_action();
     }
 
+    // 【线程安全】harq_cfg_ 由 init/set_config 在 mutex_ 下写入,
+    // 此处锁内取快照再交给进程处理, 避免无锁读竞态
+    ul_harq_config cfg_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cfg_snapshot = harq_cfg_;
+    }
+
     ul_harq_process::tx_action action =
-        processes_[grant.pid].new_grant_ul(grant, harq_cfg_, is_temp_rnti);
+        processes_[grant.pid].new_grant_ul(grant, cfg_snapshot, is_temp_rnti);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -355,20 +403,15 @@ void ul_harq_manager::handle_harq_feedback(uint32_t pid, harq_feedback feedback)
     if (pid >= MAX_HARQ_PROCESSES) return;
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (feedback == harq_feedback::ACK) {
-        stats_.total_ack++;
-        LOG_DEBUG("HARQ", rnti_, 0,
-            "PID=" + std::to_string(pid) + ": ACK received");
-    } else if (feedback == harq_feedback::NACK) {
-        stats_.total_nack++;
-        LOG_DEBUG("HARQ", rnti_, 0,
-            "PID=" + std::to_string(pid) + ": NACK received, retx pending");
-    }
-
-    // 【增强】更新进程级反馈统计, 用于早期终止判断
-    // 仅ACK/NACK参与统计, NONE不影响连续NACK计数
-    // (manager->process 锁序与 fill_process_info/reset 一致, 无死锁风险)
+    // 【PHICH 反馈落地】通过 process 的 apply_phich_feedback() 应用反馈:
+    //   ACK -> harq_feedback_=true, 进程在 get_state()/fill_process_info 呈现 INACTIVE,
+    //        下一次 has_pending_transmission() 查询时视为 grant 已释放 -> 不再抑制 SR;
+    //   NACK -> harq_feedback_=false, feedback_received_=true, 呈现 RETX_PENDING,
+    //        仍视为 grant 在途 -> SR 继续抑制。
+    //   这解决了"ACK 后进程永不释放 -> has_pending_transmission() 永真 -> SR 被永久
+    //   抑制"的问题 (场景2 1000TTI 仅发5次 SR 的根因)。
     if (feedback == harq_feedback::ACK || feedback == harq_feedback::NACK) {
+        processes_[pid].apply_phich_feedback(feedback == harq_feedback::ACK);
         processes_[pid].update_feedback_stats(feedback == harq_feedback::ACK);
     }
 
@@ -431,6 +474,21 @@ uint32_t ul_harq_manager::get_idle_process_id() const {
         if (tx_nb < min_tx) { min_tx = tx_nb; min_pid = i; }
     }
     return min_pid;
+}
+
+bool ul_harq_manager::has_pending_transmission() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (uint32_t i = 0; i < MAX_HARQ_PROCESSES; i++) {
+        harq_process_info info;
+        processes_[i].fill_process_info(info);
+        // WAITING_FB: 已发送, 等待PHICH反馈; RETX_PENDING: 收到NACK待重传
+        // 两者均表示 grant 仍在途, UL 授权仍有效 (不应触发 SR)
+        if (info.state == harq_state::WAITING_FB ||
+            info.state == harq_state::RETX_PENDING) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ul_harq_manager::set_early_termination_enabled(bool enable) {

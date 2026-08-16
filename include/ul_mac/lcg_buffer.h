@@ -98,8 +98,27 @@ public:
         return total;
     }
 
-    /// 更新旧缓冲区状态 (将new_buffer复制到old_buffer)
-    /// 对应 srsRAN proc_bsr.cc 中的 update_old_buffer()
+    /// 待发数据上界: 各逻辑信道 max(old_buffer, new_buffer) 之和
+    /// 用途: TS 36.321 §5.4.5 "UL 授权可容纳全部待发数据 -> 取消所有已触发 BSR"
+    /// 的判定。若只用 old 快照, 在新数据刚到达(尚未快照)时会低估待发量,
+    /// 导致误取消 BSR 触发(需等下一轮 retxBSR-Timer 才能补救)。
+    uint32_t get_total_buffer_state_upper_bound() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < NOF_LCGS; i++) {
+            for (const auto& [lcid, state] : lcgs_[i]) {
+                total += std::max(state.old_buffer, state.new_buffer);
+            }
+        }
+        return total;
+    }
+
+    /// 更新旧缓冲区快照 (将new_buffer复制到old_buffer)
+    /// 【实现原理 / 源自 srsRAN, 非3GPP协议原文】
+    /// 每个 TTI 结束时调用, 把当前 new_buffer 拷为 old_buffer, 作为"上次视角"基准。
+    /// 下一 TTI 通过对比 old 与 new 即可推断协议"数据刚刚到达(空→非空)"事件,
+    /// 用于触发 Regular BSR。3GPP 协议本身不规定新旧缓冲快照对比, 该思路来自
+    /// srsRAN proc_bsr.cc 的工程实现, 功能上等价于协议语义。
     void update_old_buffer() {
         std::lock_guard<std::mutex> lock(mutex_);
         for (uint32_t i = 0; i < NOF_LCGS; i++) {
@@ -110,8 +129,10 @@ public:
     }
 
     /// 检查是否有新数据到达 (LCG之前无数据, 现在有新数据)
+    /// 【实现原理 / 源自 srsRAN, 非3GPP协议原文】
+    /// 通过 old==0 且 new>0 推断协议"数据刚刚到达(空→非空)"事件, 用于触发
+    /// Regular BSR 条件①。3GPP 协议依赖 RLC 缓冲状态变化事件判定, 不规定此快照对比。
     /// 对应 srsRAN proc_bsr.cc 中的 check_new_data()
-    /// 这是触发Regular BSR的条件之一
     bool check_new_data() const {
         std::lock_guard<std::mutex> lock(mutex_);
         for (uint32_t i = 0; i < NOF_LCGS; i++) {
@@ -127,8 +148,11 @@ public:
     }
 
     /// 检查是否有高优先级通道的新数据到达
+    /// 【实现原理 / 源自 srsRAN, 非3GPP协议原文】
+    /// 通过 new>old 推断"有数据量增长", 并结合优先级比较推断协议"有更高优先级
+    /// 数据到达"事件, 用于触发 Regular BSR 条件②。判定依据的 old/new 快照对比
+    /// 来自 srsRAN proc_bsr.cc, 非 3GPP 协议条文。
     /// 对应 srsRAN proc_bsr.cc 中的 check_highest_channel()
-    /// 这是触发Regular BSR的条件之一
     bool check_highest_priority_channel() const {
         std::lock_guard<std::mutex> lock(mutex_);
         for (uint32_t i = 0; i < NOF_LCGS; i++) {
@@ -231,6 +255,28 @@ public:
             uint32_t taken = std::min(remaining, ch->new_buffer);
             ch->new_buffer -= taken;
             remaining      -= taken;
+        }
+    }
+
+    /// 把数据放回缓冲区 (模拟 RLC 重递交)
+    /// 【协议说明 / 简化实现】真实系统中 HARQ 丢弃 TB 后由 RLC ARQ 重递交,
+    /// 数据回到原逻辑信道。本项目无 RLC, 且未记录 TB 内字节来自哪些 LC,
+    /// 此处简化为全部放回**最高优先级**的逻辑信道 (调度上等价于新数据到达,
+    /// 会重新触发 Regular BSR)。无已配置逻辑信道时静默丢弃 (调用方保证不发生)。
+    /// @param bytes 被丢弃 TB 携带的字节数
+    void restore_data(uint32_t bytes) {
+        if (bytes == 0) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        lc_buffer_state* best = nullptr;
+        for (uint32_t i = 0; i < NOF_LCGS; i++) {
+            for (auto& [lcid, state] : lcgs_[i]) {
+                if (best == nullptr || state.priority < best->priority) {
+                    best = &state;
+                }
+            }
+        }
+        if (best != nullptr) {
+            best->new_buffer += bytes;
         }
     }
 
