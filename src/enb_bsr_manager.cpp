@@ -59,7 +59,9 @@ bool enb_bsr_manager::receive_bsr(uint16_t rnti, const bsr_ce& bsr) {
         view[r.lcg_id] = bsr_index_to_bytes(r.buffer_size);
     }
 
-    // 更新统计
+    // 更新统计 (eNB 侧接收/解码统计; 全局 metrics_collector 的 bsr_tx 仅由
+    // UE 发送侧计入, 此处不再重复累加 —— 否则最终汇总的"BSR发送次数"为
+    // UE 发送数 + eNB 解码数的双重计数)
     ent.stats.total_bsr_rx++;
     total_stats_.total_bsr_rx++;
     switch (bsr.format) {
@@ -76,7 +78,6 @@ bool enb_bsr_manager::receive_bsr(uint16_t rnti, const bsr_ce& bsr) {
             total_stats_.long_count++;
             break;
     }
-    metrics_collector::instance().record_bsr_tx(bsr.format);
 
     LOG_DEBUG("ENB_BSR", rnti, 0,
         "decoded " + bsr_format_to_string(bsr.format) +

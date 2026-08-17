@@ -837,10 +837,11 @@ tbs = calculate_tbs(mcs, n_prb);  // 锚点插值 × n_prb / 8
 
 #### 5.3 PF / EPF 调度算法（schedule_pf / schedule_epf）
 
-**PF（schedule_pf，第 137 行）三阶段**：
+**PF（schedule_pf，第 419 行）三阶段**：
 
 ```
 阶段1: 重传优先 —— 遍历所有UE, 对任一HARQ进程pending_retx[pid]置位的先分配 (位图, 支持多进程并行重传)
+        每UE取到一条重传授权即跳出进程循环 (LTE 每 UE 每子帧至多一条 DCI0 grant)
 阶段2: 计算PF度量 —— 对有数据/有SR的UE:
         // P1 改进: 分子改用"信道可支持速率封顶后的需求"
         mcs = cqi>0 ? calculate_mcs_from_cqi(cqi) : calculate_mcs(ul_snr)
@@ -857,31 +858,36 @@ tbs = calculate_tbs(mcs, n_prb);  // 锚点插值 × n_prb / 8
         alpha = 1/(n+1);  avg = (1-alpha)*avg + alpha*tbs
 ```
 
+> **一UE一授权约束**：三种算法（PF/RR/EPF）的重传阶段之后都维护 `std::set<uint16_t> granted` 集合，新传阶段跳过本 TTI 已获（重传）授权的 UE —— LTE 中一个 UE 每子帧至多收到一条 UL grant（一条 DCI0），否则同 UE 同 TTI 双授权会双倍挤占 PRB 池。
+
 **PF 公式的直觉**：分子是"你现在能跑多快"，分母是"你历史上已经吃了多少"。吃得多的 UE 分母大 → 度量值低 → 让位给吃得少的。这样信道好的 UE 多拿资源（效率），但饿着的 UE 度量值会逐渐升高最终被调度（公平）——**效率与公平的平衡**就体现在这个除法里。
 
-**EPF（schedule_epf，华为增强型比例公平）**：在 PF 基础上叠加 QoS 权重与信道感知增强项，度量公式：
+**EPF（schedule_epf，第 621 行）**：在 PF 基础上叠加 QoS 权重与信道感知增强项，度量公式：
 
 ```
 metric = w_qos * (R_instant / R_avg^alpha) * (1 + beta * cqi_norm)
-  - R_instant    : 当前TTI按CQI/SNR可支持的瞬时速率 (PRB * tbs_per_rb[cqi])
+  - R_instant    : 当前TTI按CQI/SNR可支持的瞬时速率, 并与待发量取小
+                   (min(achieveable, total_ul_buffer), 需求封顶 —— 与PF的
+                   demand_capped 一致, 避免小缓冲UE与满速率度量空转竞争)
   - R_avg        : 长期平均吞吐 (复用 ul_avg_rate, 指数滑动平均)
   - alpha        : 公平性因子 (EPF参数, 越大越偏向长期公平; 经典PF取1.0)
   - beta         : 信道感知因子 (EPF参数, >0 时好信道用户额外加权)
   - w_qos        : 业务QoS权重 (VoIP=3.0 > Video=2.0 > BE=1.0, 全局缩放gamma)
   - cqi_norm     : 归一化信道质量 CQI/CQI_MAX ∈ [0,1]
-  - 饿死保护     : tti_since_sched > starve_tti 时 metric ×10 放大; 并强制为
-                   长期未调度UE保留 min_prb_ratio 比例的PRB底, 避免弱信道用户饿死
+  - 饿死保护     : tti_since_sched > starve_tti 时 metric ×10 放大; 并按需求
+                   为长期未调度UE分配不超过 min_prb_ratio 份额的PRB底
+                   (保底PRB按实际待发量封顶, 小缓冲UE不浪费PRB)
 ```
 
-EPF 调度四阶段：**重传优先 → 饿死保底分配(min_prb) → EPF 度量排序新传 → 每 TTI 推进饿死计时器**。三类差异：PF 只看"瞬时/平均速率"，EPF 额外感知业务优先级（QoS）与信道质量（cqi_norm），且内置饿死保护兜底。所有 EPF 参数通过 `configure_epf(epf_params)` 可配（详见 PROTOCOL_NOTES.md §7.1、docs/MAIN_FLOW.md 场景5）。
+EPF 调度四阶段：**重传优先 → 饿死保底分配(min_prb) → EPF 度量排序新传 → 每 TTI 推进饿死计时器**（重传授权同样重置 `tti_since_sched`，持续重传的 UE 不会被误判濒临饿死）。三阶段共用 `granted` 集合保证每 UE 每 TTI 至多一条授权。三类差异：PF 只看"瞬时/平均速率"，EPF 额外感知业务优先级（QoS）与信道质量（cqi_norm），且内置饿死保护兜底。所有 EPF 参数通过 `configure_epf(epf_params)` 可配（详见 PROTOCOL_NOTES.md §7.1、docs/MAIN_FLOW.md 场景5）。
 
 > **已移除**：原"基于缓冲区大小的优先级调度"（`schedule_priority`，按 `total_ul_buffer` 降序）已删除——仅按缓冲区排序在真实系统中不可行：不感知信道质量（弱信道 UE 会被高吞吐 UE 长期挤占而饿死），且无业务区分度。其吞吐优先目标可由 EPF（高 `alpha` 趋向公平 / 低 `alpha` 趋向吞吐）参数化替代。
 
 对比另外两种算法（同一文件，结构高度相似，读起来很快）：
-- **RR**（schedule_rr）：不排序，按 map 顺序轮流，绝对公平但不看信道
+- **RR**（schedule_rr）：不排序，以 `rr_offset_`（每 TTI +1）为轮转起点遍历 UE，保证遍历优先级随时间均等轮换（固定从 map 头部遍历会让低 RNTI 恒先拿 PRB），绝对公平但不看信道
 - **EPF**（schedule_epf）：PF 度量 × QoS 权重 × 信道感知项，兼顾业务优先级与弱用户公平
 
-#### 5.4 排序 + lambda 比较器（第 173 行）
+#### 5.4 排序 + lambda 比较器（第 448 行）
 
 ```cpp
 std::sort(queue.begin(), queue.end(),

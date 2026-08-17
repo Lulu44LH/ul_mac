@@ -63,27 +63,39 @@ public:
 
     /// 更新逻辑通道的缓冲区大小 (模拟RLC层缓冲区状态查询)
     /// 对应 srsRAN proc_bsr.cc 中的 update_new_data() 方法
+    ///
+    /// 【绝对缓冲区语义】
+    /// new_buffer 表示 RLC 上报的**绝对缓冲区大小**——即该逻辑通道当前总共积攒的
+    /// 待发字节数。因此新到达的数据量应**累加**到 new_buffer 上, 而非覆盖;
+    /// 发送(MAC PDU 组装取走数据)时通过 consume_data() 扣减 new_buffer。
+    /// old_buffer 则是"上个 TTI 开始时"的快照(由 update_old_buffer() 在 TTI 起始、
+    /// 数据到来前拷贝得到), 仅用于对比 new 推断"新数据/更高优先级数据到达"事件。
+    ///
     /// @param lcid 逻辑通道ID
-    /// @param bytes 当前缓冲区字节数
+    /// @param bytes 本次新到达的字节数 (累加, 非覆盖)
     void update_buffer_state(uint32_t lcid, uint32_t bytes) {
         std::lock_guard<std::mutex> lock(mutex_);
         for (uint32_t i = 0; i < NOF_LCGS; i++) {
             auto it = lcgs_[i].find(lcid);
             if (it != lcgs_[i].end()) {
-                it->second.new_buffer = bytes;
+                it->second.new_buffer += bytes;
                 return;
             }
         }
     }
 
-    /// 获取指定LCG的缓冲区大小 (使用old_buffer, 对应已上报的状态)
+    /// 获取指定LCG的缓冲区大小 (使用 new_buffer, 即 RLC 绝对缓冲区)
     /// 对应 srsRAN proc_bsr.cc 中的 get_buffer_state_lcg()
+    /// 所有 BSR 上报与 UL 调度均基于绝对缓冲区 new_buffer: 数据到达时累加到 new,
+    /// 发送(PDU 组装)时通过 consume_data() 从 new 扣减, 故上报量直接取 new 的实时值,
+    /// 而非 old 快照。old_buffer 仅用于"数据到来前"的一次性快照, 供 new/old 对比触发
+    /// Regular BSR, 不参与 BSR 上报量计算。
     uint32_t get_buffer_state_lcg(uint32_t lcg_id) const {
         std::lock_guard<std::mutex> lock(mutex_);
         if (lcg_id >= NOF_LCGS) return 0;
         uint32_t total = 0;
         for (const auto& [lcid, state] : lcgs_[lcg_id]) {
-            total += state.old_buffer;
+            total += state.new_buffer;
         }
         return total;
     }
@@ -115,8 +127,9 @@ public:
 
     /// 更新旧缓冲区快照 (将new_buffer复制到old_buffer)
     /// 【实现原理 / 源自 srsRAN, 非3GPP协议原文】
-    /// 每个 TTI 结束时调用, 把当前 new_buffer 拷为 old_buffer, 作为"上次视角"基准。
-    /// 下一 TTI 通过对比 old 与 new 即可推断协议"数据刚刚到达(空→非空)"事件,
+    /// 每个 TTI 开始、数据到来**之前**调用, 把当前 new_buffer 拷为 old_buffer,
+    /// 作为"上个 TTI 视角"的基准。随后数据到来时 new_buffer 会累加增长, 通过对比
+    /// old 与 new 即可推断协议"数据刚刚到达(空→非空)"或"更高优先级数据到达"事件,
     /// 用于触发 Regular BSR。3GPP 协议本身不规定新旧缓冲快照对比, 该思路来自
     /// srsRAN proc_bsr.cc 的工程实现, 功能上等价于协议语义。
     void update_old_buffer() {
@@ -173,7 +186,7 @@ public:
         return false;
     }
 
-    /// 检查任意通道是否有数据待发送
+    /// 检查任意通道是否有数据待发送 (基于 new_buffer 绝对缓冲区)
     /// 对应 srsRAN proc_bsr.cc 中的 check_any_channel()
     bool check_any_channel_has_data() const {
         for (uint32_t i = 0; i < NOF_LCGS; i++) {
@@ -194,7 +207,7 @@ public:
 
         for (uint32_t i = 0; i < NOF_LCGS; i++) {
             for (const auto& [lcid, state] : lcgs_[i]) {
-                if (state.old_buffer > 0 && state.priority < best_priority) {
+                if (state.new_buffer > 0 && state.priority < best_priority) {
                     best_priority = state.priority;
                     best_lcg = i;
                 }

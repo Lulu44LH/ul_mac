@@ -171,15 +171,9 @@ void bsr_manager::step(uint32_t tti) {
         set_trigger(bsr_trigger_type::REGULAR);
     }
 
-    // 4. 更新缓冲区快照 (将new_buffer复制到old_buffer)
-    // 【实现原理 / 源自 srsRAN, 非3GPP协议原文】
-    // 在每个 TTI 结束时把当前 new_buffer 拷到 old_buffer, 等价于"打一次快照"。
-    // 下一 TTI 新数据到达后, 通过对比 old(快照) 与 new(当前) 即可推断协议要求的
-    // "数据刚刚到达(空→非空)"事件, 从而触发 Regular BSR。
-    // 注意: old/new 快照机制是 srsRAN proc_bsr.cc 的工程做法; 3GPP 协议本身不规定
-    // 这种新旧缓冲对比, 而是依赖 RLC 缓冲状态变化事件。本实现功能上等价于协议语义。
-    // 对应 srsRAN proc_bsr.cc step() 中的 update_old_buffer()
-    buffer_mgr_.update_old_buffer();
+    // 4. 本 TTI 的 old_buffer 快照已由 ue_context::begin_tti_snapshot() 在数据到达前
+    //    统一完成一次, 此处不再更新 old; 整个 TTI 仅数据到来累加 new_buffer、
+    //    发送扣减 new_buffer, 通过 old vs new 对比触发 Regular BSR。
 }
 
 bsr_format bsr_manager::select_bsr_format(uint32_t pdu_space,

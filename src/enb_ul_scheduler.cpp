@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <numeric>
+#include <set>
 
 namespace ul_mac {
 
@@ -259,6 +260,15 @@ void ul_scheduler::schedule_retx_first_unlocked(std::vector<ul_sched_result>& re
                 LOG_INFO("SCHED", rnti, tti,
                     std::string(algo_name) + " RETX: PID=" + std::to_string(res.grant.pid) +
                     ", TBS=" + std::to_string(res.grant.tbs) + "B");
+                // 【每 UE 每 TTI 至多一条授权】LTE 中一个 UE 每子帧至多收到一条
+                // UL grant (一条 DCI0); 多个 NACK 进程应跨 TTI 轮流重传,
+                // 故本 UE 拿到一条重传授权后即跳出进程循环。
+                // 【饿死计时重置】重传同样占用该 UE 的 PRB 资源, 它并非"未被调度";
+                // EPF 的 tti_since_sched 在持续重传期间累积会导致弱信道 UE 被误判
+                // 濒临饿死, 保底授权与重传同 TTI 叠加、双重挤占 PRB (PF/RR 不读
+                // 此字段, 重置对它们无影响)。
+                ctx.tti_since_sched = 0;
+                break;
             }
             // tbs==0: 本TTI无连续PRB可用 (暂时性), 保留 pending_retx 下TTI再试
         }
@@ -415,6 +425,10 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_pf(uint32_t tt
     // 阶段1: 重传优先 (公共函数, 原三处重复逻辑已抽取)
     schedule_retx_first_unlocked(results, tti, "PF");
 
+    // 本 TTI 已获 (重传) 授权的 UE: 新传阶段跳过 (LTE 每 UE 每子帧至多一条 grant)
+    std::set<uint16_t> granted;
+    for (const auto& r : results) granted.insert(r.rnti);
+
     // 阶段2: 计算PF度量值
     struct ue_pf { uint16_t rnti; double metric; };
     std::vector<ue_pf> queue;
@@ -436,6 +450,7 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_pf(uint32_t tt
 
     // 阶段3: 按PF顺序分配
     for (const auto& e : queue) {
+        if (granted.count(e.rnti)) continue;   // 本 TTI 已有重传授权
         auto& ctx = ue_db_[e.rnti];
         int32_t pid = alloc_free_pid_unlocked(ctx);
         if (pid < 0) continue; // 该UE所有HARQ进程都在忙, 跳过
@@ -463,10 +478,14 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_rr(uint32_t tt
     std::lock_guard<std::mutex> lock(mutex_);
     prb_reset_unlocked();
 
-    // 重传优先 (公共函数, 原三处重复逻辑已抽取)
+    // 阶段1: 重传优先 (公共函数, 原三处重复逻辑已抽取)
     schedule_retx_first_unlocked(results, tti, "RR");
 
-    // 轮询新传: 真正的 RR 需每 TTI 轮转起点。ue_db_ 为 std::map (按 RNTI
+    // 本 TTI 已获 (重传) 授权的 UE: 新传阶段跳过 (LTE 每 UE 每子帧至多一条 grant)
+    std::set<uint16_t> granted;
+    for (const auto& r : results) granted.insert(r.rnti);
+
+    // 阶段2: 轮询新传 — 真正的 RR 需每 TTI 轮转起点。ue_db_ 为 std::map (按 RNTI
     // 升序), 若每 TTI 都从头部遍历, 低 RNTI 恒先获得 PRB, 高 RNTI 在 PRB
     // 紧张时会被持续饿死 —— 名不副实的"轮询"。此处以 rr_offset_ 作轮转
     // 起点 (每 TTI +1), 保证各 UE 的遍历优先级随时间均等轮换。
@@ -478,6 +497,7 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_rr(uint32_t tt
         size_t start = static_cast<size_t>(rr_offset_ % n);
         for (size_t k = 0; k < n; ++k) {
             uint16_t rnti = order[(start + k) % n];
+            if (granted.count(rnti)) continue;   // 本 TTI 已有重传授权
             auto& ctx = ue_db_[rnti];
             if (ctx.total_ul_buffer == 0 && !ctx.sr_pending) continue;
             int32_t pid = alloc_free_pid_unlocked(ctx);
@@ -539,10 +559,17 @@ std::optional<ue_sched_context> ul_scheduler::get_ue_context(uint16_t rnti) cons
 // ---------------------------------------------------------------------------
 
 double ul_scheduler::compute_epf_metric(const ue_sched_context& ctx, uint32_t /*tti*/) const {
-    // R_instant: 当前 TTI 按 CQI/SNR 可支持的瞬时速率 (以 total_prb 计)
+    // R_instant: 当前 TTI 按 CQI/SNR 可支持的瞬时速率 (以 total_prb 计),
+    // 并与实际待发量取小 (需求封顶, 与 schedule_pf 的 demand_capped 一致)。
+    // 【修复】原实现未封顶, 小缓冲 UE (如 VoIP 100B) 与大缓冲 UE (视频 800B+)
+    // 以相同满 PRB 速率参与度量竞争, 调度份额只由 QoS 权重与信道项决定,
+    // 与业务量完全脱钩 —— 度量高的 UE 被反复授权但每次只传极少数据,
+    // 造成大量小 TBS 空转授权 (观测: 平均 170B/授权)。封顶后度量与
+    // "实际可发送的量"成正比, 份额回归业务量 (仍保留 QoS 权重倾斜)。
     uint8_t mcs = (ctx.cqi > 0) ? calculate_mcs_from_cqi(ctx.cqi)
                                 : calculate_mcs(ctx.ul_snr);
     double r_inst = static_cast<double>(calculate_tbs(mcs, total_prb_));
+    r_inst = std::min(r_inst, static_cast<double>(ctx.total_ul_buffer));
 
     // R_avg: 长期平均吞吐 (指数滑动平均), 为 0 时用极小值避免除零 (新用户优先)
     double r_avg = ctx.ul_avg_rate;
@@ -566,6 +593,8 @@ double ul_scheduler::compute_epf_metric(const ue_sched_context& ctx, uint32_t /*
     double metric = w_qos * pf_term * (1.0 + epf_.beta * cqi_norm);
 
     // 饿死保护: 距上次调度过久 -> 度量放大, 保证最低调度机会
+    // (注意: 持续重传的 UE 已在 schedule_retx_first 中重置 tti_since_sched,
+    //  不会被误判濒临饿死; 此处针对的是真正长期未获新传机会的 UE)
     if (ctx.tti_since_sched > epf_.starve_tti) {
         metric *= 10.0;
     }
@@ -603,12 +632,19 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
     // 阶段1: 重传优先 (公共函数, 原三处重复逻辑已抽取)
     schedule_retx_first_unlocked(results, tti, "EPF");
 
+    // 【每 UE 每 TTI 至多一条授权】LTE 中一个 UE 每子帧至多收到一条 UL grant
+    // (一条 DCI0)。本集合记录本 TTI 已获授权 (重传/保底/新传) 的 UE,
+    // 后续阶段一律跳过 —— 修复原实现中"阶段3 保底 + 阶段4 新传"可对同一 UE
+    // 同 TTI 重复授权、双倍消耗 PRB 的缺陷。
+    std::set<uint16_t> granted;
+    for (const auto& r : results) granted.insert(r.rnti);
+
     // 阶段2: 计算 EPF 度量并排序
     struct ue_epf { uint16_t rnti; double metric; };
     std::vector<ue_epf> queue;
     for (auto& [rnti, ctx] : ue_db_) {
         if (ctx.total_ul_buffer == 0 && !ctx.sr_pending) continue;
-        // 需求封顶: 仅以"实际待发量"参与速率比较, 避免空转调度
+        // 度量内部已按"实际待发量"封顶 R_instant (与 PF 一致), 避免空转调度
         double m = compute_epf_metric(ctx, tti);
         queue.push_back({rnti, m});
     }
@@ -623,18 +659,25 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
     uint32_t min_prb_total = static_cast<uint32_t>(
         std::ceil(epf_.min_prb_ratio * static_cast<double>(total_prb_)));
     for (const auto& e : queue) {
+        if (granted.count(e.rnti)) continue;   // 本 TTI 已有 (重传) 授权
         auto& ctx = ue_db_[e.rnti];
         bool starving = ctx.tti_since_sched > epf_.starve_tti;
         if (!starving) continue;
         int32_t pid = alloc_free_pid_unlocked(ctx);
         if (pid < 0) continue;
-        // 保底仅给最小份额 (至少 1 PRB), 剩余资源仍由 EPF 排序竞争
-        uint32_t n = std::min<uint32_t>(min_prb_total, total_prb_);
-        n = std::max<uint32_t>(n, 1u);
-        // 临时限制分配: 通过请求字节数反推 (复用 generate_ul_grant 的 PRB 反推逻辑)
-        // 这里直接以保底 PRB 数构造授权
+        // 保底份额按实际需求封顶: 保底语义是"份额不被好信道 UE 挤占",
+        // 若 UE 实际待发量小于保底份额, 只按需求给 PRB —— 修复原实现固定
+        // 给满 min_prb_total (10 PRB ~ 数百字节) 而不顾小缓冲浪费 PRB 的缺陷。
         uint8_t mcs = (ctx.cqi > 0) ? calculate_mcs_from_cqi(ctx.cqi)
                                     : calculate_mcs(ctx.ul_snr);
+        uint32_t req_bytes = (ctx.total_ul_buffer > 0) ? ctx.total_ul_buffer : 100;
+        uint32_t bytes_per_prb = calculate_tbs(mcs, 1);
+        if (bytes_per_prb == 0) bytes_per_prb = 1;
+        uint32_t n = (req_bytes + bytes_per_prb - 1) / bytes_per_prb; // 需求所需 PRB
+        n = std::min(n, min_prb_total);   // 不超过保底份额
+        n = std::max(n, 1u);
+        n = std::min(n, total_prb_);
+        // 从PRB池首次适配分配连续区间
         int32_t start = prb_alloc_unlocked(n);
         if (start < 0) continue; // 无连续 PRB, 跳过保底
         ul_grant grant;
@@ -645,8 +688,8 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
         grant.mcs = mcs;
         grant.tbs = calculate_tbs(mcs, n);
         // 保底分配视为"新传", 按标准翻转 NDI (与 generate_ul_grant_unlocked 新传分支一致)。
-        // 此处手动翻转而非复用 generate_ul_grant_unlocked, 是因为保底仅用最小 PRB 份额,
-        // 不依赖缓冲区需求反推, 故独立构造授权以避免与阶段4重复分配同一 UE。
+        // 此处手动翻转而非复用 generate_ul_grant_unlocked, 是因为保底按需求封顶 PRB,
+        // 不走"缓冲区需求反推满额 PRB"的路径, 故独立构造授权。
         grant.ndi = !ctx.ndi[pid];
         ctx.ndi[pid] = grant.ndi;
         grant.ndi_present = true;
@@ -663,8 +706,8 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
         res.grant = grant;
         res.is_retx = false;
         // 保底授权提交: 占用进程/清SR/扣缓冲/更新平均速率 (公共函数)
-        // 注意 grant 已手动构造 (不走 generate_ul_grant_unlocked), 此处仅提交
         commit_new_grant_unlocked(ctx, pid, res);
+        granted.insert(e.rnti);
         results.push_back(res);
         metrics_collector::instance().record_ul_grant();
         LOG_INFO("SCHED", e.rnti, tti,
@@ -675,6 +718,7 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
 
     // 阶段4: EPF 度量排序的新传分配 (剩余 PRB)
     for (const auto& e : queue) {
+        if (granted.count(e.rnti)) continue;   // 本 TTI 已有授权 (重传/保底)
         auto& ctx = ue_db_[e.rnti];
         if (ctx.total_ul_buffer == 0 && !ctx.sr_pending) continue; // 已被保底清空
         int32_t pid = alloc_free_pid_unlocked(ctx);
@@ -687,6 +731,7 @@ std::vector<ul_scheduler::ul_sched_result> ul_scheduler::schedule_epf(uint32_t t
             commit_new_grant_unlocked(ctx, pid, res);
             ctx.inst_rate = static_cast<double>(res.grant.tbs);
             ctx.tti_since_sched = 0;
+            granted.insert(e.rnti);
             results.push_back(res);
             metrics_collector::instance().record_ul_grant();
             LOG_INFO("SCHED", e.rnti, tti,

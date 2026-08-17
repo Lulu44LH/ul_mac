@@ -1,0 +1,575 @@
+==============================================================
+   eNB侧上行MAC接收链路演示项目 (UL MAC Manager - eNB side)
+   基于3GPP TS 36.321 (LTE) / TS 38.321 (NR) MAC协议
+   eNB核心模块: enb_bsr_manager + ul_scheduler + enb_ul_harq_manager
+   UE侧模块保留作发送桩 (方案A原地改造)
+==============================================================
+
+==============================================================
+  场景1: 基本接收链路 (SR -> BSR解码 -> Grant -> HARQ软合并) [方案C: 多线程 + 4-TTI时延]
+==============================================================
+
+[20:44:48.398] [INFO ] [SR] UE[0x0001] TTI[00000] SR initialized: enabled=true, dsr_transmax=8, sr_period=10ms
+[20:44:48.399] [INFO ] [BSR] UE[0x0001] TTI[00000] BSR initialized: periodic_timer=80ms, retx_timer=320ms
+[20:44:48.399] [INFO ] [HARQ] UE[0x0001] TTI[00000] HARQ initialized: max_harq_tx=4, max_msg3_tx=4, nof_processes=8
+[20:44:48.399] [INFO ] [UE] UE[0x0001] TTI[00000] UE context created
+[20:44:48.399] [INFO ] [UE] UE[0x0001] TTI[00000] LCID configured: lcid=1, lcg=0, priority=1, pbr=0, bsd=100
+[20:44:48.399] [INFO ] [UE] UE[0x0001] TTI[00000] LCID configured: lcid=2, lcg=1, priority=8, pbr=0, bsd=100
+[20:44:48.399] [INFO ] [UE] UE[0x0001] TTI[00000] LCID configured: lcid=3, lcg=2, priority=10, pbr=0, bsd=100
+[20:44:48.399] [INFO ] [SCHED] TTI[00000] UL Scheduler initialized, total_prb=100
+[20:44:48.399] [INFO ] [ENB_BSR] TTI[00000] eNB BSR decoder initialized
+[20:44:48.399] [INFO ] [ENB_HARQ] TTI[00000] eNB UL HARQ (rx) initialized, max_harq_tx=4
+[20:44:48.399] [INFO ] [SCHED] UE[0x0001] TTI[00000] UE added to scheduler
+[20:44:48.399] [INFO ] [ENB_BSR] UE[0x0001] TTI[00000] UE added to eNB BSR decoder
+[20:44:48.399] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00000] UE added to eNB HARQ
+>>> 仿真开始: 200 TTI, 单UE, PF调度
+>>> UE 0x0001: 3个逻辑通道 (SRB1 + 2 DRB)
+>>> eNB: PF调度 + BSR解码 + HARQ软合并 (ul_snr=20dB)
+>>> 中央TTI时钟线程 + 四条空口信道(各+4 TTI可见时延)
+
+[20:44:48.399] [INFO ] [BSR] UE[0x0001] TTI[00000] Triggering Regular BSR
+[20:44:48.399] [INFO ] [SR] UE[0x0001] TTI[00000] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.399] [INFO ] [UE] UE[0x0001] TTI[00000] SR sent on PUCCH
+[20:44:48.399] [INFO ] [SCHED] UE[0x0001] TTI[00004] PF NEW: PID=0, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.399] [INFO ] [BSR] UE[0x0001] TTI[00005] Triggering Regular BSR
+[20:44:48.399] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.399] [INFO ] [BSR] UE[0x0001] TTI[00000] Sending Long BSR on UL grant (grant=537B, data=800B)
+[20:44:48.399] [INFO ] [UE] UE[0x0001] TTI[00008] BSR sent: format=Long BSR, LCG1=26, LCG2=23
+[20:44:48.399] [INFO ] [HARQ] TTI[00004] PID=0: New TX, RV=0, TBS=537, NDI=1
+[20:44:48.400] [INFO ] [BSR] UE[0x0001] TTI[00010] Triggering Regular BSR
+[20:44:48.400] [INFO ] [SR] UE[0x0001] TTI[00010] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.400] [INFO ] [UE] UE[0x0001] TTI[00010] SR sent on PUCCH
+[20:44:48.400] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00004] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.400] [INFO ] [SCHED] UE[0x0001] TTI[00013] PF NEW: PID=0, MCS=7, TBS=903B, PRB[0+84]
+[20:44:48.400] [INFO ] [SCHED] UE[0x0001] TTI[00014] PF NEW: PID=1, MCS=7, TBS=827B, PRB[0+77]
+[20:44:48.400] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.400] [INFO ] [UE] UE[0x0001] TTI[00017] BSR sent: format=Long BSR, LCG1=26, LCG2=22
+[20:44:48.400] [INFO ] [HARQ] TTI[00013] PID=0: New TX, RV=0, TBS=903, NDI=0
+[20:44:48.400] [INFO ] [HARQ] TTI[00014] PID=1: New TX, RV=0, TBS=827, NDI=1
+[20:44:48.400] [INFO ] [BSR] UE[0x0001] TTI[00020] Triggering Regular BSR
+[20:44:48.400] [INFO ] [SR] UE[0x0001] TTI[00020] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.400] [INFO ] [UE] UE[0x0001] TTI[00020] SR sent on PUCCH
+[20:44:48.400] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00013] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.400] [INFO ] [SCHED] UE[0x0001] TTI[00022] PF NEW: PID=0, MCS=7, TBS=849B, PRB[0+79]
+[20:44:48.400] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00014] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.400] [INFO ] [SCHED] UE[0x0001] TTI[00024] PF NEW: PID=1, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.400] [INFO ] [BSR] UE[0x0001] TTI[00025] Triggering Regular BSR
+[20:44:48.400] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.400] [INFO ] [UE] UE[0x0001] TTI[00026] BSR sent: format=Long BSR, LCG1=26, LCG2=23
+[20:44:48.400] [INFO ] [HARQ] TTI[00022] PID=0: New TX, RV=0, TBS=849, NDI=1
+[20:44:48.400] [INFO ] [HARQ] TTI[00024] PID=1: New TX, RV=0, TBS=537, NDI=0
+[20:44:48.400] [INFO ] [BSR] UE[0x0001] TTI[00030] Triggering Regular BSR
+[20:44:48.400] [INFO ] [SR] UE[0x0001] TTI[00030] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.400] [INFO ] [UE] UE[0x0001] TTI[00030] SR sent on PUCCH
+[20:44:48.400] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00022] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.400] [INFO ] [SCHED] UE[0x0001] TTI[00031] PF NEW: PID=0, MCS=7, TBS=903B, PRB[0+84]
+[20:44:48.400] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00024] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.400] [INFO ] [SCHED] UE[0x0001] TTI[00034] PF NEW: PID=1, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.400] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.400] [INFO ] [UE] UE[0x0001] TTI[00035] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.400] [INFO ] [HARQ] TTI[00031] PID=0: New TX, RV=0, TBS=903, NDI=0
+[20:44:48.400] [INFO ] [HARQ] TTI[00034] PID=1: New TX, RV=0, TBS=537, NDI=1
+[20:44:48.400] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00031] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.400] [INFO ] [SCHED] UE[0x0001] TTI[00040] PF NEW: PID=0, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.400] [INFO ] [BSR] UE[0x0001] TTI[00040] Triggering Regular BSR
+[20:44:48.400] [INFO ] [SR] UE[0x0001] TTI[00040] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.400] [INFO ] [UE] UE[0x0001] TTI[00040] SR sent on PUCCH
+[20:44:48.400] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00034] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.400] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.400] [INFO ] [UE] UE[0x0001] TTI[00044] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.401] [INFO ] [HARQ] TTI[00040] PID=0: New TX, RV=0, TBS=559, NDI=1
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00044] PF NEW: PID=1, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.401] [INFO ] [BSR] UE[0x0001] TTI[00045] Triggering Regular BSR
+[20:44:48.401] [INFO ] [SR] UE[0x0001] TTI[00045] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.401] [INFO ] [UE] UE[0x0001] TTI[00045] SR sent on PUCCH
+[20:44:48.401] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.401] [INFO ] [UE] UE[0x0001] TTI[00048] BSR sent: format=Long BSR, LCG2=23
+[20:44:48.401] [INFO ] [HARQ] TTI[00044] PID=1: New TX, RV=0, TBS=537, NDI=0
+[20:44:48.401] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00040] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00049] PF NEW: PID=0, MCS=7, TBS=881B, PRB[0+82]
+[20:44:48.401] [INFO ] [BSR] UE[0x0001] TTI[00050] Triggering Regular BSR
+[20:44:48.401] [INFO ] [SR] UE[0x0001] TTI[00050] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.401] [INFO ] [UE] UE[0x0001] TTI[00050] SR sent on PUCCH
+[20:44:48.401] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00044] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00053] PF NEW: PID=1, MCS=7, TBS=354B, PRB[0+33]
+[20:44:48.401] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.401] [INFO ] [UE] UE[0x0001] TTI[00053] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.401] [INFO ] [HARQ] TTI[00049] PID=0: New TX, RV=0, TBS=881, NDI=0
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00054] PF NEW: PID=2, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.401] [INFO ] [HARQ] TTI[00053] PID=1: New TX, RV=0, TBS=354, NDI=1
+[20:44:48.401] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00049] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00058] PF NEW: PID=0, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.401] [INFO ] [HARQ] TTI[00054] PID=2: New TX, RV=0, TBS=537, NDI=1
+[20:44:48.401] [INFO ] [BSR] UE[0x0001] TTI[00060] Triggering Regular BSR
+[20:44:48.401] [INFO ] [SR] UE[0x0001] TTI[00060] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.401] [INFO ] [UE] UE[0x0001] TTI[00060] SR sent on PUCCH
+[20:44:48.401] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00053] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.401] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.401] [INFO ] [UE] UE[0x0001] TTI[00062] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.401] [INFO ] [HARQ] TTI[00058] PID=0: New TX, RV=0, TBS=559, NDI=1
+[20:44:48.401] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00054] PID=2: ACK (tx=1, eff=2000>=300)
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00064] PF NEW: PID=1, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.401] [INFO ] [BSR] UE[0x0001] TTI[00065] Triggering Regular BSR
+[20:44:48.401] [INFO ] [SR] UE[0x0001] TTI[00065] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.401] [INFO ] [UE] UE[0x0001] TTI[00065] SR sent on PUCCH
+[20:44:48.401] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00058] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00067] PF NEW: PID=0, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.401] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.401] [INFO ] [UE] UE[0x0001] TTI[00068] BSR sent: format=Long BSR, LCG2=23
+[20:44:48.401] [INFO ] [HARQ] TTI[00064] PID=1: New TX, RV=0, TBS=537, NDI=0
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00069] PF NEW: PID=2, MCS=7, TBS=322B, PRB[0+30]
+[20:44:48.401] [INFO ] [BSR] UE[0x0001] TTI[00070] Triggering Regular BSR
+[20:44:48.401] [INFO ] [SR] UE[0x0001] TTI[00070] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.401] [INFO ] [UE] UE[0x0001] TTI[00070] SR sent on PUCCH
+[20:44:48.401] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.401] [INFO ] [UE] UE[0x0001] TTI[00071] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.401] [INFO ] [HARQ] TTI[00067] PID=0: New TX, RV=0, TBS=559, NDI=0
+[20:44:48.401] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00064] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00073] PF NEW: PID=1, MCS=7, TBS=354B, PRB[0+33]
+[20:44:48.401] [INFO ] [HARQ] TTI[00069] PID=2: New TX, RV=0, TBS=322, NDI=0
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00074] PF NEW: PID=3, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.401] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00067] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.401] [INFO ] [SCHED] UE[0x0001] TTI[00076] PF NEW: PID=0, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.401] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00069] PID=2: ACK (tx=1, eff=2000>=300)
+[20:44:48.401] [INFO ] [HARQ] TTI[00073] PID=1: New TX, RV=0, TBS=354, NDI=1
+[20:44:48.401] [INFO ] [HARQ] TTI[00074] PID=3: New TX, RV=0, TBS=537, NDI=1
+[20:44:48.401] [INFO ] [BSR] UE[0x0001] TTI[00080] Triggering Regular BSR
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00080] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.402] [INFO ] [HARQ] TTI[00076] PID=0: New TX, RV=0, TBS=559, NDI=1
+[20:44:48.402] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00073] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.402] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00074] PID=3: ACK (tx=1, eff=2000>=300)
+[20:44:48.402] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00076] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.402] [INFO ] [SCHED] UE[0x0001] TTI[00085] PF NEW: PID=0, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.402] [INFO ] [BSR] UE[0x0001] TTI[00085] Triggering Regular BSR
+[20:44:48.402] [INFO ] [SR] UE[0x0001] TTI[00085] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00085] SR sent on PUCCH
+[20:44:48.402] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00089] BSR sent: format=Long BSR, LCG2=23
+[20:44:48.402] [INFO ] [HARQ] TTI[00085] PID=0: New TX, RV=0, TBS=559, NDI=0
+[20:44:48.402] [INFO ] [SCHED] UE[0x0001] TTI[00089] PF NEW: PID=1, MCS=7, TBS=322B, PRB[0+30]
+[20:44:48.402] [INFO ] [BSR] UE[0x0001] TTI[00090] Triggering Regular BSR
+[20:44:48.402] [INFO ] [SR] UE[0x0001] TTI[00090] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00090] SR sent on PUCCH
+[20:44:48.402] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.402] [INFO ] [BSR] UE[0x0001] TTI[00000] Sending Short BSR on UL grant (grant=322B, data=500B)
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00093] BSR sent: format=Short BSR, LCG1=26
+[20:44:48.402] [INFO ] [HARQ] TTI[00089] PID=1: New TX, RV=0, TBS=322, NDI=0
+[20:44:48.402] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00085] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.402] [INFO ] [SCHED] UE[0x0001] TTI[00094] PF NEW: PID=0, MCS=7, TBS=892B, PRB[0+83]
+[20:44:48.402] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00089] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.402] [INFO ] [SCHED] UE[0x0001] TTI[00098] PF NEW: PID=1, MCS=7, TBS=903B, PRB[0+84]
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00098] BSR sent: format=Long BSR, LCG1=20
+[20:44:48.402] [INFO ] [HARQ] TTI[00094] PID=0: New TX, RV=0, TBS=892, NDI=1
+[20:44:48.402] [INFO ] [BSR] UE[0x0001] TTI[00100] Triggering Regular BSR
+[20:44:48.402] [INFO ] [SR] UE[0x0001] TTI[00100] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00100] SR sent on PUCCH
+[20:44:48.402] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00102] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.402] [INFO ] [HARQ] TTI[00098] PID=1: New TX, RV=0, TBS=903, NDI=1
+[20:44:48.402] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00094] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.402] [INFO ] [SCHED] UE[0x0001] TTI[00103] PF NEW: PID=0, MCS=7, TBS=215B, PRB[0+20]
+[20:44:48.402] [INFO ] [SCHED] UE[0x0001] TTI[00104] PF NEW: PID=2, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.402] [INFO ] [BSR] UE[0x0001] TTI[00105] Triggering Regular BSR
+[20:44:48.402] [INFO ] [SR] UE[0x0001] TTI[00105] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00105] SR sent on PUCCH
+[20:44:48.402] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00098] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.402] [INFO ] [SCHED] UE[0x0001] TTI[00107] PF NEW: PID=1, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.402] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.402] [INFO ] [BSR] UE[0x0001] TTI[00000] Sending Short BSR on UL grant (grant=215B, data=300B)
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00107] BSR sent: format=Short BSR, LCG2=23
+[20:44:48.402] [INFO ] [HARQ] TTI[00103] PID=0: New TX, RV=0, TBS=215, NDI=0
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00108] BSR sent: format=Long BSR, LCG2=15
+[20:44:48.402] [INFO ] [HARQ] TTI[00104] PID=2: New TX, RV=0, TBS=537, NDI=1
+[20:44:48.402] [INFO ] [SCHED] UE[0x0001] TTI[00109] PF NEW: PID=3, MCS=7, TBS=322B, PRB[0+30]
+[20:44:48.402] [INFO ] [BSR] UE[0x0001] TTI[00110] Triggering Regular BSR
+[20:44:48.402] [INFO ] [SR] UE[0x0001] TTI[00110] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00110] SR sent on PUCCH
+[20:44:48.402] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.402] [INFO ] [UE] UE[0x0001] TTI[00111] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.402] [INFO ] [HARQ] TTI[00107] PID=1: New TX, RV=0, TBS=559, NDI=0
+[20:44:48.402] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00103] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.402] [INFO ] [SCHED] UE[0x0001] TTI[00112] PF NEW: PID=0, MCS=7, TBS=903B, PRB[0+84]
+[20:44:48.402] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00104] PID=2: ACK (tx=1, eff=2000>=300)
+[20:44:48.402] [INFO ] [SCHED] UE[0x0001] TTI[00113] PF NEW: PID=2, MCS=7, TBS=107B, PRB[0+10]
+[20:44:48.402] [INFO ] [HARQ] TTI[00109] PID=3: New TX, RV=0, TBS=322, NDI=0
+[20:44:48.403] [INFO ] [SCHED] UE[0x0001] TTI[00114] PF NEW: PID=4, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.403] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00107] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.403] [INFO ] [SCHED] UE[0x0001] TTI[00116] PF NEW: PID=1, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.403] [INFO ] [HARQ] TTI[00112] PID=0: New TX, RV=0, TBS=903, NDI=1
+[20:44:48.403] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00109] PID=3: ACK (tx=1, eff=2000>=300)
+[20:44:48.403] [INFO ] [HARQ] TTI[00113] PID=2: New TX, RV=0, TBS=107, NDI=0
+[20:44:48.403] [INFO ] [HARQ] TTI[00114] PID=4: New TX, RV=0, TBS=537, NDI=1
+[20:44:48.403] [INFO ] [BSR] UE[0x0001] TTI[00120] Triggering Regular BSR
+[20:44:48.403] [INFO ] [UE] UE[0x0001] TTI[00120] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.403] [INFO ] [HARQ] TTI[00116] PID=1: New TX, RV=0, TBS=559, NDI=1
+[20:44:48.403] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00112] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.403] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00113] PID=2: ACK (tx=1, eff=2000>=300)
+[20:44:48.403] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00114] PID=4: ACK (tx=1, eff=2000>=300)
+[20:44:48.403] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00116] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.403] [INFO ] [SCHED] UE[0x0001] TTI[00125] PF NEW: PID=0, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.403] [INFO ] [BSR] UE[0x0001] TTI[00125] Triggering Regular BSR
+[20:44:48.403] [INFO ] [SR] UE[0x0001] TTI[00125] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.403] [INFO ] [UE] UE[0x0001] TTI[00125] SR sent on PUCCH
+[20:44:48.403] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.403] [INFO ] [UE] UE[0x0001] TTI[00129] BSR sent: format=Long BSR, LCG2=23
+[20:44:48.403] [INFO ] [HARQ] TTI[00125] PID=0: New TX, RV=0, TBS=559, NDI=0
+[20:44:48.403] [INFO ] [SCHED] UE[0x0001] TTI[00129] PF NEW: PID=1, MCS=7, TBS=322B, PRB[0+30]
+[20:44:48.403] [INFO ] [BSR] UE[0x0001] TTI[00130] Triggering Regular BSR
+[20:44:48.403] [INFO ] [SR] UE[0x0001] TTI[00130] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.403] [INFO ] [UE] UE[0x0001] TTI[00130] SR sent on PUCCH
+[20:44:48.403] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.403] [INFO ] [BSR] UE[0x0001] TTI[00000] Sending Short BSR on UL grant (grant=322B, data=500B)
+[20:44:48.403] [INFO ] [UE] UE[0x0001] TTI[00133] BSR sent: format=Short BSR, LCG1=26
+[20:44:48.403] [INFO ] [HARQ] TTI[00129] PID=1: New TX, RV=0, TBS=322, NDI=0
+[20:44:48.403] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00125] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.403] [INFO ] [SCHED] UE[0x0001] TTI[00134] PF NEW: PID=0, MCS=7, TBS=892B, PRB[0+83]
+[20:44:48.403] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00129] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.403] [INFO ] [UE] UE[0x0001] TTI[00138] BSR sent: format=Long BSR, LCG1=20
+[20:44:48.403] [INFO ] [SCHED] UE[0x0001] TTI[00138] PF NEW: PID=1, MCS=7, TBS=903B, PRB[0+84]
+[20:44:48.403] [INFO ] [HARQ] TTI[00134] PID=0: New TX, RV=0, TBS=892, NDI=1
+[20:44:48.404] [INFO ] [BSR] UE[0x0001] TTI[00140] Triggering Regular BSR
+[20:44:48.404] [INFO ] [SR] UE[0x0001] TTI[00140] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.404] [INFO ] [UE] UE[0x0001] TTI[00140] SR sent on PUCCH
+[20:44:48.404] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.404] [INFO ] [UE] UE[0x0001] TTI[00142] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.404] [INFO ] [HARQ] TTI[00138] PID=1: New TX, RV=0, TBS=903, NDI=1
+[20:44:48.404] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00134] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.404] [INFO ] [SCHED] UE[0x0001] TTI[00143] PF NEW: PID=0, MCS=7, TBS=215B, PRB[0+20]
+[20:44:48.404] [INFO ] [SCHED] UE[0x0001] TTI[00144] PF NEW: PID=2, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.404] [INFO ] [BSR] UE[0x0001] TTI[00145] Triggering Regular BSR
+[20:44:48.404] [INFO ] [SR] UE[0x0001] TTI[00145] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.404] [INFO ] [UE] UE[0x0001] TTI[00145] SR sent on PUCCH
+[20:44:48.404] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00138] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.404] [INFO ] [SCHED] UE[0x0001] TTI[00147] PF NEW: PID=1, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.404] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.404] [INFO ] [BSR] UE[0x0001] TTI[00000] Sending Short BSR on UL grant (grant=215B, data=300B)
+[20:44:48.404] [INFO ] [UE] UE[0x0001] TTI[00147] BSR sent: format=Short BSR, LCG2=23
+[20:44:48.404] [INFO ] [HARQ] TTI[00143] PID=0: New TX, RV=0, TBS=215, NDI=0
+[20:44:48.404] [INFO ] [UE] UE[0x0001] TTI[00148] BSR sent: format=Long BSR, LCG2=15
+[20:44:48.404] [INFO ] [HARQ] TTI[00144] PID=2: New TX, RV=0, TBS=537, NDI=1
+[20:44:48.404] [INFO ] [SCHED] UE[0x0001] TTI[00149] PF NEW: PID=3, MCS=7, TBS=322B, PRB[0+30]
+[20:44:48.405] [INFO ] [BSR] UE[0x0001] TTI[00150] Triggering Regular BSR
+[20:44:48.405] [INFO ] [SR] UE[0x0001] TTI[00150] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.405] [INFO ] [UE] UE[0x0001] TTI[00150] SR sent on PUCCH
+[20:44:48.405] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00143] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.405] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.405] [INFO ] [UE] UE[0x0001] TTI[00151] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.405] [INFO ] [HARQ] TTI[00147] PID=1: New TX, RV=0, TBS=559, NDI=0
+[20:44:48.405] [INFO ] [SCHED] UE[0x0001] TTI[00152] PF NEW: PID=0, MCS=7, TBS=903B, PRB[0+84]
+[20:44:48.405] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00144] PID=2: ACK (tx=1, eff=2000>=300)
+[20:44:48.405] [INFO ] [HARQ] TTI[00149] PID=3: New TX, RV=0, TBS=322, NDI=1
+[20:44:48.405] [INFO ] [SCHED] UE[0x0001] TTI[00153] PF NEW: PID=2, MCS=7, TBS=107B, PRB[0+10]
+[20:44:48.405] [INFO ] [SCHED] UE[0x0001] TTI[00154] PF NEW: PID=4, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.405] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00147] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.405] [INFO ] [SCHED] UE[0x0001] TTI[00156] PF NEW: PID=1, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.405] [INFO ] [HARQ] TTI[00152] PID=0: New TX, RV=0, TBS=903, NDI=1
+[20:44:48.405] [INFO ] [HARQ] TTI[00153] PID=2: New TX, RV=0, TBS=107, NDI=0
+[20:44:48.405] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00149] PID=3: ACK (tx=1, eff=2000>=300)
+[20:44:48.405] [INFO ] [HARQ] TTI[00154] PID=4: New TX, RV=0, TBS=537, NDI=0
+[20:44:48.405] [INFO ] [BSR] UE[0x0001] TTI[00160] Triggering Regular BSR
+[20:44:48.405] [INFO ] [UE] UE[0x0001] TTI[00160] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.405] [INFO ] [HARQ] TTI[00156] PID=1: New TX, RV=0, TBS=559, NDI=1
+[20:44:48.405] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00152] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.405] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00153] PID=2: ACK (tx=1, eff=2000>=300)
+[20:44:48.405] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00154] PID=4: ACK (tx=1, eff=2000>=300)
+[20:44:48.405] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00156] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.405] [INFO ] [SCHED] UE[0x0001] TTI[00165] PF NEW: PID=0, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.405] [INFO ] [BSR] UE[0x0001] TTI[00165] Triggering Regular BSR
+[20:44:48.405] [INFO ] [SR] UE[0x0001] TTI[00165] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.405] [INFO ] [UE] UE[0x0001] TTI[00165] SR sent on PUCCH
+[20:44:48.405] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.405] [INFO ] [UE] UE[0x0001] TTI[00169] BSR sent: format=Long BSR, LCG2=23
+[20:44:48.405] [INFO ] [HARQ] TTI[00165] PID=0: New TX, RV=0, TBS=559, NDI=0
+[20:44:48.405] [INFO ] [SCHED] UE[0x0001] TTI[00169] PF NEW: PID=1, MCS=7, TBS=322B, PRB[0+30]
+[20:44:48.405] [INFO ] [BSR] UE[0x0001] TTI[00170] Triggering Regular BSR
+[20:44:48.405] [INFO ] [SR] UE[0x0001] TTI[00170] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.405] [INFO ] [UE] UE[0x0001] TTI[00170] SR sent on PUCCH
+[20:44:48.405] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.405] [INFO ] [BSR] UE[0x0001] TTI[00000] Sending Short BSR on UL grant (grant=322B, data=500B)
+[20:44:48.405] [INFO ] [UE] UE[0x0001] TTI[00173] BSR sent: format=Short BSR, LCG1=26
+[20:44:48.406] [INFO ] [HARQ] TTI[00169] PID=1: New TX, RV=0, TBS=322, NDI=0
+[20:44:48.406] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00165] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.406] [INFO ] [SCHED] UE[0x0001] TTI[00174] PF NEW: PID=0, MCS=7, TBS=892B, PRB[0+83]
+[20:44:48.406] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00169] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.406] [INFO ] [SCHED] UE[0x0001] TTI[00178] PF NEW: PID=1, MCS=7, TBS=903B, PRB[0+84]
+[20:44:48.406] [INFO ] [UE] UE[0x0001] TTI[00178] BSR sent: format=Long BSR, LCG1=20
+[20:44:48.406] [INFO ] [HARQ] TTI[00174] PID=0: New TX, RV=0, TBS=892, NDI=1
+[20:44:48.406] [INFO ] [BSR] UE[0x0001] TTI[00180] Triggering Regular BSR
+[20:44:48.406] [INFO ] [SR] UE[0x0001] TTI[00180] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.406] [INFO ] [UE] UE[0x0001] TTI[00180] SR sent on PUCCH
+[20:44:48.406] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.406] [INFO ] [UE] UE[0x0001] TTI[00182] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.406] [INFO ] [HARQ] TTI[00178] PID=1: New TX, RV=0, TBS=903, NDI=1
+[20:44:48.406] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00174] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.406] [INFO ] [SCHED] UE[0x0001] TTI[00183] PF NEW: PID=0, MCS=7, TBS=215B, PRB[0+20]
+[20:44:48.406] [INFO ] [SCHED] UE[0x0001] TTI[00184] PF NEW: PID=2, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.406] [INFO ] [BSR] UE[0x0001] TTI[00185] Triggering Regular BSR
+[20:44:48.406] [INFO ] [SR] UE[0x0001] TTI[00185] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.406] [INFO ] [UE] UE[0x0001] TTI[00185] SR sent on PUCCH
+[20:44:48.406] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00178] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.406] [INFO ] [SCHED] UE[0x0001] TTI[00187] PF NEW: PID=1, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.406] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.406] [INFO ] [BSR] UE[0x0001] TTI[00000] Sending Short BSR on UL grant (grant=215B, data=300B)
+[20:44:48.406] [INFO ] [UE] UE[0x0001] TTI[00187] BSR sent: format=Short BSR, LCG2=23
+[20:44:48.406] [INFO ] [HARQ] TTI[00183] PID=0: New TX, RV=0, TBS=215, NDI=0
+[20:44:48.406] [INFO ] [UE] UE[0x0001] TTI[00188] BSR sent: format=Long BSR, LCG2=15
+[20:44:48.406] [INFO ] [HARQ] TTI[00184] PID=2: New TX, RV=0, TBS=537, NDI=1
+[20:44:48.406] [INFO ] [SCHED] UE[0x0001] TTI[00189] PF NEW: PID=3, MCS=7, TBS=322B, PRB[0+30]
+[20:44:48.406] [INFO ] [BSR] UE[0x0001] TTI[00190] Triggering Regular BSR
+[20:44:48.406] [INFO ] [SR] UE[0x0001] TTI[00190] Sending SR on PUCCH, sr_counter=1/8
+[20:44:48.406] [INFO ] [UE] UE[0x0001] TTI[00190] SR sent on PUCCH
+[20:44:48.406] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00183] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.406] [INFO ] [SR] UE[0x0001] TTI[00000] SR SUCCESS: UL grant received, sr_counter=1
+[20:44:48.406] [INFO ] [UE] UE[0x0001] TTI[00191] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.406] [INFO ] [HARQ] TTI[00187] PID=1: New TX, RV=0, TBS=559, NDI=0
+[20:44:48.406] [INFO ] [SCHED] UE[0x0001] TTI[00192] PF NEW: PID=0, MCS=7, TBS=903B, PRB[0+84]
+[20:44:48.406] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00184] PID=2: ACK (tx=1, eff=2000>=300)
+[20:44:48.407] [INFO ] [HARQ] TTI[00189] PID=3: New TX, RV=0, TBS=322, NDI=0
+[20:44:48.407] [INFO ] [SCHED] UE[0x0001] TTI[00193] PF NEW: PID=2, MCS=7, TBS=107B, PRB[0+10]
+[20:44:48.407] [INFO ] [SCHED] UE[0x0001] TTI[00194] PF NEW: PID=4, MCS=7, TBS=537B, PRB[0+50]
+[20:44:48.407] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00187] PID=1: ACK (tx=1, eff=2000>=300)
+[20:44:48.407] [INFO ] [SCHED] UE[0x0001] TTI[00196] PF NEW: PID=1, MCS=7, TBS=559B, PRB[0+52]
+[20:44:48.407] [INFO ] [HARQ] TTI[00192] PID=0: New TX, RV=0, TBS=903, NDI=1
+[20:44:48.407] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00189] PID=3: ACK (tx=1, eff=2000>=300)
+[20:44:48.407] [INFO ] [HARQ] TTI[00193] PID=2: New TX, RV=0, TBS=107, NDI=0
+[20:44:48.407] [INFO ] [HARQ] TTI[00194] PID=4: New TX, RV=0, TBS=537, NDI=1
+[20:44:48.407] [INFO ] [BSR] UE[0x0001] TTI[00200] Triggering Regular BSR
+[20:44:48.407] [INFO ] [ENB_HARQ] UE[0x0001] TTI[00192] PID=0: ACK (tx=1, eff=2000>=300)
+[20:44:48.407] [INFO ] [UE] UE[0x0001] TTI[00200] BSR sent: format=Long BSR, LCG1=26
+[20:44:48.407] [INFO ] [HARQ] TTI[00196] PID=1: New TX, RV=0, TBS=559, NDI=1
+  UE[0x1]:
+    SR:  tx=25, success=25
+    BSR: tx=35
+    HARQ: new_tx=55, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=30633, throughput=1225.32 kbps
+  [eNB BSR解码] total_rx=34, Short=6, Truncated=0, Long=28
+  [eNB HARQ接收] rx=52, new_tb=52, ACK=52, NACK=0, soft_combine=0, discard=0
+
+==============================================================
+  场景2: 多UE比例公平调度 (5个UE, 好信道) [方案C: 多线程 + 4-TTI时延]
+==============================================================
+
+>>> 仿真开始: 1000 TTI, 5个UE(每UE1线程), PF调度
+>>> 中央TTI时钟线程 + 四条空口信道(各+4 TTI可见时延)
+>>> 每个UE每5个TTI产生500字节数据, ul_snr=20dB
+
+  UE[0x1]:
+    SR:  tx=3, success=3
+    BSR: tx=7
+    HARQ: new_tx=87, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=91040, throughput=728.32 kbps
+  UE[0x2]:
+    SR:  tx=3, success=3
+    BSR: tx=7
+    HARQ: new_tx=87, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=91040, throughput=728.32 kbps
+  UE[0x3]:
+    SR:  tx=3, success=3
+    BSR: tx=7
+    HARQ: new_tx=86, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=89965, throughput=719.72 kbps
+  UE[0x4]:
+    SR:  tx=3, success=3
+    BSR: tx=7
+    HARQ: new_tx=86, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=89965, throughput=719.72 kbps
+  UE[0x5]:
+    SR:  tx=3, success=3
+    BSR: tx=7
+    HARQ: new_tx=86, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=89965, throughput=719.72 kbps
+  [eNB BSR解码] total_rx=35, Short=35, Truncated=0, Long=0
+  [eNB HARQ接收] rx=428, new_tb=428, ACK=428, NACK=0, soft_combine=0, discard=0
+
+==============================================================
+  场景3: HARQ软合并重传 (弱信道, 验证IR增益) [方案C: 多线程 + 4-TTI时延]
+==============================================================
+
+>>> 仿真开始: 500 TTI, 单UE, RR调度, 弱信道
+>>> ul_snr=2dB (MCS=7 边缘), 新传NACK, 重传IR增益后ACK
+>>> 最大HARQ重传: 4次; 四信道各+4 TTI可见时延
+
+  UE[0x1]:
+    SR:  tx=2, success=2
+    BSR: tx=4
+    HARQ: new_tx=81, retx=78, fail=0, avg_retx=0.963
+    UL:  bytes=43465, throughput=695.44 kbps
+  [eNB BSR解码] total_rx=2, Short=2, Truncated=0, Long=0
+  [eNB HARQ接收] rx=156, new_tb=78, ACK=78, NACK=78, soft_combine=78, discard=0
+
+  HARQ重传统计 (UE 桩视角):
+    总重传次数: 78
+    丢弃次数(达到最大重传): 0
+    平均每包重传: 0.963
+    UE桩 BLER: 51.32%
+    UE桩 ACK: 74, NACK: 78
+
+==============================================================
+  场景4: 增强功能 (UE桩自适应SR, eNB接收侧统计) [方案C: 多线程 + 4-TTI时延]
+==============================================================
+
+>>> 仿真开始: 500 TTI, 单UE, PF调度
+>>> 演示 UE 桩自适应 SR 周期, 四信道各+4 TTI可见时延
+
+  TTI=99, SR period=21ms, SR sent=5, SR success=5
+  TTI=199, SR period=6ms, SR sent=13, SR success=11
+  TTI=299, SR period=6ms, SR sent=13, SR success=11
+  TTI=399, SR period=8ms, SR sent=22, SR success=19
+  TTI=499, SR period=8ms, SR sent=32, SR success=27
+
+  UE[0x1]:
+    SR:  tx=33, success=27
+    BSR: tx=88
+    HARQ: new_tx=149, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=100219, throughput=1603.50 kbps
+  [eNB BSR解码] total_rx=87, Short=27, Truncated=0, Long=60
+  [eNB HARQ接收] rx=148, new_tb=148, ACK=148, NACK=0, soft_combine=0, discard=0
+
+  UE 桩自适应SR统计:
+    最终SR周期: 8ms
+    总SR发送: 33
+    SR成功: 27
+    SR失败: 0
+
+  UE 桩 BSR 发送统计:
+    总BSR发送: 88
+    Regular: 27
+    Periodic: 0
+    Padding: 61
+    Short: 27
+    Long: 61
+    Truncated: 0
+
+  调度实时性 (schedule_ul 单次耗时, 微秒):
+    采样数: 501
+    min=0.00  max=154.00  avg=0.74
+    P50=0.00  P99=4.00
+
+==============================================================
+  场景5: 华为增强型比例公平调度 (EPF) [方案C: 多线程 + 4-TTI时延]
+==============================================================
+
+>>> 仿真开始: 1000 TTI, 5个UE(每UE1线程), EPF调度
+>>> QoS: UE1=VoIP(W=3) UE2=Video(W=2) UE3-5=BE(W=1)
+>>> UE5 弱信道(2dB), 验证饿死保护 (min_prb=10%)
+>>> 四信道各+4 TTI可见时延
+
+  TTI=200 EPF 度量快照:
+    UE1 QoS=0 metric=0.0 sched=2
+    UE2 QoS=1 metric=0.0 sched=4
+    UE3 QoS=2 metric=0.0 sched=3
+    UE4 QoS=2 metric=0.0 sched=3
+    UE5 QoS=2 metric=0.0 sched=10
+  TTI=400 EPF 度量快照:
+    UE1 QoS=0 metric=0.8 sched=25
+    UE2 QoS=1 metric=2.5 sched=41
+    UE3 QoS=2 metric=2.2 sched=5
+    UE4 QoS=2 metric=2.2 sched=5
+    UE5 QoS=2 metric=2.0 sched=15
+  TTI=600 EPF 度量快照:
+    UE1 QoS=0 metric=0.4 sched=31
+    UE2 QoS=1 metric=0.0 sched=93
+    UE3 QoS=2 metric=1.3 sched=45
+    UE4 QoS=2 metric=1.3 sched=45
+    UE5 QoS=2 metric=1.0 sched=78
+  TTI=800 EPF 度量快照:
+    UE1 QoS=0 metric=0.0 sched=41
+    UE2 QoS=1 metric=2.5 sched=102
+    UE3 QoS=2 metric=0.0 sched=72
+    UE4 QoS=2 metric=0.0 sched=85
+    UE5 QoS=2 metric=0.0 sched=130
+  TTI=1000 EPF 度量快照:
+    UE1 QoS=0 metric=0.4 sched=66
+    UE2 QoS=1 metric=0.0 sched=165
+    UE3 QoS=2 metric=1.3 sched=79
+    UE4 QoS=2 metric=0.0 sched=85
+    UE5 QoS=2 metric=0.0 sched=130
+
+>>> 总调度次数 (公平性/不饿死验证):
+  UE1 [VoIP,好信道] 调度=66 次, 吞吐=500.67 kbps
+  UE2 [Video,好信道] 调度=165 次, 吞吐=1385.70 kbps
+  UE3 [BE,好信道] 调度=80 次, 吞吐=602.32 kbps
+  UE4 [BE,好信道] 调度=85 次, 吞吐=645.22 kbps
+  UE5 [BE,弱信道] 调度=130 次, 吞吐=526.73 kbps
+  UE[0x1]:
+    SR:  tx=8, success=7
+    BSR: tx=16
+    HARQ: new_tx=66, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=62584, throughput=500.67 kbps
+  UE[0x2]:
+    SR:  tx=4, success=4
+    BSR: tx=7
+    HARQ: new_tx=165, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=173213, throughput=1385.70 kbps
+  UE[0x3]:
+    SR:  tx=7, success=6
+    BSR: tx=12
+    HARQ: new_tx=76, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=75290, throughput=602.32 kbps
+  UE[0x4]:
+    SR:  tx=12, success=8
+    BSR: tx=18
+    HARQ: new_tx=85, retx=0, fail=0, avg_retx=0.000
+    UL:  bytes=80652, throughput=645.22 kbps
+  UE[0x5]:
+    SR:  tx=2, success=2
+    BSR: tx=7
+    HARQ: new_tx=65, retx=65, fail=0, avg_retx=1.000
+    UL:  bytes=65841, throughput=526.73 kbps
+  [eNB BSR解码] total_rx=58, Short=35, Truncated=0, Long=23
+  [eNB HARQ接收] rx=518, new_tb=453, ACK=453, NACK=65, soft_combine=65, discard=0
+
+==============================================================
+  最终系统性能指标
+==============================================================
+
+
+==============================================================
+              MAC层上行管理系统性能指标摘要
+==============================================================
+仿真时长:           1000 TTI (1000 ms)
+--------------------------------------------------------------
+【调度请求 (SR)】
+  总发送次数:        33
+  成功次数:          27
+  失败次数:          0
+  成功率:            81.82%
+--------------------------------------------------------------
+【缓冲区状态报告 (BSR)】
+  总发送次数:        60
+  Short BSR:         35
+  Long BSR:          25
+  Truncated BSR:     0
+--------------------------------------------------------------
+【上行HARQ】
+  新传次数:          457
+  重传次数:          130
+  失败次数:          0
+  平均重传次数:      0.284
+  失败率:            0.00%
+--------------------------------------------------------------
+【上行吞吐】
+  总授权数:          526
+  总传输字节:        523421 bytes
+  系统吞吐率:        4187.37 kbps
+==============================================================
+--------------------------------------------------------------
+【延迟统计】
+  样本数:            1560
+  最小延迟:          0 TTI
+  P50 (中位数):      159 TTI
+  P90:               327 TTI
+  P99:               397 TTI
+  最大延迟:          417 TTI
+  平均延迟:          167.91 TTI
+==============================================================
+
+演示完成。eNB侧上行MAC接收链路核心机制 (方案B: BSR随PUSCH上报):
+  - BSR上报 (ue_context→mac_pdu_packer→PUSCH): UE打包BSR CE进MAC PDU
+  - BSR解码 (enb_bsr_manager): eNB解PUSCH PDU取BSR CE → 解码 → per-UE LCG视图
+  - SR (PUCCH 1-bit): 仅作调度提示, 与BSR空口分离
+  - 上行调度 (ul_scheduler): SR/BSR驱动 + PRB分配 + HARQ PID管理
+  - HARQ接收 (enb_ul_harq_manager): IR软合并 + CRC + PHICH反馈
+  - 调度算法: PF/RR/EPF(华为增强型比例公平) 三种
+  - EPF: QoS权重 + 信道感知 + 饿死保护 (可配置 alpha/beta/gamma)
+  - UE桩增强: 自适应SR (发送端行为)

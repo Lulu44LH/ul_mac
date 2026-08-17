@@ -13,18 +13,24 @@
 ```
                   多线程 + 中央 TTI 时钟 + 四信道时间解耦 (各 +4 TTI 可见时延)
  ┌──────────────────────── UE 线程 (每UE一个) ────────────────┐   ┌──── eNB 调度线程 ────┐
- │ data_arrived()                                              │   │                     │
- │ run_tti() ── 触发SR(PUCCH) + 编码BSR CE                      │   │                     │
- │   │ SR ──enqueue──► [SR信道 (PUCCH)] ──(+4TTI)──► handle_sr │   │                     │
- │   │                                                         │   │ schedule_ul()       │
- │   │ ◄─(+4TTI)── [UL Grant信道 (PDCCH)] ◄── enqueue ─────────┼───┼─ grant             │
- │   │ ue.handle_ul_grant()→打包BSR进MAC PDU                    │   │                     │
- │   │ PUSCH ──enqueue──► [MAC PDU信道 (PUSCH)] ──(+4TTI)───────┼───┼─► enb_handle_bsr_pdu│
+ │ 【每 TTI 处理顺序 · TS 36.321 §5.1 + srsRAN】               │   │                     │
+ │ ① PHICH 反馈落地 (ACK释放进程/NACK回滚缓冲)                  │   │                     │
+ │ ② begin_tti_snapshot() (new_buffer→old_buffer 快照)         │   │                     │
+ │ ③ data_arrived() (RLC 新数据 → 累加 new_buffer)             │   │                     │
+ │ ④ check_ul_grant() (PDCCH 监听, 置 has_ul_grant_ 标志)      │   │                     │
+ │ ⑤ run_tti() ── 触发SR(PUCCH) + 编码BSR CE + 令牌桶          │   │                     │
+ │ ⑥ SR ──enqueue──► [SR信道 (PUCCH)] ──(+4TTI)──► handle_sr  │   │                     │
+ │ ⑦ process_ul_grant()→HARQ新传/重传+打包BSR进MAC PDU         │   │ schedule_ul()       │
+ │   │ PUSCH ──enqueue──► [MAC PDU信道 (PUSCH)] ──(+4TTI)──────┼───┼─► enb_handle_bsr_pdu│
  │   │                                          解PUSCH PDU取BSR│   │   + receive_tb()    │
- │   │                                           ──(+4TTI)──► [PHICH信道]──enqueue──► handle_harq_feedback │
- │   │ ◄─(+4TTI)── PHICH (ACK/NACK) ◄──────────────────────────┘   │                     │
+ │   │                                           ──(+4TTI)──► [PHICH信道]──enqueue(下TTI①落地) │
  └────────────────────────────────────────────────────────────┘   └─────────────────────┘
 ```
+
+> **UE TTI 顺序依据**：PHICH 最先（§5.3.3，ACK/NACK 决定进程释放与缓冲回滚，必须先于
+> BSR 评估否则上报偏小）；快照次之（srsRAN `mac::process_subframe` 的 old/new 双缓冲）；
+> 新数据第三；PDCCH 第四（grant 标志供 SR 抑制判定 §5.4.4）；BSR/SR 评估第五（此时
+> 缓冲与 grant 状态均已就绪）；grant 处理与 PUSCH 发送最后（§5.4.3）。
 
 **方案 B（BSR 随 PUSCH 上报）**：UE 在 `handle_ul_grant()` 内用 `mac_pdu_packer::pack_bsr_only`
 把 BSR CE 打包进 UL-SCH MAC PDU 字节流（`ue_context::last_pdu_`），随 PUSCH 经 `pdu_msg`
@@ -112,16 +118,16 @@ int main(int, char**) {                  // main.cpp:462
 
 | 步骤 | 角色 | 动作 | 信道 / 时延 |
 |------|------|------|-------------|
-| 1 | UE 线程 | `ue.data_arrived()` + `ue.run_tti()` 触发 SR、编码 BSR | — |
+| 1 | UE 线程 | ①`handle_harq_feedback()` 落地上轮 PHICH → ②`begin_tti_snapshot()` → ③`data_arrived()` → ④`check_ul_grant()` 置标志 → ⑤`run_tti()` 触发 SR、编码 BSR | — |
 | 2 | UE → eNB | `sr_channel.enqueue(sr_msg, tti)` | SR(PUCCH) **+4 TTI** |
 | 3 | eNB 线程 | `scheduler.handle_sr(rnti)` 置 `sr_pending` | 收到 SR |
 | 4 | eNB 线程 | `scheduler.schedule_ul(tti)` 生成 Grant | — |
 | 5 | eNB → UE | `grant_channel.enqueue(grant_msg, tti)` | UL Grant(PDCCH) **+4 TTI** |
-| 6 | UE 线程 | `ue.handle_ul_grant()` 内 `pack_bsr_only` 把 BSR 打包进 `last_pdu_` | 收到 Grant |
+| 6 | UE 线程 | `process_ul_grant()` 内 `pack_bsr_only` 把 BSR 打包进 `last_pdu_` | 收到 Grant |
 | 7 | UE → eNB | `pdu_channel.enqueue(pdu_msg, tti)`（含 grant 副本 + PDU 字节流） | MAC PDU(PUSCH) **+4 TTI** |
-| 8 | eNB 线程 | `enb_handle_bsr_pdu()` 解 PUSCH PDU 取 BSR → `receive_tb()` 软合并+CRC | 收到 PDU |
+| 8 | eNB 线程 | `enb_handle_bsr_pdu()` 解 PUSCH PDU 取 BSR → `receive_tb()` 软合并+CRC；`scheduler.handle_ul_crc()` | 收到 PDU |
 | 9 | eNB → UE | `phich_channel.enqueue(phich_msg, tti)`（`ack = rx.crc_ok`） | PHICH **+4 TTI** |
-| 10 | UE 线程 | `ue.handle_harq_feedback()` 收 ACK/NACK；`scheduler.handle_ul_crc()` | 收到 PHICH |
+| 10 | UE 线程 | **下一 TTI 步骤①** `ue.handle_harq_feedback()` 收 ACK/NACK（ACK 释放进程；NACK+discard 回滚缓冲） | 收到 PHICH |
 
 > **注意**：方案 C 已建模**信道传播时延**——SR/Grant/PDU/PHICH 四者各带 `CHANNEL_PROPAGATION_TTI = 4`
 > 的可见时延（见 `include/ul_mac/tti_channel.h`），所以主流程中每一步交互都不再是"同一 TTI 即时闭环"，
@@ -198,10 +204,12 @@ enb_harq.set_ul_snr(0x0001, 200);   // 弱信道 2dB
 ### UE 发送桩侧（`ue_context` 及其组件）
 | 函数 | 文件 | 作用 |
 |------|------|------|
-| `ue_context::data_arrived(lcid, bytes)` | ue_context.h:90 | RLC 数据到达 → 更新 LCG 缓冲区 + 记录到达 TTI |
-| `ue_context::run_tti(tti)` | ue_context.h:107 | 每 TTI：BSR step → SR step → 令牌桶步进 |
-| `ue_context::handle_ul_grant(grant)` | ue_context.h:120 | 处理 eNB 授权：清 SR、组 BSR、HARQ 新传/重传、消耗缓冲区、算延迟 |
-| `ue_context::handle_harq_feedback(pid, ack)` | ue_context.h:176 | 模拟 PHICH 到达 UE，更新 HARQ 反馈 |
+| `ue_context::handle_harq_feedback(pid, ack)` | ue_context.h | 模拟 PHICH 到达 UE（每 TTI 最先执行）：ACK 释放 HARQ 进程；NACK+discard 回滚乐观扣减的缓冲 |
+| `ue_context::begin_tti_snapshot()` | ue_context.h | TTI 起始快照：new_buffer→old_buffer，作 Regular BSR 触发对比基准（srsRAN 式） |
+| `ue_context::data_arrived(lcid, bytes)` | ue_context.h | RLC 数据到达 → 更新 LCG 缓冲区(new_buffer) + 记录到达 TTI |
+| `ue_context::check_ul_grant(grant)` | ue_context.h | PDCCH 监听（run_tti 之前）：仅置 `has_ul_grant_` 标志，供 SR 抑制判定 (§5.4.4) |
+| `ue_context::run_tti(tti)` | ue_context.h | 每 TTI：BSR step → SR step → 令牌桶步进 |
+| `ue_context::process_ul_grant(grant)` | ue_context.h | 处理 eNB 授权（run_tti 之后）：清 SR、组 BSR、HARQ 新传/重传、打包 MAC PDU、消耗缓冲区、算延迟 |
 | `bsr_manager::step / generate_bsr / select_bsr_format` | ue_bsr_manager.cpp | BSR 触发判断、编码组包、格式选择 |
 | `sr_manager::step / notify_ul_grant_received / adjust_sr_period` | ue_sr_manager.cpp | SR 状态机、授权到达清 SR、自适应周期 |
 | `ul_harq_manager::new_grant_ul / handle_harq_feedback / generate_retx` | ue_ul_harq_manager.cpp | HARQ 新传/重传生成、反馈处理 |
@@ -211,9 +219,9 @@ enb_harq.set_ul_snr(0x0001, 200);   // 弱信道 2dB
 |------|------|------|
 | `ul_scheduler::handle_sr(rnti)` | enb_ul_scheduler.cpp:42 | 置 `sr_pending` 标志（**无独立 SR Manager**） |
 | `ul_scheduler::handle_bsr(rnti, lcg, idx)` | enb_ul_scheduler.cpp | 接收 BSR 索引，更新 `ul_buffer[lcg]` |
-| `ul_scheduler::schedule_ul(tti)` | enb_ul_scheduler.cpp | 执行 PF/RR/EPF 三种算法，分配 PRB + HARQ PID，输出 `ul_grant` |
-| `ul_scheduler::schedule_epf(tti)` | enb_ul_scheduler.cpp | EPF 核心：重传优先 → 饿死保底 → EPF 度量排序新传 |
-| `ul_scheduler::compute_epf_metric(ctx, tti)` | enb_ul_scheduler.cpp | EPF 度量 = w_qos·(R_inst/R_avg^α)·(1+β·cqi_norm)，含饿死放大 |
+| `ul_scheduler::schedule_ul(tti)` | enb_ul_scheduler.cpp | 执行 PF/RR/EPF 三种算法，分配 PRB + HARQ PID，输出 `ul_grant`；三算法均保证**每 UE 每 TTI 至多一条授权**（granted 集合，对应一条 DCI0） |
+| `ul_scheduler::schedule_epf(tti)` | enb_ul_scheduler.cpp | EPF 核心：重传优先 → 饿死保底（PRB 按需求封顶）→ EPF 度量排序新传 |
+| `ul_scheduler::compute_epf_metric(ctx, tti)` | enb_ul_scheduler.cpp | EPF 度量 = w_qos·(R_inst/R_avg^α)·(1+β·cqi_norm)，R_inst 按待发量封顶，含饿死放大 |
 | `ul_scheduler::configure_epf(epf_params)` | enb_ul_scheduler.cpp | 配置公平性因子 α / 信道感知 β / QoS 缩放 γ / 饿死参数 |
 | `ul_scheduler::set_ue_qos(rnti, qos_class)` | enb_ul_scheduler.cpp | 注入 UE 业务类型 (VoIP/视频/BE) 及其差异化权重 |
 | `ul_scheduler::handle_ul_crc(rnti, pid, ack)` | enb_ul_scheduler.cpp | 接收 CRC 结果，清/留重传标志 |

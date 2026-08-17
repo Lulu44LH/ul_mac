@@ -138,16 +138,18 @@ TEST(test_lcp_token_bucket_basic) {
     // 令牌桶步进 1ms: 每个通道获得 10*1=10 令牌
     buf_mgr.step_token_buckets(1);
 
-    // 设置缓冲区
+    // 每轮开头清零, 并在数据到来前快照一次 (TTI 起始, old=0)
+    buf_mgr.reset();
+    buf_mgr.update_old_buffer();
+
+    // 设置缓冲区 (累加语义: reset 后 new = 1000)
     buf_mgr.update_buffer_state(1, 1000);
     buf_mgr.update_buffer_state(2, 1000);
-    buf_mgr.update_old_buffer();  // old = new = 1000
 
     // 消耗 15 字节
     // 第一阶段: A(pri1) 取 min(10,1000,15)=10, B(pri2) 取 min(10,1000,5)=5
     // 第二阶段: remaining=0
     buf_mgr.consume_data(15);
-    buf_mgr.update_old_buffer();  // 将消耗后的 new_buffer 同步到 old_buffer
 
     uint32_t lcg0 = buf_mgr.get_buffer_state_lcg(0);  // 1000-10=990
     uint32_t lcg1 = buf_mgr.get_buffer_state_lcg(1);  // 1000-5=995
@@ -165,30 +167,33 @@ TEST(test_lcp_token_bucket_refill) {
     buf_mgr.setup_lcid(1, 0, 1, 10, 100);  // pbr=10
     buf_mgr.setup_lcid(2, 1, 2, 10, 100);  // pbr=10
 
+    // 第一轮: 清零 + 数据前快照 (old=0)
+    buf_mgr.reset();
+    buf_mgr.update_old_buffer();
+
     buf_mgr.update_buffer_state(1, 1000);
     buf_mgr.update_buffer_state(2, 1000);
-    buf_mgr.update_old_buffer();
 
     // 初始 token_count=0, 消耗 20 字节:
     //   第一阶段: 都取 0 (无令牌)
     //   第二阶段: A 取 20, B 取 0 (纯优先级)
     buf_mgr.consume_data(20);
-    buf_mgr.update_old_buffer();
 
     EXPECT_EQ(buf_mgr.get_buffer_state_lcg(0), 980u);   // A 取了 20
     EXPECT_EQ(buf_mgr.get_buffer_state_lcg(1), 1000u);  // B 没取到
 
-    // 重新填充缓冲区
+    // 第二轮: 清零 + 数据前快照 (old=0)
+    buf_mgr.reset();
+    buf_mgr.update_old_buffer();
+
     buf_mgr.update_buffer_state(1, 1000);
     buf_mgr.update_buffer_state(2, 1000);
-    buf_mgr.update_old_buffer();
 
     // 令牌桶步进 1ms: token_count=10
     buf_mgr.step_token_buckets(1);
 
     // 再次消耗 20: 第一阶段 A 取 10, B 取 10 (令牌补充后两通道都能取到)
     buf_mgr.consume_data(20);
-    buf_mgr.update_old_buffer();
 
     EXPECT_EQ(buf_mgr.get_buffer_state_lcg(0), 990u);   // A 取 10
     EXPECT_EQ(buf_mgr.get_buffer_state_lcg(1), 990u);   // B 取 10 (令牌补充后能取到)
@@ -203,13 +208,15 @@ TEST(test_lcp_no_pbr_fallback) {
     buf_mgr.setup_lcid(1, 0, 1, 0, 100);  // pri=1, pbr=0
     buf_mgr.setup_lcid(2, 1, 2, 0, 100);  // pri=2, pbr=0
 
+    // 清零 + 数据前快照 (old=0)
+    buf_mgr.reset();
+    buf_mgr.update_old_buffer();
+
     buf_mgr.update_buffer_state(1, 1000);
     buf_mgr.update_buffer_state(2, 1000);
-    buf_mgr.update_old_buffer();
 
     // 消耗 20: 第一阶段都跳过(pbr=0), 第二阶段 A 取 20, B 取 0
     buf_mgr.consume_data(20);
-    buf_mgr.update_old_buffer();
 
     EXPECT_EQ(buf_mgr.get_buffer_state_lcg(0), 980u);   // 高优先级取 20
     EXPECT_EQ(buf_mgr.get_buffer_state_lcg(1), 1000u);  // 低优先级没取到 (纯优先级)
@@ -1205,6 +1212,7 @@ TEST(test_ue_stale_pdu_regression) {
     EXPECT_TRUE(ue.get_last_pdu().empty());
 
     // 数据到达 -> 触发 Regular BSR -> 新传携带 BSR 的 PDU (非空)
+    ue.begin_tti_snapshot();        // TTI 起始: 数据到来前快照 old=0
     ue.data_arrived(2, 500);
     ul_grant g1;
     g1.pid = 1; g1.tbs = 200; g1.ndi = true; g1.ndi_present = true;
@@ -1218,6 +1226,7 @@ TEST(test_ue_stale_pdu_regression) {
     ul_grant g2;
     g2.pid = 2; g2.tbs = 200; g2.ndi = true; g2.ndi_present = true;
     g2.rv = 0; g2.tti_tx = 2;
+    ue.begin_tti_snapshot();        // TTI 起始: 数据到来前快照 old=当前new(已consume)
     ue.check_ul_grant(g2);          // run_tti 前: 置标志位
     ue.run_tti(2);
     ue.process_ul_grant(g2);        // run_tti 后: 处理/打包

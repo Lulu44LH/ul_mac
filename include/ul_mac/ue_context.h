@@ -92,7 +92,16 @@ public:
     /// 设置HARQ配置
     void set_harq_config(const ul_harq_config& cfg) { harq_mgr_.set_config(cfg); }
 
+    /// TTI 起始快照: 在每个 TTI 数据到来**之前**调用一次, 将当前 new_buffer 拷为
+    /// old_buffer, 作为本 TTI 对比基准。之后整个 TTI 内不再更新 old, 仅数据到来时
+    /// 累加 new_buffer、发送时扣减 new_buffer, 通过 old vs new 对比检测新数据/更高
+    /// 优先级数据到达 (触发 Regular BSR)。
+    void begin_tti_snapshot() {
+        buffer_mgr_.update_old_buffer();
+    }
+
     /// 数据到达 (模拟RLC层通知MAC有新数据)
+    /// 数据量累加到 new_buffer (绝对缓冲区大小), 不覆盖、不更新 old
     /// @param lcid 逻辑通道ID
     /// @param bytes 缓冲区字节数
     void data_arrived(uint32_t lcid, uint32_t bytes) {
